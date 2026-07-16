@@ -13,7 +13,7 @@ type RunActivityEventPatch = Pick<TranscriptEvent, "eventType"> &
   Partial<Pick<TranscriptEvent, "message" | "payload" | "payloadSchema" | "payloadTruncated" | "payloadByteLength">>;
 
 const RAW_PROTOCOL_KEYS = new Set(["raw", "rawpayload", "protocolpayload", "jsonrpc", "rpcerror"]);
-const TRANSCRIPT_MESSAGE_PREVIEW_LENGTH = 10_000;
+const TERMINAL_ACTIVITY_PREVIEW_LENGTH = 500;
 const ASSISTANT_DELTA_TEXT_KEYS = ["textPreview", "deltaPreview", "messagePreview", "delta", "text", "message"] as const;
 
 interface PreviewText {
@@ -30,7 +30,13 @@ interface PreviewText {
  */
 export function mapAgentEventToRunActivityEvent(event: AgentEvent): RunActivityEventPatch {
   const harnessActivity = runActivityPatchFromHarnessMetadata(event.runActivity);
-  if (harnessActivity) return harnessActivity;
+  if (harnessActivity) {
+    const finalResponse =
+      event.type === "completed" ? completedFinalResponse(event) : undefined;
+    return finalResponse !== undefined
+      ? withCompleteFinalResponse(harnessActivity, finalResponse)
+      : harnessActivity;
+  }
 
   switch (event.type) {
     case "session_started":
@@ -97,16 +103,19 @@ export function mapAgentEventToRunActivityEvent(event: AgentEvent): RunActivityE
       return activity("run_diagnostic", message.preview, payload);
     }
     case "completed": {
-      const message = event.message === undefined ? undefined : previewText(event.message, TRANSCRIPT_MESSAGE_PREVIEW_LENGTH);
+      const finalResponse = completedFinalResponse(event);
+      const response = finalResponse === undefined ? undefined : fullRedactedText(finalResponse);
+      const message = response === undefined ? undefined : previewText(response.preview, TERMINAL_ACTIVITY_PREVIEW_LENGTH);
       return activity("completed", message?.preview ?? "Run completed", {
         kind: "terminal",
         status: "succeeded",
-        ...(message === undefined
+        ...(response === undefined || message === undefined
           ? {}
           : {
+              finalResponseText: response.preview,
               textPreview: message.preview,
               truncated: message.truncated,
-              redacted: message.redacted,
+              redacted: response.redacted || message.redacted,
             }),
       });
     }
@@ -127,6 +136,15 @@ export function mapAgentEventToRunActivityEvent(event: AgentEvent): RunActivityE
       });
   }
   return assertNever(event);
+}
+
+function completedFinalResponse(
+  event: Extract<AgentEvent, { type: "completed" }>,
+): string | undefined {
+  if (isRecord(event.payload) && typeof event.payload.finalResponseText === "string") {
+    return event.payload.finalResponseText;
+  }
+  return event.message;
 }
 
 function assertNever(event: never): never {
@@ -265,6 +283,31 @@ function finiteNumber(value: unknown): number | null {
 function previewText(value: unknown, maxLength: number): PreviewText {
   const preview = sanitizedPreviewValue(value, maxLength);
   return { preview: preview.preview ?? "", truncated: preview.truncated, redacted: preview.redacted };
+}
+
+function fullRedactedText(value: unknown): PreviewText {
+  const redacted = redactTextPreserveFormatting(value, Number.MAX_SAFE_INTEGER);
+  return { preview: redacted.text ?? "", truncated: false, redacted: redacted.redacted };
+}
+
+function withCompleteFinalResponse(patch: RunActivityEventPatch, value: unknown): RunActivityEventPatch {
+  const response = fullRedactedText(value);
+  const message = previewText(response.preview, TERMINAL_ACTIVITY_PREVIEW_LENGTH);
+  const payload = {
+    ...(isRecord(patch.payload) ? patch.payload : {}),
+    finalResponseText: response.preview,
+    textPreview: message.preview,
+    textTruncated: message.truncated,
+    truncated: message.truncated,
+    ...(response.redacted || message.redacted ? { redacted: true } : {}),
+  };
+  return {
+    ...patch,
+    message: message.preview,
+    payload,
+    payloadTruncated: payloadContainsTruncatedPreview(payload),
+    payloadByteLength: Buffer.byteLength(JSON.stringify(payload), "utf8"),
+  };
 }
 
 function deltaPreviewText(value: unknown, maxLength: number): PreviewText {

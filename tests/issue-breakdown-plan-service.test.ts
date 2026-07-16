@@ -7,6 +7,7 @@ import {
   issueBreakdownPlanFingerprintsMatch,
   issueBreakdownPlanRequestHash,
   latestFreshIssueBreakdownPlan,
+  preFinalDispositionIssueBreakdownPlanRequestHash,
 } from "../src/core/IssueBreakdownPlanService.js";
 import type { IssueBreakdownPlanInput } from "../src/core/IssueBreakdownPlanService.js";
 import { SymphonyError } from "../src/core/errors.js";
@@ -18,6 +19,8 @@ import {
   nestedFencedIssueContractSpoof,
   testConfig,
 } from "./helpers.js";
+
+const PLANNER_FINAL_DISPOSITION = "Planner completed the requested issue breakdown analysis.";
 
 describe("IssueBreakdownPlanService", () => {
   let root: string;
@@ -38,6 +41,8 @@ describe("IssueBreakdownPlanService", () => {
     const input = {
       runId: "run-plan-1",
       issueId: candidate.id,
+      finalDisposition:
+        "Proposed one bounded child issue with an agent-eligible contract.\n\nThe child owns the planning schema and has no unresolved dependencies.",
       summary: "Split the work into child issues.",
       proposedIssues: [
         {
@@ -73,6 +78,7 @@ describe("IssueBreakdownPlanService", () => {
     expect(lifecycle?.planningFailureCount).toBe(0);
     expect(lifecycle?.lastPlanningFailureRunId).toBeNull();
     expect(lifecycle?.issueBreakdownPlans).toHaveLength(1);
+    expect(lifecycle?.issueBreakdownPlans[0]?.finalDisposition).toBe(input.finalDisposition);
     expect(lifecycle?.issueBreakdownPlans[0]?.requestHash).not.toBe("");
     expect(lifecycle?.issueBreakdownPlans[0]?.issueContentFingerprint).not.toBe("");
     expect(lifecycle?.issueBreakdownPlans[0]?.proposedIssues[0]?.title).toBe("Build planning schema");
@@ -84,6 +90,56 @@ describe("IssueBreakdownPlanService", () => {
     });
   });
 
+  it("replays only disposition-free plans with the pre-finalDisposition request hash", async () => {
+    const config = testConfig(root);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue({ updatedAt: "2026-01-02T00:00:00Z" });
+    const service = new IssueBreakdownPlanService({ config, lifecycleStore });
+    const input = {
+      runId: "run-plan-legacy-disposition",
+      issueId: candidate.id,
+      finalDisposition: PLANNER_FINAL_DISPOSITION,
+      summary: "Split the work into child issues.",
+      proposedIssues: [
+        {
+          title: "Build planning schema",
+          description: agentEligibleIssueContract(),
+          acceptanceCriteria: ["Plans persist proposed issues."],
+          dependencies: [],
+          labels: ["planning"],
+        },
+      ],
+      idempotencyKey: "plan-legacy-disposition",
+    };
+    const context = {
+      issue: candidate,
+      activeRunId: input.runId,
+      role: "worker",
+      phase: "issue_breakdown",
+    } as const;
+    const accepted = await service.submitIssueBreakdownPlan(input, context);
+    const legacyPlan = {
+      ...accepted.plan,
+      requestHash: preFinalDispositionIssueBreakdownPlanRequestHash(input),
+    };
+    delete legacyPlan.finalDisposition;
+    await lifecycleStore.updateIssue(candidate, {
+      issueBreakdownPlans: [legacyPlan],
+      lastIssueBreakdownPlanId: legacyPlan.id,
+    });
+
+    const replayed = await service.submitIssueBreakdownPlan(input, context);
+
+    expect(replayed.replayed).toBe(true);
+    expect(replayed.plan).not.toHaveProperty("finalDisposition");
+    expect((await lifecycleStore.get(candidate.id))?.issueBreakdownPlans).toHaveLength(1);
+
+    await lifecycleStore.updateIssue(candidate, {
+      issueBreakdownPlans: [{ ...legacyPlan, finalDisposition: input.finalDisposition }],
+    });
+    await expect(service.submitIssueBreakdownPlan(input, context)).rejects.toMatchObject({ code: "conflict" });
+  });
+
   it("rejects idempotency key reuse across runs or changed payloads", async () => {
     const config = testConfig(root);
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
@@ -92,6 +148,7 @@ describe("IssueBreakdownPlanService", () => {
     const input = {
       runId: "run-plan-1",
       issueId: candidate.id,
+      finalDisposition: PLANNER_FINAL_DISPOSITION,
       summary: "Split the work into child issues.",
       proposedIssues: [
         {
@@ -134,6 +191,7 @@ describe("IssueBreakdownPlanService", () => {
     const input = {
       runId: "run-plan-1",
       issueId: candidate.id,
+      finalDisposition: PLANNER_FINAL_DISPOSITION,
       summary: "Split the work into child issues.",
       proposedIssues: [
         {
@@ -181,6 +239,7 @@ describe("IssueBreakdownPlanService", () => {
     const input = {
       runId: "run-plan-config-drift",
       issueId: candidate.id,
+      finalDisposition: PLANNER_FINAL_DISPOSITION,
       summary: "Split the work into child issues.",
       proposedIssues: [
         {
@@ -247,6 +306,7 @@ describe("IssueBreakdownPlanService", () => {
     const validInput: IssueBreakdownPlanInput = {
       runId: "run-plan-validation-drift",
       issueId: candidate.id,
+      finalDisposition: "Split the work into child issues.",
       summary: "Split the work into child issues.",
       proposedIssues: [
         {
@@ -319,6 +379,7 @@ describe("IssueBreakdownPlanService", () => {
       {
         runId: "run-plan-a",
         issueId: original.id,
+        finalDisposition: PLANNER_FINAL_DISPOSITION,
         summary: "Split original work.",
         proposedIssues: [
           { title: "Build original child", description: agentEligibleIssueContract(), acceptanceCriteria: ["Done"], dependencies: [], labels: [] },
@@ -331,6 +392,7 @@ describe("IssueBreakdownPlanService", () => {
       {
         runId: "run-plan-b",
         issueId: changed.id,
+        finalDisposition: PLANNER_FINAL_DISPOSITION,
         summary: "Split changed work.",
         proposedIssues: [
           { title: "Build changed child", description: agentEligibleIssueContract(), acceptanceCriteria: ["Done"], dependencies: [], labels: [] },
@@ -375,6 +437,7 @@ describe("IssueBreakdownPlanService", () => {
         {
           runId: "run-plan-ready-label",
           issueId: candidate.id,
+          finalDisposition: PLANNER_FINAL_DISPOSITION,
           summary: "Readiness labels are operator-owned.",
           proposedIssues: [
             {
@@ -421,6 +484,7 @@ describe("IssueBreakdownPlanService", () => {
           {
             runId: `run-plan-invalid-issue-contract-${index + 1}`,
             issueId: candidate.id,
+            finalDisposition: PLANNER_FINAL_DISPOSITION,
             summary: "Every proposed issue must provide a valid fenced JSON contract.",
             proposedIssues: [
               {
@@ -457,6 +521,7 @@ describe("IssueBreakdownPlanService", () => {
         {
           runId: "run-plan-fenced-heading-spoof",
           issueId: candidate.id,
+          finalDisposition: PLANNER_FINAL_DISPOSITION,
           summary: "Real markdown headings must exist outside fenced code blocks.",
           proposedIssues: [
             {
@@ -506,6 +571,7 @@ describe("IssueBreakdownPlanService", () => {
         {
           runId: "run-plan-under-specified-contract",
           issueId: candidate.id,
+          finalDisposition: PLANNER_FINAL_DISPOSITION,
           summary: "Contracts must be concrete before child issues are created.",
           proposedIssues: [
             {
@@ -552,6 +618,7 @@ describe("IssueBreakdownPlanService", () => {
         {
           runId: "run-plan-custom-ready-label",
           issueId: candidate.id,
+          finalDisposition: PLANNER_FINAL_DISPOSITION,
           summary: "Dispatch labels remain operator-owned.",
           proposedIssues: [
             {
@@ -582,6 +649,7 @@ describe("IssueBreakdownPlanService", () => {
         {
           runId: "run-plan-protected-ready",
           issueId: candidate.id,
+          finalDisposition: PLANNER_FINAL_DISPOSITION,
           summary: "Protected path must not be agent-ready.",
           proposedIssues: [
             {
@@ -606,6 +674,7 @@ describe("IssueBreakdownPlanService", () => {
       {
         runId: "run-plan-protected-manual",
         issueId: candidate.id,
+        finalDisposition: PLANNER_FINAL_DISPOSITION,
         summary: "Protected path stays manual-only.",
         proposedIssues: [
           {
@@ -640,6 +709,7 @@ describe("IssueBreakdownPlanService", () => {
       {
         runId: "run-plan-out-of-scope-protected",
         issueId: candidate.id,
+        finalDisposition: PLANNER_FINAL_DISPOSITION,
         summary: "Only explicit touched surfaces should drive protected-path handling.",
         proposedIssues: [
           {
@@ -677,6 +747,7 @@ describe("IssueBreakdownPlanService", () => {
           {
             runId: `run-plan-protected-placeholder-${suffix}`,
             issueId: candidate.id,
+            finalDisposition: PLANNER_FINAL_DISPOSITION,
             summary: "Protected path needs a real operator blocker.",
             proposedIssues: [
               {
@@ -717,6 +788,7 @@ describe("IssueBreakdownPlanService", () => {
         {
           runId: "run-plan-protected-template-blocker",
           issueId: candidate.id,
+          finalDisposition: PLANNER_FINAL_DISPOSITION,
           summary: "Protected path needs a real manual-only blocker.",
           proposedIssues: [
             {
@@ -756,6 +828,7 @@ describe("IssueBreakdownPlanService", () => {
         {
           runId: "run-plan-1",
           issueId: candidate.id,
+          finalDisposition: PLANNER_FINAL_DISPOSITION,
           summary: "Missing proposed issues.",
           proposedIssues: [],
           idempotencyKey: "plan-1",
@@ -769,6 +842,7 @@ describe("IssueBreakdownPlanService", () => {
         {
           runId: "run-plan-1",
           issueId: candidate.id,
+          finalDisposition: PLANNER_FINAL_DISPOSITION,
           summary: "Valid shape but wrong run.",
           proposedIssues: [
             {
@@ -797,6 +871,7 @@ describe("IssueBreakdownPlanService", () => {
         {
           runId: "run-plan-1",
           issueId: candidate.id,
+          finalDisposition: PLANNER_FINAL_DISPOSITION,
           summary: "Dependencies must be explicit.",
           proposedIssues: [
             {
@@ -825,6 +900,7 @@ describe("IssueBreakdownPlanService", () => {
         {
           runId: "run-plan-1",
           issueId: candidate.id,
+          finalDisposition: PLANNER_FINAL_DISPOSITION,
           summary: "Labels must be explicit.",
           proposedIssues: [
             {

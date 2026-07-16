@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -14,6 +14,7 @@ import {
 } from "../src/core/workspace/GitWorktreeManager.js";
 import type { AcceptedArtifactWorkspaceSeed } from "../src/core/types.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
+import { LocalAcceptedArtifactCheckpointBuilder } from "../src/core/AcceptedArtifactService.js";
 import { issue } from "./helpers.js";
 
 describe("git worktree workspace source", () => {
@@ -102,6 +103,39 @@ describe("git worktree workspace source", () => {
     });
     expect(record?.seed).toEqual(workspace.seed);
     await git(["merge-base", "--is-ancestor", preparedBaseHeadSha, preparedHeadSha], repo);
+  });
+
+  it("records regular, symlink, and deletion Git modes in a new artifact checkpoint", async () => {
+    const sourceBaseHeadSha = (await git(["rev-parse", "HEAD"], repo)).trim();
+    await git(["checkout", "-b", "artifact/mode-manifest"], repo);
+    await writeFile(path.join(repo, "mode.test.ts"), "expected red\n", "utf8");
+    await symlink("mode.test.ts", path.join(repo, "mode-link.test.ts"));
+    await git(["rm", "README.md"], repo);
+    await commitAll(repo, "record artifact modes");
+    const sourceHeadSha = (await git(["rev-parse", "HEAD"], repo)).trim();
+
+    const manifest = await new LocalAcceptedArtifactCheckpointBuilder().build({
+      workspacePath: repo,
+      sourceBaseHeadSha,
+      sourceHeadSha,
+      changedFiles: ["README.md", "mode-link.test.ts", "mode.test.ts"],
+    });
+
+    expect(manifest).toEqual([
+      {
+        path: "mode-link.test.ts",
+        status: "added",
+        blobSha: expect.stringMatching(/^[0-9a-f]{40,64}$/),
+        mode: "120000",
+      },
+      {
+        path: "mode.test.ts",
+        status: "added",
+        blobSha: expect.stringMatching(/^[0-9a-f]{40,64}$/),
+        mode: "100644",
+      },
+      { path: "README.md", status: "deleted", blobSha: null, mode: null },
+    ]);
   });
 
   it("supports reviewed rename destinations and deletions in an artifact manifest", async () => {
@@ -388,22 +422,172 @@ describe("git worktree workspace source", () => {
     });
   });
 
-  it("rejects mutation of a reviewed artifact blob in a prepared workspace", async () => {
-    const { seed, target } = await reusableSeedFixture(repo, "immutable-blob");
+  it("reuses a squash-rebased seed while retaining its prepared head as provenance", async () => {
+    const { seed, target } = await reusableSeedFixture(repo, "squash-rebase");
     const manager = newManager(root, repo);
     const workspace = await manager.createForIssue(target, { seed });
-    const testFile = seed.fileManifest[0]!.path;
-    await writeFile(path.join(workspace.path, testFile), "weakened test\n", "utf8");
-    await commitAll(workspace.path, "weaken reviewed artifact test");
-    const mutatedHead = (await git(["rev-parse", "HEAD"], workspace.path)).trim();
+    const historicalPreparedHead = workspace.seed!.preparedHeadSha!;
+    const rebasedHead = await serviceStyleSquashRebase(
+      repo,
+      workspace.path,
+      "squash-rebase",
+    );
+
+    await expect(
+      git(
+        ["merge-base", "--is-ancestor", historicalPreparedHead, rebasedHead],
+        workspace.path,
+      ),
+    ).rejects.toThrow();
+
+    await expect(
+      verifyGitWorktreeSeedBinding(workspace.path, workspace.seed!, 10_000),
+    ).resolves.toEqual(workspace.seed);
+    const reused = await manager.createForIssue(target, { seed });
+
+    expect(reused.seed?.preparedHeadSha).toBe(historicalPreparedHead);
+    expect((await git(["rev-parse", "HEAD"], workspace.path)).trim()).toBe(
+      rebasedHead,
+    );
+    expect(
+      (await git(["rev-parse", `HEAD:${seed.fileManifest[0]!.path}`], workspace.path)).trim(),
+    ).toBe(seed.fileManifest[0]!.blobSha);
+  });
+
+  it("rejects a malformed historical prepared head before reusing a seed", async () => {
+    const { seed, target } = await reusableSeedFixture(repo, "invalid-prepared-head");
+    const workspace = await newManager(root, repo).createForIssue(target, {
+      seed,
+    });
 
     await expect(
       verifyGitWorktreeSeedBinding(
         workspace.path,
-        { ...workspace.seed!, preparedHeadSha: mutatedHead },
+        { ...workspace.seed!, preparedHeadSha: "not-a-full-object-id" },
+        10_000,
+      ),
+    ).rejects.toMatchObject({
+      code: "workspace_error",
+      message: expect.stringContaining("must be a full git object ID"),
+    });
+  });
+
+  it("rejects a symlink target mutation hidden by skip-worktree", async () => {
+    const sourceBaseHeadSha = (await git(["rev-parse", "HEAD"], repo)).trim();
+    await git(["checkout", "-b", "artifact/symlink-integrity"], repo);
+    await symlink("README.md", path.join(repo, "expected-red.link"));
+    await commitAll(repo, "add expected-red symlink");
+    const sourceHeadSha = (await git(["rev-parse", "HEAD"], repo)).trim();
+    const blobSha = (
+      await git(["rev-parse", "HEAD:expected-red.link"], repo)
+    ).trim();
+    await git(["checkout", "main"], repo);
+    const seed = artifactSeed(repo, {
+      artifactId: "artifact-symlink-integrity",
+      sourceBranch: "artifact/symlink-integrity",
+      sourceBaseHeadSha,
+      sourceHeadSha,
+      fileManifest: [
+        {
+          path: "expected-red.link",
+          status: "added",
+          blobSha,
+          mode: "120000",
+        },
+      ],
+    });
+    const target = issue({
+      identifier: "TEST-SYMLINK-INTEGRITY",
+      branchName: "symphony/TEST-SYMLINK-INTEGRITY",
+    });
+    const workspace = await newManager(root, repo).createForIssue(target, {
+      seed,
+    });
+    await git(
+      ["update-index", "--skip-worktree", "expected-red.link"],
+      workspace.path,
+    );
+    await rm(path.join(workspace.path, "expected-red.link"));
+    await symlink("mutated-target", path.join(workspace.path, "expected-red.link"));
+    expect(await git(["status", "--porcelain"], workspace.path)).toBe("");
+
+    await expect(
+      verifyGitWorktreeSeedBinding(workspace.path, workspace.seed!, 10_000),
+    ).rejects.toMatchObject({
+      code: "workspace_error",
+      message: "Prepared accepted-artifact files have uncommitted changes",
+    });
+  });
+
+  it("rejects dirty and committed artifact corruption after a squash rebase", async () => {
+    const { seed, target } = await reusableSeedFixture(repo, "immutable-blob");
+    const manager = newManager(root, repo);
+    const workspace = await manager.createForIssue(target, { seed });
+    const historicalPreparedHead = workspace.seed!.preparedHeadSha;
+    await serviceStyleSquashRebase(repo, workspace.path, "immutable-blob");
+    const testFile = seed.fileManifest[0]!.path;
+    await writeFile(path.join(workspace.path, testFile), "weakened test\n", "utf8");
+
+    await expect(
+      verifyGitWorktreeSeedBinding(workspace.path, workspace.seed!, 10_000),
+    ).rejects.toMatchObject({
+      code: "workspace_error",
+      message: "Prepared accepted-artifact files have uncommitted changes",
+    });
+
+    await commitAll(workspace.path, "weaken reviewed artifact test");
+
+    await expect(
+      verifyGitWorktreeSeedBinding(
+        workspace.path,
+        workspace.seed!,
         10_000,
       ),
     ).rejects.toThrow(new RegExp(`${testFile}.*reviewed manifest`));
+    expect(workspace.seed?.preparedHeadSha).toBe(historicalPreparedHead);
+  });
+
+  it("preserves reviewed deletions across a squash rebase and rejects restoration", async () => {
+    const sourceBaseHeadSha = (await git(["rev-parse", "HEAD"], repo)).trim();
+    await git(["checkout", "-b", "artifact/delete-reviewed-file"], repo);
+    await git(["rm", "README.md"], repo);
+    await commitAll(repo, "delete reviewed file");
+    const sourceHeadSha = (await git(["rev-parse", "HEAD"], repo)).trim();
+    await git(["checkout", "main"], repo);
+    await writeFile(path.join(repo, "deletion.base.txt"), "live base\n", "utf8");
+    await commitAll(repo, "advance deletion base");
+    const seed = artifactSeed(repo, {
+      artifactId: "artifact-delete-reviewed-file",
+      sourceBranch: "artifact/delete-reviewed-file",
+      sourceBaseHeadSha,
+      sourceHeadSha,
+      fileManifest: [{ path: "README.md", status: "deleted", blobSha: null }],
+    });
+    const target = issue({
+      identifier: "TEST-SEED-DELETE-REVIEWED",
+      branchName: "symphony/TEST-SEED-DELETE-REVIEWED",
+    });
+    const workspace = await newManager(root, repo).createForIssue(target, { seed });
+    await serviceStyleSquashRebase(repo, workspace.path, "delete-reviewed-file");
+
+    await expect(
+      verifyGitWorktreeSeedBinding(workspace.path, workspace.seed!, 10_000),
+    ).resolves.toEqual(workspace.seed);
+    await writeFile(path.join(workspace.path, ".gitignore"), "README.md\n", "utf8");
+    await commitAll(workspace.path, "ignore restored reviewed path");
+    await writeFile(path.join(workspace.path, "README.md"), "restored\n", "utf8");
+    await expect(
+      verifyGitWorktreeSeedBinding(workspace.path, workspace.seed!, 10_000),
+    ).rejects.toMatchObject({
+      code: "workspace_error",
+      message: "Prepared accepted-artifact files have uncommitted changes",
+    });
+
+    await git(["add", "-f", "README.md"], workspace.path);
+    await commitAll(workspace.path, "restore reviewed deletion");
+    await expect(
+      verifyGitWorktreeSeedBinding(workspace.path, workspace.seed!, 10_000),
+    ).rejects.toThrow(/deleted path README\.md is present/);
   });
 
   it("keeps reviewed artifact command execution out of workspace finalization", async () => {
@@ -764,6 +948,36 @@ async function reusableSeedFixture(repository: string, suffix: string) {
       fileManifest: [{ path: testFile, status: "added", blobSha }],
     }),
   };
+}
+
+async function serviceStyleSquashRebase(
+  repository: string,
+  workspacePath: string,
+  suffix: string,
+): Promise<string> {
+  await writeFile(
+    path.join(workspacePath, `${suffix}.implementation.ts`),
+    "implementation\n",
+    "utf8",
+  );
+  await commitAll(workspacePath, `implement ${suffix}`);
+  const originalHead = (await git(["rev-parse", "HEAD"], workspacePath)).trim();
+
+  await writeFile(
+    path.join(repository, `${suffix}.next-base.txt`),
+    "new live base\n",
+    "utf8",
+  );
+  await commitAll(repository, `advance live base for ${suffix}`);
+  const liveBase = (await git(["rev-parse", "HEAD"], repository)).trim();
+  const mergeBase = (
+    await git(["merge-base", originalHead, liveBase], workspacePath)
+  ).trim();
+
+  await git(["reset", "--soft", mergeBase], workspacePath);
+  await commitAll(workspacePath, `service squash for ${suffix}`);
+  await git(["rebase", "--onto", liveBase, mergeBase], workspacePath);
+  return (await git(["rev-parse", "HEAD"], workspacePath)).trim();
 }
 
 async function seedCreationJournalFiles(stateDir: string): Promise<string[]> {

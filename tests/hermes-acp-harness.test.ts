@@ -293,7 +293,7 @@ describe("HermesAcpHarness", () => {
         expect.objectContaining({
           type: "completed",
           message: "done",
-          payload: {
+          payload: expect.objectContaining({
             acpResponse: expect.objectContaining({
               stopReason: "end_turn",
               terminalStatus: "succeeded",
@@ -302,7 +302,7 @@ describe("HermesAcpHarness", () => {
               resultPreview: expect.stringContaining("stopReason"),
               redacted: true,
             }),
-          },
+          }),
         }),
       ]),
     );

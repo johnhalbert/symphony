@@ -46,38 +46,41 @@ export class IssueBreakdownPlanApplyService {
       return { status: "not_required", reason: "apply_to_linear_disabled" };
     }
     const contract = parseIssueContract(issue.description);
+    const lifecycle = await this.options.lifecycleStore.get(issue.id);
+    const latestPlan = lifecycle?.lastIssueBreakdownPlanId
+      ? lifecycle.issueBreakdownPlans.find((candidate) => candidate.id === lifecycle.lastIssueBreakdownPlanId) ?? null
+      : null;
     if (
       contract.valid &&
       contract.contract.delivery.mode === "accepted_artifact"
     ) {
+      if (options.dryRun !== true && latestPlan) {
+        await this.writeLatestPlanDisposition(issue, latestPlan);
+      }
       return {
         status: "no_fresh_plan",
         reason: "accepted_artifact_contract_cannot_be_decomposed",
       };
     }
-    const lifecycle = await this.options.lifecycleStore.get(issue.id);
     const plan = latestFreshIssueBreakdownPlan(lifecycle, issue, this.options.config);
     if (!plan) {
       let markedStale = false;
       if (options.dryRun !== true) {
+        if (latestPlan) await this.writeLatestPlanDisposition(issue, latestPlan);
         markedStale = await this.markStaleDriftedPlans(issue, lifecycle);
       }
       return { status: "no_fresh_plan", reason: markedStale ? ISSUE_BREAKDOWN_PLAN_STALE_REASON : "no_fresh_plan" };
     }
     if (plan.applicationStatus === "applied") return { status: "applied", plan, operations: [] };
     const childOperations = planIssueBreakdownApplicationWritebacks(issue, plan);
-    const dependencyValidation = validatePlanDependencies(plan);
-    if (dependencyValidation.length > 0) {
-      const reason = `Issue breakdown dependencies are unresolved: ${dependencyValidation.join("; ")}`;
-      if (options.dryRun === true) return { status: "blocked", plan, operations: childOperations, reason };
-      const updated = await this.updatePlan(issue, plan, {
-        applicationStatus: "blocked",
-        applicationBlockedReason: reason,
-        applicationOperationKeys: [],
-      });
-      return { status: "blocked", plan: updated, operations: [], reason };
+    if (options.dryRun === true) {
+      const dependencyValidation = validatePlanDependencies(plan);
+      if (dependencyValidation.length > 0) {
+        const reason = `Issue breakdown dependencies are unresolved: ${dependencyValidation.join("; ")}`;
+        return { status: "blocked", plan, operations: childOperations, reason };
+      }
+      return { status: "preview", plan, operations: childOperations };
     }
-    if (options.dryRun === true) return { status: "preview", plan, operations: childOperations };
     if (!this.options.writeback || !this.options.config.writeback.enabled) {
       const updated = await this.updatePlan(issue, plan, {
         applicationStatus: "blocked",
@@ -87,13 +90,56 @@ export class IssueBreakdownPlanApplyService {
     }
 
     const replayPlan = plan;
+    const dispositionOperation = planIssueBreakdownDispositionWriteback(issue, plan);
     let workingPlan = await this.updatePlan(issue, plan, {
       applicationStatus: "pending",
-      applicationOperationKeys: mergeOperationKeys(plan.applicationOperationKeys, childOperations),
+      applicationOperationKeys: mergeOperationKeys(plan.applicationOperationKeys, [dispositionOperation]),
       applicationBlockedReason: null,
     });
 
-    const processed: WritebackOperation[] = [];
+    const dispositionResult = await this.options.writeback.enqueueAndProcess(
+      dispositionOperation,
+      issueBreakdownRetryOptions(dispositionOperation, replayPlan),
+    );
+    const processed: WritebackOperation[] = [dispositionResult];
+    if (dispositionResult.status === "skipped" || dispositionResult.status === "dead_letter") {
+      const updated = await this.updatePlan(issue, workingPlan, {
+        applicationStatus: "blocked",
+        applicationBlockedReason:
+          dispositionResult.resultMessage ??
+          dispositionResult.lastError ??
+          "issue breakdown disposition writeback did not succeed",
+      });
+      return {
+        status: "blocked",
+        plan: updated,
+        operations: processed,
+        reason: updated.applicationBlockedReason ?? "issue breakdown apply blocked",
+      };
+    }
+    if (dispositionResult.status !== "succeeded") {
+      const pending = await this.updatePlan(issue, workingPlan, {
+        applicationStatus: "pending",
+        applicationBlockedReason: null,
+      });
+      return { status: "pending", plan: pending, operations: processed };
+    }
+
+    const dependencyValidation = validatePlanDependencies(plan);
+    if (dependencyValidation.length > 0) {
+      const reason = `Issue breakdown dependencies are unresolved: ${dependencyValidation.join("; ")}`;
+      const updated = await this.updatePlan(issue, workingPlan, {
+        applicationStatus: "blocked",
+        applicationBlockedReason: reason,
+      });
+      return { status: "blocked", plan: updated, operations: processed, reason };
+    }
+
+    workingPlan = await this.updatePlan(issue, workingPlan, {
+      applicationStatus: "pending",
+      applicationOperationKeys: mergeOperationKeys(workingPlan.applicationOperationKeys, childOperations),
+      applicationBlockedReason: null,
+    });
     for (const operation of childOperations) {
       const result = await this.options.writeback.enqueueAndProcess(operation, issueBreakdownRetryOptions(operation, replayPlan));
       processed.push(result);
@@ -190,6 +236,21 @@ export class IssueBreakdownPlanApplyService {
     return updatedPlan;
   }
 
+  private async writeLatestPlanDisposition(
+    issue: Issue,
+    plan: IssueBreakdownPlanRecord,
+  ): Promise<WritebackOperation | null> {
+    if (!this.options.writeback || !this.options.config.writeback.enabled) return null;
+    const operation = planIssueBreakdownDispositionWriteback(issue, plan);
+    await this.updatePlan(issue, plan, {
+      applicationOperationKeys: mergeOperationKeys(plan.applicationOperationKeys, [operation]),
+    });
+    return this.options.writeback.enqueueAndProcess(
+      operation,
+      issueBreakdownRetryOptions(operation, plan),
+    );
+  }
+
   private async markStaleDriftedPlans(issue: Issue, lifecycle: IssueLifecycleRecord | null): Promise<boolean> {
     if (!lifecycle) return false;
     let markedStale = false;
@@ -232,6 +293,33 @@ export function planIssueBreakdownApplicationWritebacks(
       },
     };
   });
+}
+
+export function planIssueBreakdownDispositionWriteback(
+  issue: Issue,
+  plan: IssueBreakdownPlanRecord,
+): NewWritebackOperation {
+  const dedupeKey = `issue-breakdown-disposition:${plan.id}`;
+  return {
+    idempotencyKey: issueBreakdownDispositionOperationKey(issue, plan),
+    kind: "comment",
+    issueId: issue.id,
+    runId: plan.runId,
+    payload: {
+      issueBreakdownPlanId: plan.id,
+      dedupeKey,
+      body: [
+        "## Symphony Issue Breakdown Plan",
+        "",
+        "Status: accepted for application",
+        `Plan: ${plan.id}`,
+        `Run: ${plan.runId}`,
+        ...(plan.finalDisposition === undefined
+          ? []
+          : ["", "Agent final disposition:", plan.finalDisposition]),
+      ].join("\n"),
+    },
+  };
 }
 
 export function planIssueBreakdownFinalizationWritebacks(
@@ -285,7 +373,7 @@ export function planIssueBreakdownFinalizationWritebacks(
     });
   }
   operations.push({
-    idempotencyKey: `comment:${issue.id}:issue-breakdown:${plan.id}:children`,
+    idempotencyKey: issueBreakdownChildrenCommentOperationKey(issue, plan),
     kind: "comment",
     issueId: issue.id,
     runId: plan.runId,
@@ -396,6 +484,9 @@ function dependencyRelations(plan: IssueBreakdownPlanRecord): Array<{
 }
 
 function renderParentComment(issue: Issue, plan: IssueBreakdownPlanRecord): string {
+  const dispositionAlreadyWritten = plan.applicationOperationKeys.includes(
+    issueBreakdownDispositionOperationKey(issue, plan),
+  );
   const refs = plan.createdIssueRefs
     .slice()
     .sort((left, right) => left.proposedIssueIndex - right.proposedIssueIndex)
@@ -407,10 +498,27 @@ function renderParentComment(issue: Issue, plan: IssueBreakdownPlanRecord): stri
     });
   return [
     `Applied issue breakdown plan ${plan.id} for ${issue.identifier}.`,
+    ...(plan.finalDisposition === undefined || dispositionAlreadyWritten
+      ? []
+      : ["", "Agent final disposition:", plan.finalDisposition]),
     "",
     "Created child issues:",
     ...refs,
   ].join("\n");
+}
+
+function issueBreakdownDispositionOperationKey(
+  issue: Issue,
+  plan: IssueBreakdownPlanRecord,
+): string {
+  return `comment:${issue.id}:issue-breakdown:${plan.id}:disposition`;
+}
+
+function issueBreakdownChildrenCommentOperationKey(
+  issue: Issue,
+  plan: IssueBreakdownPlanRecord,
+): string {
+  return `comment:${issue.id}:issue-breakdown:${plan.id}:children`;
 }
 
 function proposalHash(value: unknown): string {

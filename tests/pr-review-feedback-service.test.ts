@@ -16,6 +16,7 @@ import type {
   PullRequestReviewFeedbackResult,
 } from "../src/integrations/github/GitHubPullRequestClient.js";
 import { issue, testConfig } from "./helpers.js";
+import type { IssueBaseRefObservation } from "../src/core/BaseRefVerification.js";
 
 describe("PullRequestReviewFeedbackService", () => {
   let root: string;
@@ -282,6 +283,230 @@ describe("PullRequestReviewFeedbackService", () => {
     expect(client.calls).toHaveLength(0);
   });
 
+  it("records review-feedback base failures with exact run and PR-head provenance", async () => {
+    const config = configured();
+    const lifecycleStore = new FileIssueLifecycleStore(root);
+    const client = new RecordingFeedbackClient();
+    const observation = baseRefFailureObservation();
+    const service = new PullRequestReviewFeedbackService({
+      config,
+      lifecycleStore,
+      client,
+      baseRefVerifier: { verify: async () => observation },
+    });
+    await seedLifecycle(lifecycleStore);
+
+    await expect(
+      service.submitPullRequestReviewFeedback(
+        {
+          kind: "review",
+          event: "REQUEST_CHANGES",
+          body: "Unable to publish review feedback.",
+          idempotencyKey: "base-ref-failure-1",
+        },
+        context(),
+      ),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      details: {
+        blockerProvenance: {
+          code: "base_ref_drift",
+          runId: "review-run-1",
+          pullRequestNumber: 42,
+          pullRequestHeadSha: "abc123",
+        },
+      },
+    });
+
+    const lifecycle = await lifecycleStore.get("issue-1");
+    expect(lifecycle?.activeBlockerProvenanceId).toBe(
+      lifecycle?.blockerProvenances?.[0]?.id,
+    );
+    expect(lifecycle?.blockerProvenances).toEqual([
+      expect.objectContaining({
+        code: "base_ref_drift",
+        recoveryKind: "automatic_rebase",
+        sourceKind: "base_ref_observation",
+        initialObservationFingerprint: observation.inputFingerprint,
+        initialClassification: "branch_not_based_on_live_base",
+        sourceObservationFingerprint: observation.inputFingerprint,
+        classification: "branch_not_based_on_live_base",
+        operation: "review_feedback",
+        runId: "review-run-1",
+        pullRequestNumber: 42,
+        pullRequestHeadSha: "abc123",
+        liveBaseHeadSha: "base-sha-2",
+        worktreeHeadSha: "abc123",
+        observationAttempt: 1,
+        lastObservedAt: observation.checkedAt,
+        reviewVerdictId: null,
+        resolvedAt: null,
+      }),
+    ]);
+    expect(client.calls).toHaveLength(0);
+  });
+
+  it("updates one active provenance across repeated review-feedback base failures", async () => {
+    const config = configured();
+    const lifecycleStore = new FileIssueLifecycleStore(root);
+    const client = new RecordingFeedbackClient();
+    const firstObservation = baseRefFailureObservation();
+    const secondObservation = baseRefFailureObservation({
+      classification: "base_ref_fetch_failed",
+      checkedAt: "2026-01-01T00:00:04.000Z",
+      githubBaseHeadSha: "base-sha-3",
+      localBaseHeadShaBeforeFetch: "base-sha-2",
+      localBaseHeadShaAfterFetch: null,
+      localBaseIsAncestorOfHead: null,
+      reason: "Unable to fetch origin base ref",
+      error: "git fetch failed",
+    });
+    const observations = [firstObservation, secondObservation];
+    let observationIndex = 0;
+    const service = new PullRequestReviewFeedbackService({
+      config,
+      lifecycleStore,
+      client,
+      baseRefVerifier: {
+        verify: async () => observations[observationIndex++]!,
+      },
+    });
+    await seedLifecycle(lifecycleStore);
+    const feedback = {
+      kind: "review" as const,
+      event: "REQUEST_CHANGES" as const,
+      body: "Unable to publish review feedback.",
+      idempotencyKey: "base-ref-retry-failure-1",
+    };
+
+    await expect(
+      service.submitPullRequestReviewFeedback(feedback, context()),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    const firstLifecycle = await lifecycleStore.get("issue-1");
+    const provenanceId = firstLifecycle?.activeBlockerProvenanceId;
+
+    await expect(
+      service.submitPullRequestReviewFeedback(feedback, context()),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      details: {
+        blockerProvenance: {
+          id: provenanceId,
+          initialClassification: "branch_not_based_on_live_base",
+          classification: "base_ref_fetch_failed",
+          observationAttempt: 2,
+        },
+      },
+    });
+
+    const lifecycle = await lifecycleStore.get("issue-1");
+    expect(lifecycle?.activeBlockerProvenanceId).toBe(provenanceId);
+    expect(lifecycle?.blockerProvenances).toHaveLength(1);
+    expect(lifecycle?.blockerProvenances?.[0]).toMatchObject({
+      id: provenanceId,
+      code: "base_ref_verification_failure",
+      recoveryKind: "automatic_recheck",
+      initialObservationFingerprint: firstObservation.inputFingerprint,
+      initialClassification: firstObservation.classification,
+      initialLiveBaseHeadSha: firstObservation.githubBaseHeadSha,
+      initialWorktreeHeadSha: firstObservation.worktreeHeadSha,
+      sourceObservationFingerprint: secondObservation.inputFingerprint,
+      classification: secondObservation.classification,
+      liveBaseHeadSha: secondObservation.githubBaseHeadSha,
+      worktreeHeadSha: secondObservation.worktreeHeadSha,
+      observationAttempt: 2,
+      createdAt: firstObservation.checkedAt,
+      lastObservedAt: secondObservation.checkedAt,
+      resolvedAt: null,
+      resolution: null,
+    });
+    expect(client.calls).toHaveLength(0);
+  });
+
+  it("updates and resolves one provenance across fail-fail-ok review-feedback retries", async () => {
+    const config = configured();
+    const lifecycleStore = new FileIssueLifecycleStore(root);
+    const client = new RecordingFeedbackClient();
+    const firstObservation = baseRefFailureObservation();
+    const secondObservation = baseRefFailureObservation({
+      classification: "base_ref_fetch_failed",
+      checkedAt: "2026-01-01T00:00:04.000Z",
+      githubBaseHeadSha: "base-sha-3",
+      localBaseHeadShaBeforeFetch: "base-sha-2",
+      localBaseHeadShaAfterFetch: null,
+      localBaseIsAncestorOfHead: null,
+      reason: "Unable to fetch origin base ref",
+      error: "git fetch failed",
+    });
+    const okObservation = baseRefFailureObservation({
+      classification: "ok",
+      checkedAt: "2026-01-01T00:00:05.000Z",
+      githubBaseHeadSha: "base-sha-3",
+      localBaseHeadShaBeforeFetch: "base-sha-3",
+      localBaseHeadShaAfterFetch: "base-sha-3",
+      localBaseIsAncestorOfHead: true,
+      reason: null,
+      error: null,
+    });
+    const observations = [firstObservation, secondObservation, okObservation];
+    let observationIndex = 0;
+    const service = new PullRequestReviewFeedbackService({
+      config,
+      lifecycleStore,
+      client,
+      baseRefVerifier: {
+        verify: async () => observations[observationIndex++]!,
+      },
+    });
+    await seedLifecycle(lifecycleStore);
+    const feedback = {
+      kind: "review" as const,
+      event: "REQUEST_CHANGES" as const,
+      body: "Unable to publish review feedback.",
+      idempotencyKey: "base-ref-retry-success-1",
+    };
+
+    await expect(
+      service.submitPullRequestReviewFeedback(feedback, context()),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    const firstLifecycle = await lifecycleStore.get("issue-1");
+    const provenanceId = firstLifecycle?.activeBlockerProvenanceId;
+    await expect(
+      service.submitPullRequestReviewFeedback(feedback, context()),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+
+    await expect(
+      service.submitPullRequestReviewFeedback(feedback, context()),
+    ).resolves.toMatchObject({ accepted: true, replayed: false });
+
+    const lifecycle = await lifecycleStore.get("issue-1");
+    expect(lifecycle).toMatchObject({
+      phase: "review",
+      blockedReason: null,
+      activeBlockerProvenanceId: null,
+      baseRefObservation: okObservation,
+    });
+    expect(lifecycle?.blockerProvenances).toHaveLength(1);
+    expect(lifecycle?.blockerProvenances?.[0]).toMatchObject({
+      id: provenanceId,
+      recoveryKind: "automatic_recheck",
+      initialObservationFingerprint: firstObservation.inputFingerprint,
+      initialClassification: firstObservation.classification,
+      initialLiveBaseHeadSha: firstObservation.githubBaseHeadSha,
+      initialWorktreeHeadSha: firstObservation.worktreeHeadSha,
+      sourceObservationFingerprint: okObservation.inputFingerprint,
+      classification: "ok",
+      liveBaseHeadSha: okObservation.githubBaseHeadSha,
+      worktreeHeadSha: okObservation.worktreeHeadSha,
+      observationAttempt: 3,
+      createdAt: firstObservation.checkedAt,
+      lastObservedAt: okObservation.checkedAt,
+      resolvedAt: okObservation.checkedAt,
+      resolution: "base_ref_recheck",
+    });
+    expect(client.calls).toHaveLength(1);
+  });
+
   function fixture() {
     const config = configured();
     const lifecycleStore = new FileIssueLifecycleStore(root);
@@ -297,6 +522,14 @@ class RecordingFeedbackClient implements PullRequestReviewFeedbackClient {
     | { kind: "review_comment"; input: PullRequestReviewCommentFeedbackInput }
     | { kind: "issue_comment"; input: PullRequestIssueCommentFeedbackInput }
   > = [];
+
+  async getBranchHeadSha(): Promise<string> {
+    return "base-sha-2";
+  }
+
+  async gitAuthHeader(): Promise<string> {
+    return "AUTHORIZATION: basic test";
+  }
 
   async submitPullRequestReviewFeedback(input: PullRequestReviewFeedbackInput): Promise<PullRequestReviewFeedbackResult> {
     this.calls.push({ kind: "review", input });
@@ -395,4 +628,29 @@ function context(overrides: Partial<ReviewFeedbackActiveContext> = {}): ReviewFe
 
 function issueComment() {
   return { kind: "issue_comment" as const, body: "High-level note.", idempotencyKey: "issue-comment-1" };
+}
+
+function baseRefFailureObservation(
+  overrides: Partial<IssueBaseRefObservation> = {},
+): IssueBaseRefObservation {
+  return {
+    version: 1,
+    inputFingerprint: "review-feedback-base-ref-fingerprint",
+    classification: "branch_not_based_on_live_base",
+    operation: "review_feedback",
+    checkedAt: "2026-01-01T00:00:03.000Z",
+    workspacePath: "/tmp/symphony-pr-review-feedback",
+    branchName: "symphony/TEST-1",
+    baseRef: "origin/main",
+    normalizedBaseBranch: "main",
+    localBaseRef: "refs/remotes/origin/main",
+    githubBaseHeadSha: "base-sha-2",
+    localBaseHeadShaBeforeFetch: "base-sha-1",
+    localBaseHeadShaAfterFetch: "base-sha-2",
+    worktreeHeadSha: "abc123",
+    localBaseIsAncestorOfHead: false,
+    reason: "Worktree HEAD is not based on the live origin base",
+    error: null,
+    ...overrides,
+  };
 }

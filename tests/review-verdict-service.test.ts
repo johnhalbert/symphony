@@ -3,6 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { SymphonyError } from "../src/core/errors.js";
+import { createReviewFeedbackBaseRefProvenance } from "../src/core/BlockerProvenance.js";
+import type { IssueBaseRefObservation } from "../src/core/BaseRefVerification.js";
 import {
   FileIssueLifecycleStore,
   type IssueLifecycleRecord,
@@ -11,6 +13,7 @@ import {
 } from "../src/core/persistence/IssueLifecycleStore.js";
 import {
   formatWorkerMergeGatePromptResult,
+  planReviewVerdictSubmissionApplication,
   ReviewVerdictService,
   type ReviewVerdictActiveContext,
   type ReviewVerdictInput,
@@ -100,6 +103,55 @@ describe("ReviewVerdictService", () => {
     });
 
     expect(await outbox.list()).toHaveLength(0);
+  });
+
+  it("automatically links a blocked verdict to matching Symphony blocker provenance", async () => {
+    const { service, lifecycleStore } = fixture();
+    const observation = reviewFeedbackBaseRefObservation();
+    const provenance = createReviewFeedbackBaseRefProvenance({
+      issue: issue({ state: "In Review" }),
+      runId: "review-run-1",
+      pullRequestNumber: 42,
+      pullRequestHeadSha: "head-sha-1",
+      observation,
+    });
+    const report = completionReport();
+    await lifecycleStore.ensureIssue(issue({ state: "In Review" }), {
+      phase: "review",
+      lastCompletionReportId: report.id,
+      completionReports: [report],
+      baseRefObservation: observation,
+      blockerProvenances: [provenance],
+      activeBlockerProvenanceId: provenance.id,
+      summaryPointers: {
+        lastRunId: "review-run-1",
+        prUrl: report.pullRequest?.url ?? null,
+        prNumber: report.pullRequest?.number ?? null,
+        prHeadSha: report.pullRequest?.headSha ?? null,
+        prBranch: report.pullRequest?.branch ?? null,
+      },
+    });
+
+    const result = await service.submit_review_verdict(
+      blockedVerdict(),
+      context(),
+    );
+
+    expect(result.verdict.blockerProvenanceId).toBe(provenance.id);
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      reviewVerdictSubmissions: [
+        expect.objectContaining({
+          id: "review-verdict:issue-1:blocked-verdict-1",
+          blockerProvenanceId: provenance.id,
+        }),
+      ],
+      blockerProvenances: [
+        expect.objectContaining({
+          id: provenance.id,
+          reviewVerdictId: "review-verdict:issue-1:blocked-verdict-1",
+        }),
+      ],
+    });
   });
 
   it("rejects blocked verdicts for failed validation without non-worker-owned evidence", async () => {
@@ -300,16 +352,19 @@ describe("ReviewVerdictService", () => {
   });
 
   it("accepts a manual fail verdict with the issue state gate explicitly ignored", async () => {
-    const { service, lifecycleStore, outbox } = fixture();
-    await lifecycleStore.ensureIssue(issue({ state: "Todo" }), {
+    const { service, lifecycleStore, outbox, config } = fixture();
+    const candidate = issue({ state: "Todo", branchName: "symphony/TEST-1" });
+    const finalDisposition =
+      "Manual review failed outside the normal state gate.\n\nThe complete reviewer response remains visible without truncation.";
+    await lifecycleStore.ensureIssue(candidate, {
       phase: "review",
       reviewRound: 0,
     });
 
     const result = await service.submitReviewVerdict(
-      failVerdict(),
+      failVerdict({ finalDisposition }),
       context({
-        issue: issue({ state: "Todo", branchName: "symphony/TEST-1" }),
+        issue: candidate,
         ignoreStateGate: true,
       }),
     );
@@ -330,6 +385,34 @@ describe("ReviewVerdictService", () => {
       ],
     });
     expect(await outbox.list()).toHaveLength(0);
+
+    const lifecycle = await lifecycleStore.get("issue-1");
+    if (lifecycle === null) throw new Error("expected lifecycle");
+    const plan = planReviewVerdictSubmissionApplication({
+      config,
+      issue: candidate,
+      lifecycle,
+      submission: result.verdict,
+    });
+    expect(plan.operations).toHaveLength(1);
+    expect(plan.operations[0]).toMatchObject({
+      kind: "comment",
+      lifecycleBinding: {
+        kind: "review_verdict",
+        recordId: "review-verdict:issue-1:verdict-1",
+      },
+    });
+    expect(
+      plan.operations[0]?.kind === "comment"
+        ? plan.operations[0].payload.body
+        : "",
+    ).toContain(finalDisposition);
+    expect(plan.operations.some((operation) => operation.kind === "transition"))
+      .toBe(false);
+    expect(plan.verdict).toMatchObject({
+      finalDisposition,
+      writebackOperationKeys: [plan.operations[0]?.idempotencyKey],
+    });
   });
 
   it("rejects a pass verdict when the active reviewer run has not approved the lifecycle-bound PR", async () => {
@@ -538,6 +621,32 @@ describe("ReviewVerdictService", () => {
     expect(await outbox.list()).toHaveLength(0);
   });
 
+  it("rejects canonical reviewer disposition drift on same-run replay", async () => {
+    const { service, lifecycleStore } = fixture();
+    await lifecycleStore.ensureIssue(issue({ state: "In Review" }), {
+      phase: "review",
+    });
+    const original = failVerdict();
+    const changedDisposition = "A corrected but different full reviewer disposition.";
+
+    await service.submitReviewVerdict(original, context());
+
+    await expect(
+      service.submitReviewVerdict(
+        failVerdict({ finalDisposition: changedDisposition }),
+        context(),
+      ),
+    ).rejects.toMatchObject({
+      code: "conflict",
+      message: "Review verdict idempotency key was reused with a different final disposition",
+    });
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      reviewVerdictSubmissions: [
+        expect.objectContaining({ finalDisposition: original.finalDisposition }),
+      ],
+    });
+  });
+
   it("rejects review verdict idempotency key reuse from another reviewer run", async () => {
     const { service, lifecycleStore } = fixture();
     await lifecycleStore.ensureIssue(issue({ state: "In Review" }), {
@@ -734,7 +843,7 @@ describe("ReviewVerdictService", () => {
     const lifecycleStore = new FileIssueLifecycleStore(root);
     const outbox = new FileWritebackOutboxStore(root);
     const service = new ReviewVerdictService({ config, lifecycleStore, writebackOutbox: outbox });
-    return { service, lifecycleStore, outbox };
+    return { service, lifecycleStore, outbox, config };
   }
 });
 
@@ -960,10 +1069,33 @@ function completionReport(
   };
 }
 
+function reviewFeedbackBaseRefObservation(): IssueBaseRefObservation {
+  return {
+    version: 1,
+    inputFingerprint: "review-feedback-base-ref-fingerprint",
+    classification: "branch_not_based_on_live_base",
+    operation: "review_feedback",
+    checkedAt: "2026-01-01T00:00:02.000Z",
+    workspacePath: "/repo",
+    branchName: "symphony/TEST-1",
+    baseRef: "origin/main",
+    normalizedBaseBranch: "main",
+    localBaseRef: "refs/remotes/origin/main",
+    githubBaseHeadSha: "base-sha-2",
+    localBaseHeadShaBeforeFetch: "base-sha-1",
+    localBaseHeadShaAfterFetch: "base-sha-2",
+    worktreeHeadSha: "head-sha-1",
+    localBaseIsAncestorOfHead: false,
+    reason: "Worktree HEAD is not based on the live origin base",
+    error: null,
+  };
+}
+
 function failVerdict(overrides: Partial<ReviewVerdictInput> = {}): ReviewVerdictInput {
   return {
     runId: "review-run-1",
     issueId: "issue-1",
+    finalDisposition: "Review failed because the implementation still needs a bounded repair.",
     verdict: "fail",
     acceptanceResults: [
       {
@@ -984,6 +1116,7 @@ function passVerdict(overrides: Partial<ReviewVerdictInput> = {}): ReviewVerdict
   return {
     runId: "review-run-1",
     issueId: "issue-1",
+    finalDisposition: "Review passed because all acceptance criteria are satisfied.",
     verdict: "pass",
     acceptanceResults: [
       {
@@ -1004,6 +1137,7 @@ function blockedVerdict(overrides: Partial<ReviewVerdictInput> = {}): ReviewVerd
   return {
     runId: "review-run-1",
     issueId: "issue-1",
+    finalDisposition: "Review is blocked by a non-worker-owned validation constraint.",
     verdict: "blocked",
     acceptanceResults: [
       {

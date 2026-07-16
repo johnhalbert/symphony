@@ -7,6 +7,7 @@ import {
   issueTriageTriggerFingerprint,
   legacyIssueTriageReportRequestHash,
   parseIssueTriageReport,
+  preFinalDispositionIssueTriageReportRequestHash,
   shouldIssueTriageRun,
 } from "../src/core/IssueTriageService.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
@@ -43,6 +44,8 @@ describe("IssueTriageService", () => {
       runId: "triage-run-1",
       issueId: candidate.id,
       triggerFingerprint: issueTriageTriggerFingerprint(lifecycle),
+      finalDisposition:
+        "The active blocker is an underspecified contract that needs planner decomposition.\n\nAfter decomposition, rerun the merge gate because that downstream blocker may remain.",
       summary: "Review failures repeatedly exposed missing sibling API scope.",
       blockers: [
         {
@@ -100,10 +103,12 @@ describe("IssueTriageService", () => {
     expect(writebacks[0]?.kind === "comment" ? writebacks[0].payload.body : "").toContain(
       "Use SpecKit to decompose the hidden sibling API scope into blocking child issues.",
     );
+    expect(writebacks[0]?.kind === "comment" ? writebacks[0].payload.body : "").toContain(input.finalDisposition);
     await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
       lastIssueTriageReportId: "issue-triage-report:issue-1:triage-1",
       issueTriageReports: [
         {
+          finalDisposition: input.finalDisposition,
           disposition: "decompose_issue",
           confidence: "high",
           blockers: [
@@ -217,6 +222,7 @@ describe("IssueTriageService", () => {
       runId: "triage-run-legacy",
       issueId: candidate.id,
       triggerFingerprint: issueTriageTriggerFingerprint(lifecycle),
+      finalDisposition: "The legacy triage replay was evaluated without synthesizing a stored disposition.",
       disposition: "implementation_repair",
       confidence: "medium",
       summary: "Worker missed a concrete reviewer finding.",
@@ -257,7 +263,57 @@ describe("IssueTriageService", () => {
     });
 
     expect(replayed.replayed).toBe(true);
+    expect(replayed.report).not.toHaveProperty("finalDisposition");
     await expect(writebackOutbox.list()).resolves.toEqual([]);
+  });
+
+  it("replays only disposition-free structured reports with the pre-finalDisposition request hash", async () => {
+    const config = testConfig(root);
+    config.issueTriage.enabled = true;
+    config.writeback.enabled = true;
+    const candidate = issue({ state: "Blocked" });
+    const lifecycleStore = new FileIssueLifecycleStore(root);
+    const writebackOutbox = new FileWritebackOutboxStore(root);
+    const lifecycle = await lifecycleStore.ensureIssue(candidate, {
+      phase: "blocked",
+      reviewRound: 3,
+      blockedReason: "max reviewer failures reached (3/3)",
+    });
+    const service = new IssueTriageService({ config, lifecycleStore, writebackOutbox });
+    const input = reportInput(
+      "triage-run-structured-legacy",
+      "triage-structured-legacy",
+      issueTriageTriggerFingerprint(lifecycle),
+    );
+    const context = {
+      issue: candidate,
+      activeRunId: input.runId,
+      role: "triage",
+      phase: "issue_triage",
+    } as const;
+    const accepted = await service.submitIssueTriageReport(input, context);
+    const legacyReport = {
+      ...accepted.report,
+      requestHash: preFinalDispositionIssueTriageReportRequestHash(
+        parseIssueTriageReport(input),
+      ),
+    };
+    delete legacyReport.finalDisposition;
+    await lifecycleStore.updateIssue(candidate, {
+      issueTriageReports: [legacyReport],
+      lastIssueTriageReportId: legacyReport.id,
+    });
+
+    const replayed = await service.submitIssueTriageReport(input, context);
+
+    expect(replayed.replayed).toBe(true);
+    expect(replayed.report).not.toHaveProperty("finalDisposition");
+    expect(await writebackOutbox.list()).toHaveLength(1);
+
+    await lifecycleStore.updateIssue(candidate, {
+      issueTriageReports: [{ ...legacyReport, finalDisposition: input.finalDisposition }],
+    });
+    await expect(service.submitIssueTriageReport(input, context)).rejects.toMatchObject({ code: "conflict" });
   });
 });
 
@@ -266,6 +322,7 @@ function reportInput(runId: string, idempotencyKey: string, triggerFingerprint: 
     runId,
     issueId: "issue-1",
     triggerFingerprint,
+    finalDisposition: "The issue requires another implementation pass for the remaining reviewer finding.",
     summary: "Worker missed a concrete reviewer finding.",
     blockers: [
       {

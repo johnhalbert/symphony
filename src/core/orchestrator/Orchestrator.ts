@@ -11,6 +11,15 @@ import {
   type IssueBaseRefObservation,
 } from "../BaseRefVerification.js";
 import { SymphonyError, errorMessage } from "../errors.js";
+import {
+  activateBlockerProvenancePatch,
+  activeBlockerProvenance,
+  blockerProvenanceMatchesObservation,
+  createBaseRefBlockerProvenance,
+  resolveActiveBlockerProvenancePatch,
+  updateBaseRefBlockerProvenanceObservationPatch,
+  updateReviewFeedbackBaseRefProvenanceObservationPatch,
+} from "../BlockerProvenance.js";
 import type {
   AgentActivitySource,
   AgentEvent,
@@ -170,6 +179,7 @@ import {
   latestCurrentApprovalPassVerdict,
   phaseForIssueState,
   type IssueBreakdownPlanRecord,
+  type IssueBlockerProvenanceRecord,
   type IssueCompletionReportRejectionRecord,
   type IssueCompletionReportRecord,
   type IssueAcceptedArtifactRecord,
@@ -230,6 +240,7 @@ import {
   type ContinuationSummarizer,
 } from "../summarization/ContinuationSummarizer.js";
 import {
+  bindWritebackOperationToLifecycle,
   SqliteWritebackOutboxStore,
   type WritebackProcessor,
 } from "../writeback/WritebackOutbox.js";
@@ -284,6 +295,7 @@ export interface OrchestratorOptions {
   pullRequestClient?: PullRequestDiscoveryClient;
   pullRequestReviewClient?: PullRequestReviewEvidenceClient;
   pullRequestMergeClient?: MergePolicyGitHubClient;
+  baseRefVerifier?: Pick<BaseRefVerifier, "verify">;
   completionReportPublisher?: CompletionReportPullRequestPublisher;
   acceptedArtifactClient?: AcceptedArtifactGitHubClient;
   operatorApproval?: Pick<
@@ -587,6 +599,7 @@ interface RetryTransitionScratch {
 interface BlockIssueTransitionScratch {
   lifecycle?: IssueLifecycleRecord;
   blockedLifecycle?: IssueLifecycleRecord;
+  blockerProvenance?: IssueBlockerProvenanceRecord;
   reason?: string;
   runId?: string;
 }
@@ -1050,6 +1063,9 @@ export class Orchestrator {
   constructor(private readonly options: OrchestratorOptions) {
     this.config = options.config;
     this.promptTemplate = options.promptTemplate;
+    if (options.writeback && options.lifecycleStore) {
+      options.writeback.bindLifecycleStore(options.lifecycleStore);
+    }
     this.providerGateStore =
       options.providerGateStore ??
       new FileProviderGateStore(options.config.workspace.stateDir);
@@ -3756,6 +3772,29 @@ export class Orchestrator {
         },
       },
       {
+        id: "record_merge_conflict_lifecycle",
+        execute: async (context) => {
+          const service = this.mergePolicyServiceForContext(context);
+          const preparationPlan = context.mergePolicy.conflictPreparationPlan;
+          const execution = context.mergePolicy.conflictPreparationExecution;
+          const writebackPlan = context.mergePolicy.conflictWritebackPlan;
+          if (!preparationPlan || !execution || !writebackPlan) {
+            throw new SymphonyError(
+              "invalid_request",
+              "Merge conflict lifecycle update requires preparation output",
+            );
+          }
+          const result = await service.recordServicePreparedMergeConflict(
+            context.issue,
+            preparationPlan,
+            execution,
+            writebackPlan,
+          );
+          context.mergePolicy.result = result;
+          return { details: result };
+        },
+      },
+      {
         id: "apply_merge_conflict_writebacks",
         execute: async (context) => {
           const service = this.mergePolicyServiceForContext(context);
@@ -3779,29 +3818,6 @@ export class Orchestrator {
             preparationPlan,
             writebackPlan,
           );
-          return { details: result };
-        },
-      },
-      {
-        id: "record_merge_conflict_lifecycle",
-        execute: async (context) => {
-          const service = this.mergePolicyServiceForContext(context);
-          const preparationPlan = context.mergePolicy.conflictPreparationPlan;
-          const execution = context.mergePolicy.conflictPreparationExecution;
-          const writebackPlan = context.mergePolicy.conflictWritebackPlan;
-          if (!preparationPlan || !execution || !writebackPlan) {
-            throw new SymphonyError(
-              "invalid_request",
-              "Merge conflict lifecycle update requires preparation output",
-            );
-          }
-          const result = await service.recordServicePreparedMergeConflict(
-            context.issue,
-            preparationPlan,
-            execution,
-            writebackPlan,
-          );
-          context.mergePolicy.result = result;
           return { details: result };
         },
       },
@@ -3993,23 +4009,6 @@ export class Orchestrator {
             },
           },
           {
-            id: "apply_head_supersession_writebacks",
-            execute: async (context) => {
-              const service = this.mergePolicyServiceForContext(context);
-              const plan = context.mergePolicy.headSupersessionPlan;
-              if (!plan)
-                throw new SymphonyError(
-                  "invalid_request",
-                  "Head supersession writeback requires a plan",
-                );
-              const result = await service.applyHeadSupersessionWritebacks(
-                context.issue,
-                plan,
-              );
-              return { details: result };
-            },
-          },
-          {
             id: "record_head_supersession_lifecycle",
             execute: async (context) => {
               const service = this.mergePolicyServiceForContext(context);
@@ -4024,6 +4023,23 @@ export class Orchestrator {
                 plan,
               );
               context.mergePolicy.result = result;
+              return { details: result };
+            },
+          },
+          {
+            id: "apply_head_supersession_writebacks",
+            execute: async (context) => {
+              const service = this.mergePolicyServiceForContext(context);
+              const plan = context.mergePolicy.headSupersessionPlan;
+              if (!plan)
+                throw new SymphonyError(
+                  "invalid_request",
+                  "Head supersession writeback requires a plan",
+                );
+              const result = await service.applyHeadSupersessionWritebacks(
+                context.issue,
+                plan,
+              );
               return { details: result };
             },
           },
@@ -4129,23 +4145,6 @@ export class Orchestrator {
             },
           },
           {
-            id: "apply_merge_gate_repair_writebacks",
-            execute: async (context) => {
-              const service = this.mergePolicyServiceForContext(context);
-              const plan = context.mergePolicy.gateFailurePlan;
-              if (!plan)
-                throw new SymphonyError(
-                  "invalid_request",
-                  "Merge gate repair writeback requires a plan",
-                );
-              const result = await service.applyMergeGateFailureWritebacks(
-                context.issue,
-                plan,
-              );
-              return { details: result };
-            },
-          },
-          {
             id: "record_merge_gate_repair_lifecycle",
             execute: async (context) => {
               const service = this.mergePolicyServiceForContext(context);
@@ -4160,6 +4159,23 @@ export class Orchestrator {
                 plan,
               );
               context.mergePolicy.result = result;
+              return { details: result };
+            },
+          },
+          {
+            id: "apply_merge_gate_repair_writebacks",
+            execute: async (context) => {
+              const service = this.mergePolicyServiceForContext(context);
+              const plan = context.mergePolicy.gateFailurePlan;
+              if (!plan)
+                throw new SymphonyError(
+                  "invalid_request",
+                  "Merge gate repair writeback requires a plan",
+                );
+              const result = await service.applyMergeGateFailureWritebacks(
+                context.issue,
+                plan,
+              );
               return { details: result };
             },
           },
@@ -4194,23 +4210,6 @@ export class Orchestrator {
             },
           },
           {
-            id: "apply_merge_gate_blocked_writebacks",
-            execute: async (context) => {
-              const service = this.mergePolicyServiceForContext(context);
-              const plan = context.mergePolicy.gateFailurePlan;
-              if (!plan)
-                throw new SymphonyError(
-                  "invalid_request",
-                  "Merge gate blocked writeback requires a plan",
-                );
-              const result = await service.applyMergeGateFailureWritebacks(
-                context.issue,
-                plan,
-              );
-              return { details: result };
-            },
-          },
-          {
             id: "record_merge_gate_blocked_lifecycle",
             execute: async (context) => {
               const service = this.mergePolicyServiceForContext(context);
@@ -4225,6 +4224,23 @@ export class Orchestrator {
                 plan,
               );
               context.mergePolicy.result = result;
+              return { details: result };
+            },
+          },
+          {
+            id: "apply_merge_gate_blocked_writebacks",
+            execute: async (context) => {
+              const service = this.mergePolicyServiceForContext(context);
+              const plan = context.mergePolicy.gateFailurePlan;
+              if (!plan)
+                throw new SymphonyError(
+                  "invalid_request",
+                  "Merge gate blocked writeback requires a plan",
+                );
+              const result = await service.applyMergeGateFailureWritebacks(
+                context.issue,
+                plan,
+              );
               return { details: result };
             },
           },
@@ -5157,14 +5173,14 @@ export class Orchestrator {
               this.planHeadSupersessionRecoveryWritebacksAction(context),
           },
           {
-            id: "apply_head_supersession_recovery_writebacks",
-            execute: (context) =>
-              this.applyHeadSupersessionRecoveryWritebacksAction(context),
-          },
-          {
             id: "update_lifecycle_head_supersession_recovered",
             execute: (context) =>
               this.updateLifecycleHeadSupersessionRecoveredAction(context),
+          },
+          {
+            id: "apply_head_supersession_recovery_writebacks",
+            execute: (context) =>
+              this.applyHeadSupersessionRecoveryWritebacksAction(context),
           },
         ],
       },
@@ -6170,7 +6186,7 @@ export class Orchestrator {
         message: "No completion report exists for run",
       };
     if (
-      !isFinalizedCompletionReport(report) &&
+      !isFinalizedCompletionReport(report, lifecycle) &&
       !pendingPublicationHandoffForRun(lifecycle, { runId: loaded.runId })
     ) {
       if (lifecycle.phase !== "review" || lifecycle.blockedReason !== null) {
@@ -6187,7 +6203,7 @@ export class Orchestrator {
       details: {
         reportId: report.id,
         runId: loaded.runId,
-        finalized: isFinalizedCompletionReport(report),
+        finalized: isFinalizedCompletionReport(report, lifecycle),
       },
     };
   }
@@ -6207,13 +6223,13 @@ export class Orchestrator {
     entry.lifecycle = lifecycle;
     entry.completionReportAccepted = true;
     return {
-      message: isFinalizedCompletionReport(report)
+      message: isFinalizedCompletionReport(report, lifecycle)
         ? "Completion report accepted"
         : "Completion report accepted pending publication",
       details: {
         reportId: report.id,
         runId: context.handoffReconciliation.runId ?? report.runId,
-        finalized: isFinalizedCompletionReport(report),
+        finalized: isFinalizedCompletionReport(report, lifecycle),
       },
     };
   }
@@ -6229,7 +6245,7 @@ export class Orchestrator {
         stop: true,
         message: "Completion report handoff was not loaded",
       };
-    if (!isFinalizedCompletionReport(report))
+    if (!isFinalizedCompletionReport(report, context.handoffReconciliation.lifecycle))
       return {
         status: "skipped" as const,
         message: "Completion report is pending publication",
@@ -7685,7 +7701,7 @@ export class Orchestrator {
         message: "Head supersession recovery preconditions no longer match",
       };
     }
-    const operations = planMergeGateHeadSupersessionRecoveryWritebacks(
+    const rawOperations = planMergeGateHeadSupersessionRecoveryWritebacks(
       {
         issue: context.issue,
         gateId: gate.id,
@@ -7696,12 +7712,28 @@ export class Orchestrator {
       },
       this.config,
     );
-    if (operations.length === 0)
+    if (rawOperations.length === 0)
       return {
         status: "skipped" as const,
         stop: true,
         message: "No head supersession recovery writebacks were planned",
       };
+    const supersededByHeadSha = gate.supersededByHeadSha;
+    if (supersededByHeadSha === null) {
+      throw new SymphonyError(
+        "invalid_request",
+        "Head supersession recovery requires a superseding PR head",
+      );
+    }
+    const operations = rawOperations.map((operation) =>
+      bindWritebackOperationToLifecycle(operation, {
+        kind: "merge_gate",
+        recordId: gate.id,
+        status: "superseded",
+        headSha: gate.headSha,
+        supersededByHeadSha,
+      }),
+    );
     context.headSupersessionRecovery.lifecycle = lifecycle;
     context.headSupersessionRecovery.report = report;
     context.headSupersessionRecovery.verdict = verdict;
@@ -7750,20 +7782,48 @@ export class Orchestrator {
   private async updateLifecycleHeadSupersessionRecoveredAction(
     context: OrchestratorTransitionContext,
   ) {
+    const lifecycle = context.headSupersessionRecovery.lifecycle;
     const report = context.headSupersessionRecovery.report;
     const verdict = context.headSupersessionRecovery.verdict;
-    if (!report || !verdict)
+    const operations = context.headSupersessionRecovery.operations ?? [];
+    const gate = lifecycle?.mergeGate ?? null;
+    if (
+      !report ||
+      !verdict ||
+      gate === null ||
+      gate.status !== "superseded" ||
+      gate.supersededByHeadSha === null ||
+      operations.length === 0
+    )
       return {
         status: "skipped" as const,
         stop: true,
         message: "Head supersession recovery state was not prepared",
       };
+    if (!this.options.writeback) {
+      throw new SymphonyError(
+        "invalid_request",
+        "Head supersession recovery requires service-owned writeback",
+      );
+    }
+    for (const operation of operations) {
+      await this.options.writeback.enqueue(operation);
+    }
     await this.updateIssueLifecycleWithEvidence(
       context.issue,
       {
         phase: "passed",
         blockedReason: null,
         lastReviewVerdictId: verdict.id,
+        mergeGate: {
+          ...gate,
+          writebackOperationKeys: [
+            ...new Set([
+              ...gate.writebackOperationKeys,
+              ...operations.map((operation) => operation.idempotencyKey),
+            ]),
+          ],
+        },
         summaryPointers: { ciStatus: null },
       },
       "merge_gate_head_supersession_rebind",
@@ -8231,6 +8291,42 @@ export class Orchestrator {
         stop: true,
         message: "No lifecycle exists for blocked transition",
       };
+    if (context.transition.transitionKind === "base_ref_block") {
+      const requestedProvenanceId = nonEmptyString(
+        context.transition.blockerProvenanceId,
+      );
+      const observation = context.transition.lastBaseRefObservation ?? null;
+      const requestedFingerprint = nonEmptyString(
+        context.transition.baseRefObservationFingerprint,
+      );
+      const requestedClassification = nonEmptyString(
+        context.transition.baseRefObservationClassification,
+      );
+      const currentObservation = lifecycle.baseRefObservation ?? null;
+      const provenance = activeBlockerProvenance(lifecycle);
+      if (
+        requestedProvenanceId === null ||
+        observation === null ||
+        currentObservation === null ||
+        provenance === null ||
+        provenance.id !== requestedProvenanceId ||
+        requestedFingerprint !== observation.inputFingerprint ||
+        requestedClassification !== observation.classification ||
+        !sameBaseRefObservationIdentity(currentObservation, observation) ||
+        !blockerProvenanceMatchesObservation(provenance, currentObservation, {
+          runId: lifecycle.summaryPointers.lastRunId ?? context.issue.id,
+          pullRequestNumber: lifecycle.summaryPointers.prNumber ?? null,
+          pullRequestHeadSha: lifecycle.summaryPointers.prHeadSha ?? null,
+        })
+      ) {
+        return {
+          status: "skipped" as const,
+          stop: true,
+          message: "Base ref block blocker provenance is stale",
+        };
+      }
+      context.blockIssue.blockerProvenance = provenance;
+    }
     context.blockIssue.lifecycle = lifecycle;
     context.blockIssue.reason =
       nonEmptyString(context.transition.blockedReason) ??
@@ -8252,7 +8348,178 @@ export class Orchestrator {
     context: OrchestratorTransitionContext,
   ) {
     const targetRequest = baseRefTargetRequestFromTransition(context.transition);
-    if (targetRequest === null) {
+    const persistedLifecycle =
+      (await this.options.lifecycleStore?.get(context.issue.id)) ?? null;
+    const requestedProvenanceId = nonEmptyString(
+      context.transition.blockerProvenanceId,
+    );
+    const requestedOperation = nonEmptyString(
+      context.transition.baseRefObservationOperation,
+    );
+    let reviewFeedbackReobservation: {
+      lifecycle: IssueLifecycleRecord;
+      provenance: IssueBlockerProvenanceRecord;
+    } | null = null;
+    let operatorResumeProvenance: {
+      lifecycle: IssueLifecycleRecord;
+      provenance: IssueBlockerProvenanceRecord;
+    } | null = null;
+    let baseRefRecheckProvenance: {
+      lifecycle: IssueLifecycleRecord;
+      provenance: IssueBlockerProvenanceRecord;
+    } | null = null;
+    if (
+      targetRequest === null &&
+      requestedProvenanceId !== null &&
+      requestedOperation === "review_feedback"
+    ) {
+      const sourceObservation = context.transition.lastBaseRefObservation ?? null;
+      const lifecycle = persistedLifecycle;
+      const provenance =
+        lifecycle === undefined || lifecycle === null
+          ? null
+          : activeBlockerProvenance(lifecycle);
+      const snapshotProvenance =
+        sourceObservation === null
+          ? null
+          : reviewFeedbackBaseRefProvenanceApplies(
+              context.transition,
+              sourceObservation,
+            );
+      const expectedAttempt = context.transition.baseRefObservationAttempt;
+      if (
+        sourceObservation === null ||
+        lifecycle === undefined ||
+        lifecycle === null ||
+        provenance === null ||
+        snapshotProvenance === null ||
+        provenance.id !== requestedProvenanceId ||
+        snapshotProvenance.id !== requestedProvenanceId ||
+        lifecycle.baseRefObservation == null ||
+        !sameBaseRefObservationIdentity(
+          lifecycle.baseRefObservation,
+          sourceObservation,
+        ) ||
+        !blockerProvenanceMatchesObservation(provenance, sourceObservation, {
+          runId: lifecycle.summaryPointers.lastRunId ?? context.issue.id,
+          pullRequestNumber: lifecycle.summaryPointers.prNumber ?? null,
+          pullRequestHeadSha: lifecycle.summaryPointers.prHeadSha ?? null,
+        }) ||
+        (typeof expectedAttempt === "number" &&
+          provenance.observationAttempt !== expectedAttempt)
+      ) {
+        return {
+          status: "skipped" as const,
+          stop: true,
+          message: "Review-feedback base ref blocker provenance is stale",
+        };
+      }
+      reviewFeedbackReobservation = { lifecycle, provenance };
+    }
+    if (
+      targetRequest !== null &&
+      requestedProvenanceId !== null &&
+      requestedOperation === "operator_resume"
+    ) {
+      const sourceObservation = context.transition.lastBaseRefObservation ?? null;
+      const requestedFingerprint = nonEmptyString(
+        context.transition.baseRefObservationFingerprint,
+      );
+      const requestedClassification = nonEmptyString(
+        context.transition.baseRefObservationClassification,
+      );
+      const lifecycle = persistedLifecycle;
+      const provenance =
+        lifecycle === undefined || lifecycle === null
+          ? null
+          : activeBlockerProvenance(lifecycle);
+      if (
+        sourceObservation === null ||
+        lifecycle === undefined ||
+        lifecycle === null ||
+        provenance === null ||
+        provenance.id !== requestedProvenanceId ||
+        requestedFingerprint !== sourceObservation.inputFingerprint ||
+        requestedClassification !== sourceObservation.classification ||
+        lifecycle.baseRefObservation == null ||
+        !sameBaseRefObservationIdentity(
+          lifecycle.baseRefObservation,
+          sourceObservation,
+        ) ||
+        !blockerProvenanceMatchesObservation(provenance, sourceObservation, {
+          runId: lifecycle.summaryPointers.lastRunId ?? context.issue.id,
+          pullRequestNumber: lifecycle.summaryPointers.prNumber ?? null,
+          pullRequestHeadSha: lifecycle.summaryPointers.prHeadSha ?? null,
+        }) ||
+        (lifecycle.mergeConflict?.blockerProvenanceId === provenance.id &&
+          lifecycle.mergeConflict.status !== "resolved")
+      ) {
+        return {
+          status: "skipped" as const,
+          stop: true,
+          message: "Operator-resume base ref blocker provenance is stale or carried by an unfinished conflict",
+        };
+      }
+      operatorResumeProvenance = { lifecycle, provenance };
+    }
+    if (
+      requestedProvenanceId !== null &&
+      requestedOperation === "base_ref_recheck"
+    ) {
+      const sourceObservation = context.transition.lastBaseRefObservation ?? null;
+      const lifecycle = persistedLifecycle;
+      const provenance =
+        lifecycle === null ? null : activeBlockerProvenance(lifecycle);
+      const expectedAttempt = context.transition.baseRefObservationAttempt;
+      if (
+        sourceObservation === null ||
+        lifecycle === null ||
+        provenance === null ||
+        provenance.id !== requestedProvenanceId ||
+        lifecycle.baseRefObservation == null ||
+        !sameBaseRefObservationIdentity(
+          lifecycle.baseRefObservation,
+          sourceObservation,
+        ) ||
+        !blockerProvenanceMatchesObservation(
+          provenance,
+          lifecycle.baseRefObservation,
+          {
+            runId: lifecycle.summaryPointers.lastRunId ?? context.issue.id,
+            pullRequestNumber: lifecycle.summaryPointers.prNumber ?? null,
+            pullRequestHeadSha: lifecycle.summaryPointers.prHeadSha ?? null,
+          },
+        ) ||
+        (typeof expectedAttempt === "number" &&
+          provenance.observationAttempt !== expectedAttempt) ||
+        (lifecycle.mergeConflict?.blockerProvenanceId === provenance.id &&
+          lifecycle.mergeConflict.status !== "resolved")
+      ) {
+        return {
+          status: "skipped" as const,
+          stop: true,
+          message: "Base ref recheck blocker provenance is stale",
+        };
+      }
+      baseRefRecheckProvenance = { lifecycle, provenance };
+    }
+    if (
+      requestedProvenanceId !== null &&
+      reviewFeedbackReobservation === null &&
+      operatorResumeProvenance === null &&
+      baseRefRecheckProvenance === null
+    ) {
+      return {
+        status: "skipped" as const,
+        stop: true,
+        message: "Base ref observation blocker provenance operation is invalid",
+      };
+    }
+    if (
+      targetRequest === null &&
+      reviewFeedbackReobservation === null &&
+      baseRefRecheckProvenance === null
+    ) {
       return {
         status: "skipped" as const,
         stop: true,
@@ -8267,22 +8534,165 @@ export class Orchestrator {
     const baseRef =
       nonEmptyString(context.transition.latestBaseRef) ??
       nonEmptyString(this.config.workspace.source.baseRef);
+    const operation =
+      reviewFeedbackReobservation !== null
+        ? "review_feedback"
+        : baseRefRecheckProvenance !== null
+          ? baseRefRecheckProvenance.provenance.operation
+          : targetRequest?.transitionKind;
+    if (operation === undefined) {
+      return {
+        status: "skipped" as const,
+        stop: true,
+        message: "Base ref observation operation is missing",
+      };
+    }
     const client =
       this.options.pullRequestMergeClient ??
-      createGitHubPullRequestClientForCapability(this.config, "github.merge");
-    const observation = await new BaseRefVerifier().verify({
+      createGitHubPullRequestClientForCapability(
+        this.config,
+        operation === "review_feedback"
+          ? "github.review_feedback_write"
+          : "github.merge",
+      );
+    const observation = await (
+      this.options.baseRefVerifier ?? new BaseRefVerifier()
+    ).verify({
       workspacePath,
       branchName,
       baseRef,
-      operation: targetRequest.transitionKind,
+      operation,
       client,
     });
     context.baseRef.observation = observation;
+    let observationBlockerProvenanceId: string | null = null;
+    let lifecyclePatch: IssueLifecyclePatch = {
+      baseRefObservation: observation,
+    };
+    if (reviewFeedbackReobservation !== null) {
+      const { lifecycle, provenance } = reviewFeedbackReobservation;
+      const provenanceObservationPatch =
+        updateReviewFeedbackBaseRefProvenanceObservationPatch(
+          lifecycle,
+          provenance.id,
+          observation,
+        );
+      if (observation.classification === "ok") {
+        const observedLifecycle = {
+          ...lifecycle,
+          ...provenanceObservationPatch,
+        };
+        lifecyclePatch = {
+          phase: "review",
+          blockedReason: null,
+          baseRefObservation: observation,
+          ...resolveActiveBlockerProvenancePatch(observedLifecycle, {
+            expectedProvenanceId: provenance.id,
+            resolution: "base_ref_recheck",
+            resolvedAt: observation.checkedAt,
+          }),
+        };
+      } else {
+        observationBlockerProvenanceId = provenance.id;
+        lifecyclePatch = {
+          phase: "blocked",
+          blockedReason: baseRefBlockedReason(observation),
+          baseRefObservation: observation,
+          ...provenanceObservationPatch,
+        };
+      }
+    } else if (operatorResumeProvenance !== null) {
+      const { lifecycle, provenance } = operatorResumeProvenance;
+      const resetPatch = this.operatorFailureBudgetResetPatch(
+        context.issue,
+        lifecycle,
+      );
+      if (observation.classification === "ok") {
+        lifecyclePatch = {
+          ...resetPatch,
+          baseRefObservation: observation,
+          ...resolveActiveBlockerProvenancePatch(lifecycle, {
+            expectedProvenanceId: provenance.id,
+            resolution: "superseded",
+            resolvedAt: observation.checkedAt,
+          }),
+        };
+      } else {
+        const replacement = createBaseRefBlockerProvenance({
+          issue: context.issue,
+          runId:
+            nonEmptyString(context.transition.latestRunId) ??
+            lifecycle.summaryPointers.lastRunId ??
+            context.issue.id,
+          pullRequestNumber: lifecycle.summaryPointers.prNumber ?? null,
+          pullRequestHeadSha: lifecycle.summaryPointers.prHeadSha ?? null,
+          observation,
+        });
+        observationBlockerProvenanceId = replacement.id;
+        lifecyclePatch = {
+          ...resetPatch,
+          baseRefObservation: observation,
+          ...activateBlockerProvenancePatch(lifecycle, replacement),
+        };
+      }
+    } else if (baseRefRecheckProvenance !== null) {
+      const { lifecycle, provenance } = baseRefRecheckProvenance;
+      const observationPatch =
+        updateBaseRefBlockerProvenanceObservationPatch(
+          lifecycle,
+          provenance.id,
+          observation,
+        );
+      const observedLifecycle = { ...lifecycle, ...observationPatch };
+      if (observation.classification === "ok") {
+        lifecyclePatch = {
+          baseRefObservation: observation,
+          ...resolveActiveBlockerProvenancePatch(observedLifecycle, {
+            expectedProvenanceId: provenance.id,
+            resolution: "base_ref_recheck",
+            resolvedAt: observation.checkedAt,
+          }),
+        };
+      } else {
+        observationBlockerProvenanceId = provenance.id;
+        lifecyclePatch = {
+          baseRefObservation: observation,
+          ...observationPatch,
+        };
+      }
+    } else if (observation.classification !== "ok") {
+      if (persistedLifecycle === null) {
+        return {
+          status: "skipped" as const,
+          stop: true,
+          message: "Non-OK base ref observation requires blocker provenance persistence",
+        };
+      }
+      const provenance = createBaseRefBlockerProvenance({
+        issue: context.issue,
+        runId:
+          nonEmptyString(context.transition.latestRunId) ??
+          persistedLifecycle.summaryPointers.lastRunId ??
+          context.issue.id,
+        pullRequestNumber:
+          persistedLifecycle.summaryPointers.prNumber ?? null,
+        pullRequestHeadSha:
+          persistedLifecycle.summaryPointers.prHeadSha ?? null,
+        observation,
+      });
+      observationBlockerProvenanceId = provenance.id;
+      lifecyclePatch = {
+        baseRefObservation: observation,
+        ...activateBlockerProvenancePatch(persistedLifecycle, provenance),
+      };
+    }
     const lifecycle =
       (await this.updateIssueLifecycleWithEvidence(
         context.issue,
-        { baseRefObservation: observation },
-        "base_ref_observed",
+        lifecyclePatch,
+        reviewFeedbackReobservation === null
+          ? "base_ref_observed"
+          : "review_feedback_base_ref_reobserved",
         context.transition.historySnapshotId,
       )) ?? null;
     if (lifecycle === null) {
@@ -8294,7 +8704,33 @@ export class Orchestrator {
     }
     return {
       details: {
-        targetTransitionKind: targetRequest.transitionKind,
+        targetTransitionKind: targetRequest?.transitionKind ?? null,
+        operation,
+        ...(reviewFeedbackReobservation === null
+          ? {
+              ...(operatorResumeProvenance === null
+                ? {}
+                : {
+                    supersededBlockerProvenanceId:
+                      operatorResumeProvenance.provenance.id,
+                  }),
+              ...(observationBlockerProvenanceId === null
+                ? {}
+                : {
+                    blockerProvenanceId: observationBlockerProvenanceId,
+                    observationAttempt:
+                      activeBlockerProvenance(lifecycle)?.observationAttempt ??
+                      1,
+                  }),
+            }
+          : {
+              blockerProvenanceId:
+                observationBlockerProvenanceId ??
+                lifecycle.activeBlockerProvenanceId ??
+                reviewFeedbackReobservation.provenance.id,
+              observationAttempt:
+                reviewFeedbackReobservation.provenance.observationAttempt + 1,
+            }),
         classification: observation.classification,
         inputFingerprint: observation.inputFingerprint,
         workspacePath: observation.workspacePath,
@@ -8316,6 +8752,9 @@ export class Orchestrator {
     const requestedFingerprint = nonEmptyString(
       context.transition.baseRefObservationFingerprint,
     );
+    const requestedClassification = nonEmptyString(
+      context.transition.baseRefObservationClassification,
+    );
     if (observation === null) {
       return {
         status: "skipped" as const,
@@ -8323,14 +8762,35 @@ export class Orchestrator {
         message: "Base ref repair requires a recorded base ref observation",
       };
     }
+    const requestedProvenanceId = nonEmptyString(
+      context.transition.blockerProvenanceId,
+    );
+    const lifecycle = await this.options.lifecycleStore?.get(context.issue.id);
+    const provenance =
+      lifecycle === undefined || lifecycle === null
+        ? null
+        : activeBlockerProvenance(lifecycle);
+    const currentObservation = lifecycle?.baseRefObservation ?? null;
     if (
-      requestedFingerprint !== null &&
-      observation.inputFingerprint !== requestedFingerprint
+      requestedProvenanceId === null ||
+      requestedFingerprint !== observation.inputFingerprint ||
+      requestedClassification !== observation.classification ||
+      lifecycle === undefined ||
+      lifecycle === null ||
+      currentObservation === null ||
+      provenance === null ||
+      provenance.id !== requestedProvenanceId ||
+      !sameBaseRefObservationIdentity(currentObservation, observation) ||
+      !blockerProvenanceMatchesObservation(provenance, currentObservation, {
+        runId: lifecycle.summaryPointers.lastRunId ?? context.issue.id,
+        pullRequestNumber: lifecycle.summaryPointers.prNumber ?? null,
+        pullRequestHeadSha: lifecycle.summaryPointers.prHeadSha ?? null,
+      })
     ) {
       return {
         status: "skipped" as const,
         stop: true,
-        message: "Base ref repair observation fingerprint is stale",
+        message: "Base ref repair blocker provenance is stale",
       };
     }
     const result = await this.mergePolicyServiceForContext(
@@ -8428,6 +8888,7 @@ export class Orchestrator {
         maxReviewRounds: this.config.reviewLoop.failureLimits.reviewerFailures,
         lastCompletionReport: latestCompletionReport(blockedLifecycle),
         lastReviewVerdict: latestReviewVerdict(blockedLifecycle),
+        blockerProvenance: context.blockIssue.blockerProvenance ?? null,
         requiredAction:
           "Inspect the latest run output and reviewer feedback, then move the issue out of the blocked state when Symphony should try again.",
       },
@@ -9675,6 +10136,18 @@ export class Orchestrator {
       observation.inputFingerprint === expectedFingerprint
     ) {
       if (observation.classification === "ok") return targetRequest;
+      const provenance = baseRefBlockerProvenanceApplies(
+        snapshot,
+        observation,
+      );
+      if (provenance === null) {
+        return {
+          transitionKind: "base_ref_observe",
+          reason: "base_ref_provenance_refresh_required",
+          baseRefTargetTransitionKind: targetRequest.transitionKind,
+          baseRefTargetRequest: targetRequest,
+        };
+      }
       const blockedReason = baseRefBlockedReason(observation);
       if (baseRefObservationIsTransient(observation)) {
         return {
@@ -9682,6 +10155,11 @@ export class Orchestrator {
           reason: "transient_base_ref_verification_retry",
           baseRefTargetTransitionKind: targetRequest.transitionKind,
           baseRefTargetRequest: targetRequest,
+          blockerProvenanceId: provenance.id,
+          baseRefObservationOperation: "base_ref_recheck",
+          baseRefObservationFingerprint: observation.inputFingerprint,
+          baseRefObservationClassification: observation.classification,
+          baseRefObservationAttempt: provenance.observationAttempt,
         };
       }
       if (baseRefObservationCanRepairByRebase(observation)) {
@@ -9690,6 +10168,7 @@ export class Orchestrator {
           reason: blockedReason,
           baseRefObservationFingerprint: observation.inputFingerprint,
           baseRefObservationClassification: observation.classification,
+          blockerProvenanceId: provenance.id,
         };
       }
       return {
@@ -9699,6 +10178,7 @@ export class Orchestrator {
         runId: snapshot.latestRunId ?? snapshot.issueId,
         baseRefObservationFingerprint: observation.inputFingerprint,
         baseRefObservationClassification: observation.classification,
+        blockerProvenanceId: provenance.id,
       };
     }
     return {
@@ -9815,7 +10295,11 @@ export class Orchestrator {
       snapshot.incompleteTurnCount >= this.config.reviewLoop.maxIncompleteTurns
     )
       return false;
-    if (runPhase === "implementation" && snapshot.mergeConflict?.status === "open")
+    if (
+      runPhase === "implementation" &&
+      (snapshot.mergeConflict?.status === "open" ||
+        activeCarriedMergeConflict(snapshot) !== null)
+    )
       return false;
     if (runPhase === "merge_conflict_resolution") {
       const conflict = snapshot.mergeConflict;
@@ -10063,13 +10547,12 @@ export class Orchestrator {
       return false;
     if (isPendingPublicationApprovalReason(snapshot.blockedReason))
       return false;
+    if (activeCarriedMergeConflict(snapshot) !== null) return false;
     const observation = snapshot.lastBaseRefObservation ?? null;
     if (
       observation !== null &&
-      reasonContainsBaseRefBlocker(
-        snapshot.blockedReason,
-        baseRefBlockedReason(observation),
-      )
+      observation.classification !== "ok" &&
+      baseRefBlockerProvenanceForRouting(snapshot, observation) !== null
     )
       return false;
     if (this.config.reviewLoop.blockedStates.length === 0) return false;
@@ -10122,7 +10605,10 @@ export class Orchestrator {
     if (snapshot.phase !== "implementation") return false;
     if (snapshot.mergeGate === null || snapshot.mergeGate.status !== "blocked")
       return false;
-    const activeBlockers = this.rulesetActiveIssueTriageBlockers(snapshot);
+    const activeBlockers = (
+      snapshot.latestPersistedIssueTriageReportBlockers ??
+      snapshot.latestIssueTriageReportBlockers
+    ).filter((blocker) => blocker.status === "active");
     if (activeBlockers.length === 0) return false;
     return !activeBlockers.every((blocker) => blocker.nextActor === "worker");
   }
@@ -10240,8 +10726,7 @@ export class Orchestrator {
 
     const observation = snapshot.lastBaseRefObservation ?? null;
     if (observation !== null && observation.classification !== "ok") {
-      const blockedReason = baseRefBlockedReason(observation);
-      if (observedBaseRefBlockerApplies(snapshot, observation, blockedReason))
+      if (reviewFeedbackBaseRefProvenanceApplies(snapshot, observation))
         return false;
     }
 
@@ -10279,24 +10764,52 @@ export class Orchestrator {
     if (observation === null || observation.classification === "ok")
       return null;
 
+    if (activeCarriedMergeConflict(snapshot) !== null) return null;
+    const provenance = baseRefBlockerProvenanceForRouting(
+      snapshot,
+      observation,
+    );
+    if (provenance === null) return null;
+
     const blockedReason = baseRefBlockedReason(observation);
-    if (
-      !observedBaseRefBlockerApplies(snapshot, observation, blockedReason)
-    )
-      return null;
 
     const refreshRequest =
-      this.baseRefObservationRefreshTransitionRequest(snapshot, observation);
+      this.baseRefObservationRefreshTransitionRequest(
+        snapshot,
+        observation,
+        provenance,
+      );
     if (refreshRequest !== null) return refreshRequest;
 
-    if (baseRefObservationIsTransient(observation)) return null;
+    const automaticRecheck = provenance.recoveryKind === "automatic_recheck";
+    if (automaticRecheck) {
+      if (isStateIn(snapshot.trackerState, this.config.reviewLoop.blockedStates))
+        return null;
+      return {
+        transitionKind: "base_ref_observe",
+        reason:
+          observation.operation === "review_feedback"
+            ? "transient_review_feedback_base_ref_verification_retry"
+            : "transient_base_ref_verification_retry",
+        blockerProvenanceId: provenance.id,
+        baseRefObservationOperation:
+          observation.operation === "review_feedback"
+            ? "review_feedback"
+            : "base_ref_recheck",
+        baseRefObservationFingerprint: observation.inputFingerprint,
+        baseRefObservationClassification: observation.classification,
+        baseRefObservationAttempt: provenance.observationAttempt,
+      };
+    }
 
-    if (baseRefObservationCanRepairByRebase(observation)) {
+    const automaticRebase = provenance.recoveryKind === "automatic_rebase";
+    if (automaticRebase) {
       return {
         transitionKind: "base_ref_repair",
         reason: blockedReason,
         baseRefObservationFingerprint: observation.inputFingerprint,
         baseRefObservationClassification: observation.classification,
+        blockerProvenanceId: provenance.id,
       };
     }
 
@@ -10310,18 +10823,22 @@ export class Orchestrator {
       runId: snapshot.latestRunId ?? snapshot.issueId,
       baseRefObservationFingerprint: observation.inputFingerprint,
       baseRefObservationClassification: observation.classification,
+      blockerProvenanceId: provenance.id,
     };
   }
 
   private baseRefObservationRefreshTransitionRequest(
     snapshot: IssueCurrentStateSnapshot,
     observation: IssueBaseRefObservation,
+    provenance: IssueBlockerProvenanceRecord,
   ): IssueTransitionRequest | null {
     if (!isStateIn(snapshot.trackerState, this.config.tracker.activeStates))
       return null;
     if (isStateIn(snapshot.trackerState, this.config.reviewLoop.blockedStates))
       return null;
     if (baseRefObservationCanRepairByRebase(observation)) return null;
+    if (snapshot.phase !== "blocked" && snapshot.blockedReason === null)
+      return null;
     const targetRequest = dispatchTransitionRequest({
       role: "worker",
       runPhase: "implementation",
@@ -10337,6 +10854,10 @@ export class Orchestrator {
       reason: "base_ref_reobserve_after_operator_resume",
       baseRefTargetTransitionKind: targetRequest.transitionKind,
       baseRefTargetRequest: targetRequest,
+      baseRefObservationFingerprint: observation.inputFingerprint,
+      baseRefObservationClassification: observation.classification,
+      blockerProvenanceId: provenance.id,
+      baseRefObservationOperation: "operator_resume",
     };
   }
 
@@ -12162,36 +12683,11 @@ export class Orchestrator {
     const store = this.options.lifecycleStore;
     if (!store) return lifecycle;
 
-    const now = new Date().toISOString();
-    const approvalVerdict = latestCurrentApprovalPassVerdict(lifecycle);
-    const mergeGate = resetMergeGateFailureBudgetForOperatorAction(
-      lifecycle.mergeGate ?? null,
-      now,
+    const patch = this.operatorFailureBudgetResetPatch(
+      issue,
+      lifecycle,
+      options,
     );
-    const mergeConflict = resetMergeConflictFailureBudgetForOperatorAction(
-      lifecycle.mergeConflict,
-      now,
-      options.reopenMergeConflict === true ||
-        (this.config.mergePolicy.conflictsState !== null &&
-          isStateIn(issue.state, [this.config.mergePolicy.conflictsState])),
-    );
-    const lastReviewVerdictId =
-      lifecycle.mergeGate !== null &&
-      lifecycle.mergeGate !== undefined &&
-      lifecycle.lastReviewVerdictId === lifecycle.mergeGate.id &&
-      approvalVerdict !== null
-        ? approvalVerdict.id
-        : lifecycle.lastReviewVerdictId;
-    const patch: IssueLifecyclePatch = {
-      phase: phaseForIssueState(issue.state, this.config),
-      reviewRound: 0,
-      incompleteTurnCount: 0,
-      blockedReason: null,
-      lastIssueTriageReportId: null,
-      lastReviewVerdictId,
-      mergeGate,
-      mergeConflict,
-    };
     const updated =
       (await this.updateIssueLifecycleWithEvidence(
         issue,
@@ -12216,6 +12712,43 @@ export class Orchestrator {
       next_conflict_fix_turn_count: updated.mergeConflict?.fixTurnCount ?? null,
     });
     return updated;
+  }
+
+  private operatorFailureBudgetResetPatch(
+    issue: Issue,
+    lifecycle: IssueLifecycleRecord,
+    options: { reopenMergeConflict?: boolean } = {},
+  ): IssueLifecyclePatch {
+    const now = new Date().toISOString();
+    const approvalVerdict = latestCurrentApprovalPassVerdict(lifecycle);
+    const mergeGate = resetMergeGateFailureBudgetForOperatorAction(
+      lifecycle.mergeGate ?? null,
+      now,
+    );
+    const mergeConflict = resetMergeConflictFailureBudgetForOperatorAction(
+      lifecycle.mergeConflict,
+      now,
+      options.reopenMergeConflict === true ||
+        (this.config.mergePolicy.conflictsState !== null &&
+          isStateIn(issue.state, [this.config.mergePolicy.conflictsState])),
+    );
+    const lastReviewVerdictId =
+      lifecycle.mergeGate !== null &&
+      lifecycle.mergeGate !== undefined &&
+      lifecycle.lastReviewVerdictId === lifecycle.mergeGate.id &&
+      approvalVerdict !== null
+        ? approvalVerdict.id
+        : lifecycle.lastReviewVerdictId;
+    return {
+      phase: phaseForIssueState(issue.state, this.config),
+      reviewRound: 0,
+      incompleteTurnCount: 0,
+      blockedReason: null,
+      lastIssueTriageReportId: null,
+      lastReviewVerdictId,
+      mergeGate,
+      mergeConflict,
+    };
   }
 
   private async lifecycleDispatchInspection(
@@ -15897,12 +16430,31 @@ export class Orchestrator {
     conflict: IssueMergeConflictMetadata,
     reason: string,
   ): Promise<void> {
+    const lifecycle = await this.options.lifecycleStore?.get(issue.id);
+    const blockerProvenance =
+      conflict.blockerProvenanceId === null ||
+      conflict.blockerProvenanceId === undefined
+        ? null
+        : (lifecycle?.blockerProvenances ?? []).find(
+            (record) =>
+              record.id === conflict.blockerProvenanceId &&
+              lifecycle?.activeBlockerProvenanceId === record.id &&
+              record.resolvedAt === null &&
+              record.resolution === null,
+          ) ?? null;
+    if (conflict.blockerProvenanceId && blockerProvenance === null) {
+      throw new SymphonyError(
+        "invalid_request",
+        "Merge conflict Blocked writeback requires its exact active blocker provenance",
+      );
+    }
     await this.applyWritebacks(
       planBlockedEscalationWritebacks(
         {
           issue,
           runId,
           reason: conflict.blockedReason ?? reason,
+          blockerProvenance,
           requiredAction: [
             "Merge conflicts remain unresolved after the configured conflict-fix attempts.",
             `Pull request: ${formatPullRequest(conflict.pullRequest.number, conflict.pullRequest.url)}`,
@@ -18101,36 +18653,89 @@ function baseRefObservationCanRepairByRebase(
   return observation.classification === "branch_not_based_on_live_base";
 }
 
-function reasonContainsBaseRefBlocker(
-  reason: string | null | undefined,
-  blockedReason: string,
-): boolean {
-  return (reason ?? "")
-    .toLowerCase()
-    .includes(blockedReason.toLowerCase());
-}
-
-function observedBaseRefBlockerApplies(
+function reviewFeedbackBaseRefProvenanceApplies(
   snapshot: IssueCurrentStateSnapshot,
   observation: IssueBaseRefObservation,
-  blockedReason: string,
-): boolean {
-  if (reasonContainsBaseRefBlocker(snapshot.blockedReason, blockedReason))
-    return true;
-  if (observation.operation !== "review_feedback") return false;
-  if (snapshot.phase !== "review") return false;
-  if (!isReviewerBlockedTriageReason(snapshot.blockedReason)) return false;
-  return reasonMentionsReviewFeedbackBaseRefBlocker(snapshot.blockedReason);
+): NonNullable<IssueCurrentStateSnapshot["activeBlockerProvenance"]> | null {
+  const provenance = baseRefBlockerProvenanceApplies(snapshot, observation);
+  if (
+    provenance === null ||
+    provenance.operation !== "review_feedback" ||
+    observation.operation !== "review_feedback"
+  ) {
+    return null;
+  }
+  if (provenance.reviewVerdictId === null) {
+    if (snapshot.phase !== "blocked" || snapshot.latestRunRole !== "reviewer")
+      return null;
+  } else if (provenance.reviewVerdictId !== snapshot.lastReviewVerdictId) {
+    return null;
+  }
+  return provenance;
 }
 
-function reasonMentionsReviewFeedbackBaseRefBlocker(
-  reason: string | null | undefined,
+function baseRefBlockerProvenanceForRouting(
+  snapshot: IssueCurrentStateSnapshot,
+  observation: IssueBaseRefObservation,
+): NonNullable<IssueCurrentStateSnapshot["activeBlockerProvenance"]> | null {
+  return observation.operation === "review_feedback"
+    ? reviewFeedbackBaseRefProvenanceApplies(snapshot, observation)
+    : baseRefBlockerProvenanceApplies(snapshot, observation);
+}
+
+function baseRefBlockerProvenanceApplies(
+  snapshot: IssueCurrentStateSnapshot,
+  observation: IssueBaseRefObservation,
+): NonNullable<IssueCurrentStateSnapshot["activeBlockerProvenance"]> | null {
+  const provenance = snapshot.activeBlockerProvenance ?? null;
+  if (
+    provenance === null ||
+    !blockerProvenanceMatchesObservation(provenance, observation, {
+      runId: snapshot.latestRunId ?? snapshot.issueId,
+      pullRequestNumber: snapshot.latestPrNumber,
+      pullRequestHeadSha: snapshot.latestPrHeadSha,
+    })
+  ) {
+    return null;
+  }
+  return provenance;
+}
+
+function activeCarriedMergeConflict(
+  snapshot: IssueCurrentStateSnapshot,
+): {
+  conflict: NonNullable<IssueCurrentStateSnapshot["mergeConflict"]>;
+  provenance: NonNullable<
+    IssueCurrentStateSnapshot["activeBlockerProvenance"]
+  >;
+} | null {
+  const conflict = snapshot.mergeConflict ?? null;
+  const provenance = snapshot.activeBlockerProvenance ?? null;
+  if (
+    conflict === null ||
+    provenance === null ||
+    conflict.blockerProvenanceId !== provenance.id ||
+    conflict.status === "resolved" ||
+    provenance.resolvedAt !== null ||
+    provenance.resolution !== null
+  ) {
+    return null;
+  }
+  return { conflict, provenance };
+}
+
+function sameBaseRefObservationIdentity(
+  left: IssueBaseRefObservation,
+  right: IssueBaseRefObservation,
 ): boolean {
-  const normalized = (reason ?? "").toLowerCase();
   return (
-    normalized.includes("base ref verification fail") ||
-    normalized.includes("base-ref verification fail") ||
-    normalized.includes("worktree needs rebase over latest origin base")
+    left.inputFingerprint === right.inputFingerprint &&
+    left.classification === right.classification &&
+    left.operation === right.operation &&
+    left.checkedAt === right.checkedAt &&
+    left.githubBaseHeadSha === right.githubBaseHeadSha &&
+    left.localBaseHeadShaAfterFetch === right.localBaseHeadShaAfterFetch &&
+    left.worktreeHeadSha === right.worktreeHeadSha
   );
 }
 

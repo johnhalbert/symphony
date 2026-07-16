@@ -704,7 +704,7 @@ async function buildFileManifest(
   );
   const fields = diff.stdout.split("\0");
   if (fields.at(-1) === "") fields.pop();
-  const entries: Array<Omit<ArtifactFileManifestEntry, "blobSha">> = [];
+  const entries: Array<Omit<ArtifactFileManifestEntry, "blobSha" | "mode">> = [];
   for (let index = 0; index < fields.length; ) {
     const rawStatus = fields[index++];
     const code = rawStatus?.[0];
@@ -737,34 +737,56 @@ async function buildFileManifest(
   for (const entry of entries) {
     if (paths.has(entry.path)) throw new SymphonyError("conflict", `Accepted-artifact path repeated: ${entry.path}`);
     paths.add(entry.path);
+    if (entry.status === "deleted") {
+      manifest.push({ ...entry, blobSha: null, mode: null });
+      continue;
+    }
+    const treeEntry = await treeBlobEntry(
+      workspacePath,
+      sourceHeadSha,
+      entry.path,
+      timeoutMs,
+    );
     manifest.push({
       ...entry,
-      blobSha:
-        entry.status === "deleted"
-          ? null
-          : await treeBlobSha(workspacePath, sourceHeadSha, entry.path, timeoutMs),
+      blobSha: treeEntry.blobSha,
+      mode: treeEntry.mode,
     });
   }
   return manifest;
 }
 
-async function treeBlobSha(
+async function treeBlobEntry(
   workspacePath: string,
   commitSha: string,
   filePath: string,
   timeoutMs: number,
-): Promise<string> {
+): Promise<{
+  blobSha: string;
+  mode: Exclude<ArtifactFileManifestEntry["mode"], null | undefined>;
+}> {
   const result = await runGit(
     ["ls-tree", "-z", commitSha, "--", `:(literal)${filePath}`],
     workspacePath,
     timeoutMs,
   );
   const tab = result.stdout.indexOf("\t");
-  const objectSha = tab < 0 ? null : result.stdout.slice(0, tab).split(" ")[2]?.trim();
-  if (!objectSha || !/^[0-9a-f]{40,64}$/i.test(objectSha)) {
+  const match =
+    tab < 0
+      ? null
+      : /^(100644|100755|120000) blob ([0-9a-f]{40,64})$/i.exec(
+          result.stdout.slice(0, tab),
+        );
+  if (match === null) {
     throw new SymphonyError("conflict", `Unable to resolve accepted-artifact blob for ${filePath}`);
   }
-  return objectSha;
+  return {
+    mode: match[1]!.toLowerCase() as Exclude<
+      ArtifactFileManifestEntry["mode"],
+      null | undefined
+    >,
+    blobSha: match[2]!,
+  };
 }
 
 async function resolveExactCommit(

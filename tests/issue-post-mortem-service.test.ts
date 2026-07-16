@@ -5,6 +5,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   IssuePostMortemService,
   issuePostMortemTriggerFingerprint,
+  parseIssuePostMortemReport,
+  preFinalDispositionIssuePostMortemReportRequestHash,
   shouldIssuePostMortemRun,
 } from "../src/core/IssuePostMortemService.js";
 import type {
@@ -70,11 +72,13 @@ describe("IssuePostMortemService", () => {
     expect(body).toContain("Completion judgment:");
     expect(body).toContain("Specification assessment:");
     expect(body).toContain("Follow-up candidates:");
+    expect(body).toContain(input.finalDisposition);
     await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
       lastPostMortemReportId: "issue-post-mortem-report:issue-1:postmortem-1",
       postMortemReports: [
         {
           runId: "post-mortem-run-1",
+          finalDisposition: input.finalDisposition,
           completionJudgment: { status: "valid_with_followups" },
           specificationAssessment: {
             quality: "adequate",
@@ -85,6 +89,52 @@ describe("IssuePostMortemService", () => {
         },
       ],
     });
+  });
+
+  it("replays only disposition-free reports with the pre-finalDisposition request hash", async () => {
+    const config = testConfig(root);
+    config.postMortem.enabled = true;
+    config.postMortem.doneStates = ["Done"];
+    config.writeback.enabled = true;
+    const candidate = issue({ state: "Done" });
+    const lifecycleStore = new FileIssueLifecycleStore(root);
+    const writebackOutbox = new FileWritebackOutboxStore(root);
+    const lifecycle = await seedCompletedLifecycle(lifecycleStore, candidate);
+    const service = new IssuePostMortemService({ config, lifecycleStore, writebackOutbox });
+    const input = reportInput(
+      "post-mortem-run-legacy-disposition",
+      "postmortem-legacy-disposition",
+      issuePostMortemTriggerFingerprint(lifecycle, candidate),
+    );
+    const context = {
+      issue: candidate,
+      activeRunId: input.runId,
+      role: "post_mortem",
+      phase: "post_mortem",
+    } as const;
+    const accepted = await service.submitIssuePostMortemReport(input, context);
+    const legacyReport = {
+      ...accepted.report,
+      requestHash: preFinalDispositionIssuePostMortemReportRequestHash(
+        parseIssuePostMortemReport(input),
+      ),
+    };
+    delete legacyReport.finalDisposition;
+    await lifecycleStore.updateIssue(candidate, {
+      postMortemReports: [legacyReport],
+      lastPostMortemReportId: legacyReport.id,
+    });
+
+    const replayed = await service.submitIssuePostMortemReport(input, context);
+
+    expect(replayed.replayed).toBe(true);
+    expect(replayed.report).not.toHaveProperty("finalDisposition");
+    expect(await writebackOutbox.list()).toHaveLength(1);
+
+    await lifecycleStore.updateIssue(candidate, {
+      postMortemReports: [{ ...legacyReport, finalDisposition: input.finalDisposition }],
+    });
+    await expect(service.submitIssuePostMortemReport(input, context)).rejects.toMatchObject({ code: "conflict" });
   });
 
   it("does not allow another automatic report after the configured trigger attempt limit", async () => {
@@ -212,6 +262,8 @@ function reportInput(runId: string, idempotencyKey: string, triggerFingerprint: 
     runId,
     issueId: "issue-1",
     triggerFingerprint,
+    finalDisposition:
+      "Done is valid under the written contract, with one non-gating follow-up test candidate.\n\nThe reviewer gate was sound and no retroactive blocker was found.",
     summary: "The issue reached Done with a valid implementation and one useful follow-up.",
     completionJudgment: {
       status: "valid_with_followups",

@@ -18,6 +18,7 @@ import type { RunTranscriptStore } from "./persistence/RunTranscriptStore.js";
 import type { Issue } from "./types.js";
 import { planIssueTriageReportWritebacks } from "./writeback/TransitionPolicy.js";
 import type { WritebackOutboxStore } from "./writeback/WritebackOutbox.js";
+import { bindWritebackOperationToLifecycle } from "./writeback/WritebackOutbox.js";
 
 export const ISSUE_TRIAGE_DISPOSITIONS = [
   "decompose_issue",
@@ -87,6 +88,7 @@ const issueTriageReportSchema = z
     runId: z.string().trim().min(1),
     issueId: z.string().trim().min(1),
     triggerFingerprint: z.string().trim().min(1),
+    finalDisposition: z.string().min(1).refine((value) => value.trim().length > 0, "Final disposition cannot be blank"),
     summary: z.string().trim().min(1),
     blockers: z.array(issueTriageBlockerSchema).min(1).optional(),
     disposition: z.enum(ISSUE_TRIAGE_DISPOSITIONS).optional(),
@@ -117,6 +119,7 @@ export interface IssueTriageReportInput {
   runId: string;
   issueId: string;
   triggerFingerprint: string;
+  finalDisposition: string;
   summary: string;
   blockers: IssueTriageBlockerRecord[];
   disposition: IssueTriageDisposition;
@@ -171,6 +174,7 @@ export class IssueTriageService {
     }
 
     const requestHash = issueTriageReportRequestHash(parsed);
+    const preFinalDispositionRequestHash = preFinalDispositionIssueTriageReportRequestHash(parsed);
     const legacyRequestHash = legacyIssueTriageReportRequestHash(parsed);
     const existingScoped = existingLifecycle.issueTriageReports.find(
       (report) => report.runId === context.activeRunId && report.idempotencyKey === parsed.idempotencyKey,
@@ -180,6 +184,7 @@ export class IssueTriageService {
         idempotencyKey: parsed.idempotencyKey,
         activeRunId: context.activeRunId,
         requestHash,
+        preFinalDispositionRequestHash,
         legacyRequestHash,
       });
       return { accepted: true, replayed: true, report: existingScoped };
@@ -221,6 +226,7 @@ export class IssueTriageService {
       issueId: context.issue.id,
       issueIdentifier: context.issue.identifier,
       triggerFingerprint: parsed.triggerFingerprint,
+      finalDisposition: parsed.finalDisposition,
       disposition: parsed.disposition,
       confidence: parsed.confidence,
       summary: parsed.summary,
@@ -242,7 +248,11 @@ export class IssueTriageService {
       this.options.config,
     );
     const writebackOperationKeys: string[] = [];
-    for (const operation of operations) {
+    for (const rawOperation of operations) {
+      const operation = bindWritebackOperationToLifecycle(rawOperation, {
+        kind: "issue_triage_report",
+        recordId: reportBase.id,
+      });
       const enqueued = await this.options.writebackOutbox.enqueueOnce(operation);
       writebackOperationKeys.push(enqueued.idempotencyKey);
     }
@@ -384,6 +394,20 @@ export function issueTriageReportRequestHash(input: IssueTriageReportInput): str
       stableJson({
         issueId: input.issueId,
         triggerFingerprint: input.triggerFingerprint,
+        finalDisposition: input.finalDisposition,
+        summary: normalizeString(input.summary),
+        blockers: input.blockers,
+      }),
+    )
+    .digest("hex");
+}
+
+export function preFinalDispositionIssueTriageReportRequestHash(input: IssueTriageReportInput): string {
+  return createHash("sha256")
+    .update(
+      stableJson({
+        issueId: input.issueId,
+        triggerFingerprint: input.triggerFingerprint,
         summary: normalizeString(input.summary),
         blockers: input.blockers,
       }),
@@ -471,6 +495,7 @@ function canonicalIssueTriageReportInput(input: RawIssueTriageReportInput): Issu
     runId: normalizeString(input.runId),
     issueId: normalizeString(input.issueId),
     triggerFingerprint: normalizeString(input.triggerFingerprint),
+    finalDisposition: input.finalDisposition,
     summary: normalizeString(input.summary),
     blockers,
     disposition: legacyDispositionForIssueTriageBlocker(primary.kind),
@@ -597,9 +622,22 @@ function validateCaller(report: IssueTriageReportInput, context: IssueTriageActi
 
 function assertIssueTriageReplayAllowed(
   existing: IssueTriageReportRecord,
-  expected: { idempotencyKey: string; activeRunId: string; requestHash: string; legacyRequestHash: string },
+  expected: {
+    idempotencyKey: string;
+    activeRunId: string;
+    requestHash: string;
+    preFinalDispositionRequestHash: string;
+    legacyRequestHash: string;
+  },
 ): void {
-  if (existing.requestHash !== expected.requestHash && existing.requestHash !== expected.legacyRequestHash) {
+  if (
+    existing.requestHash !== expected.requestHash &&
+    !(
+      existing.finalDisposition === undefined &&
+      (existing.requestHash === expected.preFinalDispositionRequestHash ||
+        existing.requestHash === expected.legacyRequestHash)
+    )
+  ) {
     throw issueTriageIdempotencyConflict("payload_mismatch", existing, expected);
   }
 }
@@ -607,7 +645,13 @@ function assertIssueTriageReplayAllowed(
 function issueTriageIdempotencyConflict(
   reason: "payload_mismatch" | "cross_run_key_reuse",
   existing: IssueTriageReportRecord,
-  expected: { idempotencyKey: string; activeRunId: string; requestHash: string; legacyRequestHash?: string },
+  expected: {
+    idempotencyKey: string;
+    activeRunId: string;
+    requestHash: string;
+    preFinalDispositionRequestHash?: string;
+    legacyRequestHash?: string;
+  },
 ): SymphonyError {
   return new SymphonyError("conflict", "Issue triage report idempotency key was reused with a different run or payload", {
     reason,

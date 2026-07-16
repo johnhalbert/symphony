@@ -2,6 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { createReviewFeedbackBaseRefProvenance } from "../src/core/BlockerProvenance.js";
 import { LifecyclePrHeadRebindService } from "../src/core/LifecyclePrHeadRebindService.js";
 import { FileIssueStateStore } from "../src/core/orchestration/FileIssueStateStore.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
@@ -101,6 +102,89 @@ describe("LifecyclePrHeadRebindService", () => {
           classification: "branch_not_based_on_live_base",
           worktreeHeadSha: "2222222222222222222222222222222222222222",
         },
+      },
+    });
+  });
+
+  it("supersedes and detaches carried blocker provenance during an applied rebind", async () => {
+    const lifecycle = await lifecycleStore.get(candidate.id);
+    const observation = lifecycle?.baseRefObservation;
+    expect(observation).not.toBeNull();
+    const provenance = createReviewFeedbackBaseRefProvenance({
+      issue: candidate,
+      runId: "review-run-1",
+      pullRequestNumber: 7,
+      pullRequestHeadSha: "1111111111111111111111111111111111111111",
+      observation: observation!,
+    });
+    await lifecycleStore.updateIssue(candidate, {
+      blockerProvenances: [provenance],
+      activeBlockerProvenanceId: provenance.id,
+      mergeConflict: {
+        id: "merge-conflict:issue-1:head-1",
+        status: "open",
+        resolutionStatus: "pending",
+        pullRequest: {
+          url: "https://github.com/acme/repo/pull/7",
+          number: 7,
+          headSha: "1111111111111111111111111111111111111111",
+          branch: "symphony/test-1",
+        },
+        approvedHeadSha: "1111111111111111111111111111111111111111",
+        currentHeadSha: "1111111111111111111111111111111111111111",
+        resolvedHeadSha: null,
+        baseBranch: "main",
+        baseHeadSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        sourceState: "In Review",
+        conflictsState: "Approved with Conflicts",
+        reason: "Base-ref repair conflicted",
+        mergeableState: "dirty",
+        blockerProvenanceId: provenance.id,
+        servicePreparation: {
+          strategy: "squash_rebase",
+          status: "conflicted",
+          originalHeadSha: "1111111111111111111111111111111111111111",
+          observedPrBaseHeadSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          liveBaseHeadSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          preparedBaseHeadSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          mergeBaseSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          squashCommitSha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          conflictedFiles: ["src/example.ts"],
+          preparedAt: "2026-01-01T00:00:00.000Z",
+          finalizedAt: null,
+          finalizedHeadSha: null,
+          preservedStash: null,
+        },
+        detectedAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        fixTurnCount: 0,
+        maxFixTurns: 3,
+        lastConflictFixRunId: null,
+        lastConflictResolutionReportId: null,
+        attemptRunIds: [],
+        writebackOperationKeys: [],
+        blockedAt: null,
+        blockedReason: null,
+      },
+    });
+    const service = serviceWithGitHubHead("2222222222222222222222222222222222222222");
+
+    const result = await service.rebind({ issueIdOrIdentifier: "TEST-1", apply: true });
+    const rebound = await lifecycleStore.get(candidate.id);
+
+    expect(result.status).toBe("applied");
+    expect(rebound).toMatchObject({
+      activeBlockerProvenanceId: null,
+      blockerProvenances: [
+        expect.objectContaining({
+          id: provenance.id,
+          resolution: "superseded",
+          resolvedAt: expect.any(String),
+        }),
+      ],
+      mergeConflict: {
+        blockerProvenanceId: null,
+        status: "open",
       },
     });
   });

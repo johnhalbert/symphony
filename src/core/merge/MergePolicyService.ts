@@ -13,6 +13,10 @@ import type { ServiceConfig } from "../config/Config.js";
 import type { IssueBaseRefObservation } from "../BaseRefVerification.js";
 import type { ResolvedCredential } from "../config/CredentialProfiles.js";
 import { SymphonyError } from "../errors.js";
+import {
+  activeBlockerProvenance,
+  resolveActiveBlockerProvenancePatch,
+} from "../BlockerProvenance.js";
 import type { Logger } from "../logging/StructuredLogger.js";
 import type { IssueTransitionKind } from "../orchestration/IssueOrchestrationState.js";
 import type {
@@ -48,6 +52,7 @@ import {
   type MergeGateCheckEvidence,
 } from "../writeback/TransitionPolicy.js";
 import type { WritebackOperation, WritebackProcessor } from "../writeback/WritebackOutbox.js";
+import { bindWritebackOperationToLifecycle } from "../writeback/WritebackOutbox.js";
 import {
   canAutoResolveMergeGateOnCheckPass,
   hasRepairGateClearance,
@@ -285,7 +290,9 @@ export interface MergePolicyConflictWritebackPlan {
 }
 
 export class MergePolicyService {
-  constructor(private readonly options: MergePolicyServiceOptions) {}
+  constructor(private readonly options: MergePolicyServiceOptions) {
+    this.options.writeback?.bindLifecycleStore(this.options.lifecycleStore);
+  }
 
   requireGatedServiceConfiguration(): void {
     const config = this.options.config;
@@ -755,8 +762,9 @@ export class MergePolicyService {
 
   async markHeadSuperseded(issue: Issue, observation: MergePolicyObservation): Promise<MergePolicyResult> {
     const plan = await this.planHeadSupersession(issue, observation);
+    const result = await this.recordHeadSupersessionLifecycle(issue, plan);
     await this.applyHeadSupersessionWritebacks(issue, plan);
-    return this.recordHeadSupersessionLifecycle(issue, plan);
+    return result;
   }
 
   async planHeadSupersession(issue: Issue, observation: MergePolicyObservation): Promise<MergePolicyHeadSupersessionPlan> {
@@ -785,16 +793,35 @@ export class MergePolicyService {
           liveHeadSha,
         ).mergeGate;
     if (!supersededPatch) throw new SymphonyError("invalid_request", "Merge gate supersession could not build inactive gate state");
+    const rawOperations = planMergeGateHeadSupersessionWritebacks(
+      { issue, gateId, fromState: sourceState, pullRequest, liveHeadSha, reportId: report.id },
+      this.options.config,
+    );
+    const operationKeys = rawOperations.map((operation) => operation.idempotencyKey);
+    const ownedSupersededPatch: IssueMergeGateState = {
+      ...supersededPatch,
+      writebackOperationKeys: operationKeys,
+    };
     const lifecyclePatch: IssueLifecyclePatch = {
-      ...(gate ? inactiveMergeGateLifecyclePatch(lifecycle, gate, "superseded", liveHeadSha) : { mergeGate: supersededPatch }),
+      ...(gate
+        ? {
+            ...inactiveMergeGateLifecyclePatch(lifecycle, gate, "superseded", liveHeadSha),
+            mergeGate: ownedSupersededPatch,
+          }
+        : { mergeGate: ownedSupersededPatch }),
       phase: "implementation",
       blockedReason: null,
       lastReviewVerdictId: null,
       summaryPointers: { ciStatus: "head_superseded" },
     };
-    const operations = planMergeGateHeadSupersessionWritebacks(
-      { issue, gateId, fromState: sourceState, pullRequest, liveHeadSha, reportId: report.id },
-      this.options.config,
+    const operations = rawOperations.map((operation) =>
+      bindWritebackOperationToLifecycle(operation, {
+        kind: "merge_gate",
+        recordId: ownedSupersededPatch.id,
+        status: "superseded",
+        headSha: ownedSupersededPatch.headSha,
+        supersededByHeadSha: liveHeadSha,
+      }),
     );
     return {
       lifecycle,
@@ -804,7 +831,7 @@ export class MergePolicyService {
       livePullRequest,
       sourceState,
       liveHeadSha,
-      supersededGate: gateStatusFromState(supersededPatch),
+      supersededGate: gateStatusFromState(ownedSupersededPatch),
       lifecyclePatch,
       operations,
     };
@@ -825,6 +852,7 @@ export class MergePolicyService {
   }
 
   async recordHeadSupersessionLifecycle(issue: Issue, plan: MergePolicyHeadSupersessionPlan): Promise<MergePolicyResult> {
+    await this.enqueueMergeGateWritebacks(plan.operations);
     await this.options.lifecycleStore.updateIssue(issue, plan.lifecyclePatch);
     return {
       status: "head_superseded",
@@ -843,8 +871,14 @@ export class MergePolicyService {
       await this.restorePreservedStashAfterPreparedHead(issue, plan, execution);
     }
     const writebackPlan = this.planServiceConflictWritebacks(issue, plan, execution);
+    const result = await this.recordServicePreparedMergeConflict(
+      issue,
+      plan,
+      execution,
+      writebackPlan,
+    );
     await this.applyServiceConflictWritebacks(issue, plan, writebackPlan);
-    return this.recordServicePreparedMergeConflict(issue, plan, execution, writebackPlan);
+    return result;
   }
 
   async planRefreshConflictBase(
@@ -902,7 +936,9 @@ export class MergePolicyService {
   async refreshSameGateBlocker(issue: Issue, observation: MergePolicyObservation): Promise<MergePolicyResult> {
     const lifecycle = await this.options.lifecycleStore.get(issue.id);
     const gate = requireObservationValue(observation.gate, "Merge gate refresh requires observed gate");
+    const sourceState = requireObservationValue(observation.sourceState, "Merge gate refresh requires observed source state");
     if (!lifecycle) throw new SymphonyError("invalid_request", "Gated merge policy requires an issue lifecycle record");
+    await this.retryDurableMergeGateResultWritebacks(issue, lifecycle, sourceState);
     const refreshedMergeGate = refreshActiveMergeGateObservation(lifecycle, gate, observation.existingGateFailure?.writebackOperationKeys ?? []);
     if (!refreshedMergeGate) {
       const activeGate = lifecycle.mergeGate ? gateStatusFromState(lifecycle.mergeGate) : gate;
@@ -966,8 +1002,14 @@ export class MergePolicyService {
       await this.restorePreservedStashAfterPreparedHead(issue, plan, execution);
     }
     const writebackPlan = this.planServiceConflictWritebacks(issue, plan, execution);
+    const result = await this.recordServicePreparedMergeConflict(
+      issue,
+      plan,
+      execution,
+      writebackPlan,
+    );
     await this.applyServiceConflictWritebacks(issue, plan, writebackPlan);
-    return this.recordServicePreparedMergeConflict(issue, plan, execution, writebackPlan);
+    return result;
   }
 
   async repairBaseRefDrift(issue: Issue, observation: IssueBaseRefObservation): Promise<MergePolicyResult> {
@@ -998,6 +1040,22 @@ export class MergePolicyService {
     const requiredBaseBranch = requireValue(baseBranch, "Base ref repair requires a base branch");
     const pullRequest = pullRequestForBaseRefRepair(lifecycle, requiredBranchName, requiredOriginalHeadSha);
     const sourceState = latestIssue.state;
+    const activeProvenance = activeBlockerProvenance(lifecycle);
+    const blockerProvenanceId =
+      activeProvenance !== null &&
+      activeProvenance.sourceObservationFingerprint ===
+        observation.inputFingerprint &&
+      activeProvenance.classification === observation.classification &&
+      activeProvenance.worktreeHeadSha === observation.worktreeHeadSha
+        ? activeProvenance.id
+        : null;
+    const blockerResolutionPatch = resolveActiveBlockerProvenancePatch(
+      lifecycle,
+      {
+        expectedObservation: observation,
+        resolution: "base_ref_repair",
+      },
+    );
 
     const github = this.options.client ?? createGitHubPullRequestClientForCapability(this.options.config, "github.merge");
     const requiredLiveBaseHeadSha = requireValue(
@@ -1005,7 +1063,11 @@ export class MergePolicyService {
       "Base ref repair requires the live base head SHA",
     );
     const authHeader = await github.gitAuthHeader();
-    const conflictGit = this.options.conflictGit ?? new ServiceOwnedMergeConflictGit();
+    const conflictGit =
+      this.options.conflictGit ??
+      new ServiceOwnedMergeConflictGit({
+        journalDir: this.options.config.workspace.stateDir,
+      });
     const operationId = `base-ref:${issue.id}:${requiredOriginalHeadSha}:${requiredLiveBaseHeadSha}`;
     let preservedStashes = preservedWorktreeStashesOf(lifecycle);
     const preservedStash = await conflictGit.preserveDirtyWorktree({
@@ -1039,6 +1101,8 @@ export class MergePolicyService {
         operationId,
         sourceState,
         preservedStashes,
+        blockerResolutionPatch,
+        blockerProvenanceId,
       });
     }
 
@@ -1082,6 +1146,7 @@ export class MergePolicyService {
           preservedStashes,
           stashApply: restore.stashApply,
           reason: "Preserved local changes conflicted while restoring after base-ref repair",
+          blockerProvenanceId,
         });
       }
       const operations = planBaseRefRepairWritebacks(
@@ -1098,8 +1163,19 @@ export class MergePolicyService {
         },
         this.options.config,
       );
-      await this.requireMergeGateWritebacksSucceeded(latestIssue, operations, this.options.config.writeback.dispatchState);
+      const boundOperations = operations.map((operation) =>
+        bindWritebackOperationToLifecycle(operation, {
+          kind: "issue_checkpoint",
+          phase: "implementation",
+          prHeadSha: preparation.rebasedHeadSha,
+          gitBranchName: requiredBranchName,
+          baseRef: requiredBaseBranch,
+          resolvedBlockerProvenanceId: blockerProvenanceId,
+        }),
+      );
+      await this.enqueueMergeGateWritebacks(boundOperations);
       await this.options.lifecycleStore.updateIssue(latestIssue, {
+        ...blockerResolutionPatch,
         phase: "implementation",
         blockedReason: null,
         mergeGate: null,
@@ -1116,6 +1192,11 @@ export class MergePolicyService {
         },
         preservedWorktreeStashes: preservedStashes,
       });
+      await this.requireMergeGateWritebacksSucceeded(
+        latestIssue,
+        boundOperations,
+        this.options.config.writeback.dispatchState,
+      );
       return { status: "base_ref_repaired", headSha: preparation.rebasedHeadSha };
     }
 
@@ -1135,8 +1216,6 @@ export class MergePolicyService {
       },
       this.options.config,
     );
-    await this.requireMergeGateWritebacksSucceeded(latestIssue, operations, conflictsState);
-
     const now = new Date().toISOString();
     const conflict = buildBaseRefRepairMergeConflict({
       issue: latestIssue,
@@ -1146,9 +1225,17 @@ export class MergePolicyService {
       baseBranch: requiredBaseBranch,
       baseHeadSha: requiredLiveBaseHeadSha,
       preparation,
+      blockerProvenanceId,
       maxFixTurns: this.options.config.mergePolicy.maxConflictFixTurns,
       now,
     });
+    const boundOperations = operations.map((operation) =>
+      bindWritebackOperationToLifecycle(operation, {
+        kind: "merge_conflict",
+        recordId: conflict.id,
+      }),
+    );
+    await this.enqueueMergeGateWritebacks(boundOperations);
     const updated = await this.options.lifecycleStore.updateIssue(latestIssue, {
       phase: "merge_conflict_resolution",
       blockedReason: null,
@@ -1177,6 +1264,11 @@ export class MergePolicyService {
         baseRef: requiredBaseBranch,
       },
     });
+    await this.requireMergeGateWritebacksSucceeded(
+      latestIssue,
+      boundOperations,
+      conflictsState,
+    );
     return {
       status: "conflict_dispatched",
       gate: emptyGateStatus(operationId, pullRequest, requiredOriginalHeadSha, this.options.config.mergePolicy.requiredChecks),
@@ -1196,6 +1288,11 @@ export class MergePolicyService {
     operationId: string;
     sourceState: string;
     preservedStashes: IssuePreservedWorktreeStash[];
+    blockerResolutionPatch: Pick<
+      IssueLifecyclePatch,
+      "blockerProvenances" | "activeBlockerProvenanceId"
+    >;
+    blockerProvenanceId: string | null;
   }): Promise<MergePolicyResult> {
     let refresh: ServiceOwnedLocalBaseRefreshResult;
     let preservedStashes = input.preservedStashes;
@@ -1237,6 +1334,7 @@ export class MergePolicyService {
           preservedStashes,
           stashApply: restore.stashApply,
           reason: "Preserved local changes conflicted while restoring after blocked local-only base refresh",
+          blockerProvenanceId: null,
         });
       }
       const reason = `local-only base refresh blocked: ${messageFromUnknown(error)}`;
@@ -1288,6 +1386,7 @@ export class MergePolicyService {
         preservedStashes,
         stashApply: restore.stashApply,
         reason: "Preserved local changes conflicted while restoring after local-only base refresh",
+        blockerProvenanceId: input.blockerProvenanceId,
       });
     }
 
@@ -1305,12 +1404,19 @@ export class MergePolicyService {
       },
       this.options.config,
     );
-    await this.requireMergeGateWritebacksSucceeded(
-      input.issue,
-      operations,
-      this.options.config.writeback.dispatchState,
+    const boundOperations = operations.map((operation) =>
+      bindWritebackOperationToLifecycle(operation, {
+        kind: "issue_checkpoint",
+        phase: "implementation",
+        prHeadSha: null,
+        gitBranchName: input.branchName,
+        baseRef: input.baseBranch,
+        resolvedBlockerProvenanceId: input.blockerProvenanceId,
+      }),
     );
+    await this.enqueueMergeGateWritebacks(boundOperations);
     await this.options.lifecycleStore.updateIssue(input.issue, {
+      ...input.blockerResolutionPatch,
       phase: "implementation",
       blockedReason: null,
       mergeGate: null,
@@ -1327,6 +1433,11 @@ export class MergePolicyService {
         baseRef: input.baseBranch,
       },
     });
+    await this.requireMergeGateWritebacksSucceeded(
+      input.issue,
+      boundOperations,
+      this.options.config.writeback.dispatchState,
+    );
     return { status: "base_ref_repaired", headSha: refresh.refreshedHeadSha };
   }
 
@@ -1352,7 +1463,11 @@ export class MergePolicyService {
       first.branchName ?? lifecycle.summaryPointers.gitBranchName ?? lifecycle.summaryPointers.branchName,
       "Preserved stash restore requires a branch name",
     );
-    const conflictGit = this.options.conflictGit ?? new ServiceOwnedMergeConflictGit();
+    const conflictGit =
+      this.options.conflictGit ??
+      new ServiceOwnedMergeConflictGit({
+        journalDir: this.options.config.workspace.stateDir,
+      });
     const restore = await this.restorePreservedStashQueue({
       issue: latestIssue,
       conflictGit,
@@ -1464,6 +1579,7 @@ export class MergePolicyService {
     preservedStashes: IssuePreservedWorktreeStash[];
     stashApply: Extract<ServiceOwnedPreservedStashApplyResult, { status: "conflicted" }>;
     reason: string;
+    blockerProvenanceId?: string | null;
   }): Promise<MergePolicyResult> {
     const conflictsState = input.conflictsState;
     if (conflictsState === null) {
@@ -1481,7 +1597,6 @@ export class MergePolicyService {
       },
       this.options.config,
     );
-    await this.requireMergeGateWritebacksSucceeded(input.issue, operations, conflictsState);
     const now = new Date().toISOString();
     const conflict = buildStashApplyMergeConflict({
       issue: input.issue,
@@ -1495,9 +1610,17 @@ export class MergePolicyService {
       changedFiles: input.stashApply.changedFiles,
       conflictedFiles: input.stashApply.conflictedFiles,
       reason: input.reason,
+      blockerProvenanceId: input.blockerProvenanceId ?? null,
       maxFixTurns: this.options.config.mergePolicy.maxConflictFixTurns,
       now,
     });
+    const boundOperations = operations.map((operation) =>
+      bindWritebackOperationToLifecycle(operation, {
+        kind: "merge_conflict",
+        recordId: conflict.id,
+      }),
+    );
+    await this.enqueueMergeGateWritebacks(boundOperations);
     const updated = await this.options.lifecycleStore.updateIssue(input.issue, {
       phase: "merge_conflict_resolution",
       blockedReason: null,
@@ -1518,6 +1641,11 @@ export class MergePolicyService {
         baseRef: input.baseBranch,
       },
     });
+    await this.requireMergeGateWritebacksSucceeded(
+      input.issue,
+      boundOperations,
+      conflictsState,
+    );
     return {
       status: "conflict_dispatched",
       gate: emptyGateStatus(
@@ -1574,7 +1702,11 @@ export class MergePolicyService {
   ): Promise<MergePolicyConflictPreparationExecution> {
     const github = this.options.client ?? createGitHubPullRequestClientForCapability(this.options.config, "github.merge");
     const authHeader = await github.gitAuthHeader();
-    const conflictGit = this.options.conflictGit ?? new ServiceOwnedMergeConflictGit();
+    const conflictGit =
+      this.options.conflictGit ??
+      new ServiceOwnedMergeConflictGit({
+        journalDir: this.options.config.workspace.stateDir,
+      });
     const operationId = `${plan.mode === "base_refresh" ? "service-conflict-base-refresh" : "service-conflict"}:${issue.id}:${plan.expectedHeadSha}:${plan.baseObservation.liveBaseHeadSha}`;
     let preservedStashes = preservedWorktreeStashesOf(plan.lifecycle);
     const preservedStash = await conflictGit.preserveDirtyWorktree({
@@ -1632,7 +1764,11 @@ export class MergePolicyService {
     execution: MergePolicyConflictPreparationExecution,
   ): Promise<{ published: boolean; headSha: string | null }> {
     if (execution.preparation.status !== "clean") return { published: false, headSha: null };
-    const conflictGit = this.options.conflictGit ?? new ServiceOwnedMergeConflictGit();
+    const conflictGit =
+      this.options.conflictGit ??
+      new ServiceOwnedMergeConflictGit({
+        journalDir: this.options.config.workspace.stateDir,
+      });
     await conflictGit.publishPreparedHead({
       workspacePath: plan.workspacePath,
       branchName: plan.branchName,
@@ -1648,7 +1784,11 @@ export class MergePolicyService {
     execution: MergePolicyConflictPreparationExecution,
   ): Promise<void> {
     if (execution.preparation.status !== "clean") return;
-    const conflictGit = this.options.conflictGit ?? new ServiceOwnedMergeConflictGit();
+    const conflictGit =
+      this.options.conflictGit ??
+      new ServiceOwnedMergeConflictGit({
+        journalDir: this.options.config.workspace.stateDir,
+      });
     const restore = await this.restorePreservedStashQueue({
       issue,
       conflictGit,
@@ -1729,9 +1869,37 @@ export class MergePolicyService {
     plan: MergePolicyConflictPreparationPlan,
     writebackPlan: MergePolicyConflictWritebackPlan,
   ): Promise<{ operations: Array<{ operationKey: string; status: WritebackOperation["status"] }> }> {
+    const lifecycle = await this.options.lifecycleStore.get(issue.id);
+    const conflict = lifecycle?.mergeConflict ?? null;
+    if (conflict === null) {
+      throw new SymphonyError(
+        "invalid_request",
+        "Service conflict writebacks require a durable merge-conflict lifecycle record",
+      );
+    }
+    const operationKeys = writebackPlan.operations.map(
+      (operation) => operation.idempotencyKey,
+    );
+    if (
+      operationKeys.some(
+        (operationKey) =>
+          !conflict.writebackOperationKeys.includes(operationKey),
+      )
+    ) {
+      throw new SymphonyError(
+        "invalid_request",
+        "Service conflict writebacks are not registered on the current merge conflict",
+      );
+    }
+    const boundOperations = writebackPlan.operations.map((operation) =>
+      bindWritebackOperationToLifecycle(operation, {
+        kind: "merge_conflict",
+        recordId: conflict.id,
+      }),
+    );
     const results = await this.requireMergeGateWritebacksSucceeded(
       issue,
-      writebackPlan.operations,
+      boundOperations,
       writebackPlan.expectedState,
     );
     return {
@@ -1820,14 +1988,16 @@ export class MergePolicyService {
 
   async dispatchRepair(issue: Issue, observation: MergePolicyObservation): Promise<MergePolicyResult> {
     const plan = await this.planMergeGateFailure(issue, observation, "repair");
+    const result = await this.recordMergeGateFailureLifecycle(issue, plan);
     await this.applyMergeGateFailureWritebacks(issue, plan);
-    return this.recordMergeGateFailureLifecycle(issue, plan);
+    return result;
   }
 
   async blockFailure(issue: Issue, observation: MergePolicyObservation): Promise<MergePolicyResult> {
     const plan = await this.planMergeGateFailure(issue, observation, "blocked");
+    const result = await this.recordMergeGateFailureLifecycle(issue, plan);
     await this.applyMergeGateFailureWritebacks(issue, plan);
-    return this.recordMergeGateFailureLifecycle(issue, plan);
+    return result;
   }
 
   async mergePullRequest(issue: Issue, observation: MergePolicyObservation): Promise<MergePolicyResult> {
@@ -1955,15 +2125,15 @@ export class MergePolicyService {
     if (expectedDisposition === "blocked" && !blocked) {
       throw new SymphonyError("invalid_request", "Merge gate failure snapshot selected block but current evidence allows repair");
     }
-    const operations = blocked
+    const rawOperations = blocked
       ? planMergeGateBlockedWritebacks(this.mergeGateWritebackContext(issue, gate, sourceState, reviewRound), this.options.config)
       : planMergeGateRepairWritebacks(this.mergeGateWritebackContext(issue, gate, sourceState, reviewRound), this.options.config);
-    if (operations.length === 0) {
+    if (rawOperations.length === 0) {
       throw new SymphonyError("invalid_request", "Merge gate failure could not plan service-owned writeback");
     }
 
     const blockerKind = blocked ? "blocked" : "repair";
-    const operationKeys = operations.map((operation) => operation.idempotencyKey);
+    const operationKeys = rawOperations.map((operation) => operation.idempotencyKey);
     const storedResult: IssueMergeGateResultRecord = {
       id: gate.id,
       idempotencyKey: mergeGateResultIdempotencyKey(gate, blockerKind),
@@ -1994,6 +2164,13 @@ export class MergePolicyService {
       supersededBy: null,
       supersededReason: null,
     };
+    const operations = rawOperations.map((operation) =>
+      bindWritebackOperationToLifecycle(operation, {
+        kind: "merge_gate_result",
+        recordId: storedResult.id,
+        resultIdempotencyKey: storedResult.idempotencyKey,
+      }),
+    );
     return {
       lifecycle,
       report,
@@ -2025,6 +2202,7 @@ export class MergePolicyService {
   }
 
   async recordMergeGateFailureLifecycle(issue: Issue, plan: MergePolicyGateFailurePlan): Promise<MergePolicyResult> {
+    await this.enqueueMergeGateWritebacks(plan.operations);
     await this.options.lifecycleStore.updateIssue(issue, {
       phase: plan.blocked ? "blocked" : "implementation",
       incompleteTurnCount: 0,
@@ -2161,6 +2339,11 @@ export class MergePolicyService {
     }
     if (existingGateFailure && decision.kind === "failure") {
       if (shouldRefreshSameMergeGateBlocker(activeLifecycle, decision.gate)) {
+        await this.retryDurableMergeGateResultWritebacks(
+          latestIssue,
+          activeLifecycle,
+          sourceState,
+        );
         const refreshedMergeGate = refreshActiveMergeGateObservation(activeLifecycle, decision.gate, existingGateFailure.writebackOperationKeys);
         if (refreshedMergeGate) {
           const updated = await this.options.lifecycleStore.updateIssue(latestIssue, {
@@ -2350,17 +2533,15 @@ export class MergePolicyService {
     const maxMergeGateFailures = this.options.config.reviewLoop.failureLimits.mergeGateFailures;
     const missingConflictState = gate.mergeability?.status === "conflicted" && this.options.config.mergePolicy.conflictsState === null;
     const blocked = missingConflictState || reviewRound >= maxMergeGateFailures;
-    const operations = blocked
+    const rawOperations = blocked
       ? planMergeGateBlockedWritebacks(this.mergeGateWritebackContext(issue, gate, sourceState, reviewRound), this.options.config)
       : planMergeGateRepairWritebacks(this.mergeGateWritebackContext(issue, gate, sourceState, reviewRound), this.options.config);
-    if (operations.length === 0) {
+    if (rawOperations.length === 0) {
       throw new SymphonyError("invalid_request", "Merge gate failure could not plan service-owned writeback");
     }
 
-    await this.requireMergeGateWritebacksSucceeded(issue, operations, blocked ? this.options.config.reviewLoop.blockedStates[0] ?? null : this.options.config.writeback.dispatchState);
-
     const blockerKind = blocked ? "blocked" : "repair";
-    const operationKeys = operations.map((operation) => operation.idempotencyKey);
+    const operationKeys = rawOperations.map((operation) => operation.idempotencyKey);
     const storedResult: IssueMergeGateResultRecord = {
       id: gate.id,
       idempotencyKey: mergeGateResultIdempotencyKey(gate, blockerKind),
@@ -2391,7 +2572,15 @@ export class MergePolicyService {
       supersededBy: null,
       supersededReason: null,
     };
+    const operations = rawOperations.map((operation) =>
+      bindWritebackOperationToLifecycle(operation, {
+        kind: "merge_gate_result",
+        recordId: storedResult.id,
+        resultIdempotencyKey: storedResult.idempotencyKey,
+      }),
+    );
 
+    await this.enqueueMergeGateWritebacks(operations);
     await this.options.lifecycleStore.updateIssue(issue, {
       phase: blocked ? "blocked" : "implementation",
       incompleteTurnCount: 0,
@@ -2413,6 +2602,13 @@ export class MergePolicyService {
       ),
       summaryPointers: { ciStatus: "failure" },
     });
+    await this.requireMergeGateWritebacksSucceeded(
+      issue,
+      operations,
+      blocked
+        ? this.options.config.reviewLoop.blockedStates[0] ?? null
+        : this.options.config.writeback.dispatchState,
+    );
 
     const resultGate = { ...gate, writebackOperationKeys: operationKeys };
     return blocked ? { status: "blocked", gate: resultGate } : { status: "repair_dispatched", gate: resultGate };
@@ -2476,8 +2672,14 @@ export class MergePolicyService {
       await this.restorePreservedStashAfterPreparedHead(issue, plan, execution);
     }
     const writebackPlan = this.planServiceConflictWritebacks(issue, plan, execution);
+    const result = await this.recordServicePreparedMergeConflict(
+      issue,
+      plan,
+      execution,
+      writebackPlan,
+    );
     await this.applyServiceConflictWritebacks(issue, plan, writebackPlan);
-    return this.recordServicePreparedMergeConflict(issue, plan, execution, writebackPlan);
+    return result;
   }
 
   private async handleServicePreparedMergeConflict(
@@ -2522,8 +2724,14 @@ export class MergePolicyService {
       await this.restorePreservedStashAfterPreparedHead(issue, plan, execution);
     }
     const writebackPlan = this.planServiceConflictWritebacks(issue, plan, execution);
+    const result = await this.recordServicePreparedMergeConflict(
+      issue,
+      plan,
+      execution,
+      writebackPlan,
+    );
     await this.applyServiceConflictWritebacks(issue, plan, writebackPlan);
-    return this.recordServicePreparedMergeConflict(issue, plan, execution, writebackPlan);
+    return result;
   }
 
   private mergeGateWritebackContext(issue: Issue, gate: MergeGateStatus, sourceState: string, reviewRound: number) {
@@ -2572,19 +2780,42 @@ export class MergePolicyService {
           liveHeadSha,
         ).mergeGate;
     if (!supersededPatch) throw new SymphonyError("invalid_request", "Merge gate supersession could not build inactive gate state");
-    const supersededGate = supersededPatch;
-    const operations = planMergeGateHeadSupersessionWritebacks(
+    const rawOperations = planMergeGateHeadSupersessionWritebacks(
       { issue, gateId, fromState: sourceState, pullRequest, liveHeadSha, reportId: report.id },
       this.options.config,
     );
-    await this.requireMergeGateWritebacksSucceeded(issue, operations, this.options.config.writeback.dispatchState);
+    const operationKeys = rawOperations.map((operation) => operation.idempotencyKey);
+    const supersededGate: IssueMergeGateState = {
+      ...supersededPatch,
+      writebackOperationKeys: operationKeys,
+    };
+    const operations = rawOperations.map((operation) =>
+      bindWritebackOperationToLifecycle(operation, {
+        kind: "merge_gate",
+        recordId: supersededGate.id,
+        status: "superseded",
+        headSha: supersededGate.headSha,
+        supersededByHeadSha: liveHeadSha,
+      }),
+    );
+    await this.enqueueMergeGateWritebacks(operations);
     await this.options.lifecycleStore.updateIssue(issue, {
-      ...(gate ? inactiveMergeGateLifecyclePatch(lifecycle, gate, "superseded", liveHeadSha) : { mergeGate: supersededGate }),
+      ...(gate
+        ? {
+            ...inactiveMergeGateLifecyclePatch(lifecycle, gate, "superseded", liveHeadSha),
+            mergeGate: supersededGate,
+          }
+        : { mergeGate: supersededGate }),
       phase: "implementation",
       blockedReason: null,
       lastReviewVerdictId: null,
       summaryPointers: { ciStatus: "head_superseded" },
     });
+    await this.requireMergeGateWritebacksSucceeded(
+      issue,
+      operations,
+      this.options.config.writeback.dispatchState,
+    );
     return {
       status: "head_superseded",
       previousHeadSha,
@@ -2617,6 +2848,75 @@ export class MergePolicyService {
       throw new SymphonyError("invalid_request", "Merge gate writeback could not be verified");
     }
     return results;
+  }
+
+  private async retryDurableMergeGateResultWritebacks(
+    issue: Issue,
+    lifecycle: IssueLifecycleRecord,
+    sourceState: string,
+  ): Promise<void> {
+    const gate = lifecycle.mergeGate ?? null;
+    if (gate === null || (gate.status !== "repair_dispatched" && gate.status !== "blocked")) return;
+    const result = (lifecycle.mergeGateResults ?? []).find(
+      (candidate) =>
+        candidate.id === gate.id &&
+        !isSupersededLifecycleRecord(candidate),
+    );
+    if (!result) return;
+    if (result.writebackOperationKeys.length === 0) {
+      throw new SymphonyError(
+        "invalid_request",
+        "Durable merge-gate result does not own any writebacks",
+      );
+    }
+    const writeback = this.options.writeback;
+    if (!writeback) {
+      throw new SymphonyError(
+        "invalid_request",
+        "Gated merge policy requires service-owned writeback",
+      );
+    }
+    const operations = await writeback.retryRegistered(
+      result.writebackOperationKeys,
+      { retrySkipped: true },
+    );
+    const incomplete = operations.find(
+      (operation) => operation.status !== "succeeded",
+    );
+    if (incomplete) {
+      throw new SymphonyError(
+        "invalid_request",
+        `Merge gate writeback did not succeed: ${incomplete.status}${
+          incomplete.lastError ? ` (${incomplete.lastError})` : ""
+        }`,
+      );
+    }
+    const expectedState =
+      result.status === "blocked"
+        ? this.options.config.reviewLoop.blockedStates[0] ?? null
+        : this.options.config.writeback.dispatchState;
+    if (expectedState === null) return;
+    const latest =
+      (await this.options.tracker.fetchIssueStatesByIds([issue.id]))[0] ?? null;
+    if (!latest || !statesEqual(latest.state, expectedState)) {
+      throw new SymphonyError(
+        "invalid_request",
+        "Merge gate writeback could not be verified",
+      );
+    }
+  }
+
+  private async enqueueMergeGateWritebacks(
+    operations: Parameters<WritebackProcessor["enqueueAndProcess"]>[0][],
+  ): Promise<void> {
+    const writeback = this.options.writeback;
+    if (!writeback) {
+      throw new SymphonyError(
+        "invalid_request",
+        "Gated merge policy requires service-owned writeback",
+      );
+    }
+    for (const operation of operations) await writeback.enqueue(operation);
   }
 
   private mergeSourceState(issue: Issue, lifecycle: IssueLifecycleRecord | null = null): string | null {
@@ -2961,6 +3261,7 @@ function buildBaseRefRepairMergeConflict(input: {
   baseBranch: string;
   baseHeadSha: string;
   preparation: ServiceOwnedMergeConflictPreparationResult & { status: "conflicted" };
+  blockerProvenanceId: string | null;
   maxFixTurns: number;
   now: string;
 }): IssueMergeConflictMetadata {
@@ -2978,6 +3279,7 @@ function buildBaseRefRepairMergeConflict(input: {
     conflictsState: input.conflictsState,
     reason: "Worktree rebase over the live origin base produced conflicts",
     mergeableState: "dirty",
+    blockerProvenanceId: input.blockerProvenanceId,
     servicePreparation: {
       strategy: "squash_rebase",
       status: "conflicted",
@@ -3037,6 +3339,7 @@ function buildServicePreparedMergeConflict(input: {
     conflictsState: input.conflictsState,
     reason: input.gate.mergeability?.reason ?? "Pull request has merge conflicts with the base branch",
     mergeableState: input.mergeableState,
+    blockerProvenanceId: null,
     servicePreparation: {
       strategy: "squash_rebase",
       status: resolved ? "finalized" : "conflicted",
@@ -3077,6 +3380,7 @@ function buildStashApplyMergeConflict(input: {
   changedFiles: string[];
   conflictedFiles: string[];
   reason: string;
+  blockerProvenanceId?: string | null;
   maxFixTurns: number;
   now: string;
 }): IssueMergeConflictMetadata {
@@ -3099,6 +3403,7 @@ function buildStashApplyMergeConflict(input: {
     conflictsState: input.conflictsState,
     reason: input.reason,
     mergeableState: "dirty",
+    blockerProvenanceId: input.blockerProvenanceId ?? null,
     servicePreparation: {
       strategy: "stash_apply",
       status: "conflicted",

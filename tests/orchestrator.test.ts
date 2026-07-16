@@ -9,10 +9,12 @@ import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
 import {
   baseRefBlockedReason,
   baseRefObservationInputFingerprint,
+  baseRefObservationIsTransient,
   type IssueBaseRefObservation,
 } from "../src/core/BaseRefVerification.js";
 import {
   CompletionReportService,
+  isFinalizedCompletionReport,
   PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
   PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON,
   type CompletionReportPullRequestPublication,
@@ -66,6 +68,7 @@ import { SqliteIssueStateStore } from "../src/core/orchestration/SqliteIssueStat
 import { SqliteMergeQueueStore } from "../src/core/orchestration/SqliteMergeQueueStore.js";
 import {
   FileIssueLifecycleStore,
+  type IssueBlockerProvenanceRecord,
   type IssueCompletionReportRecord,
   type IssueBreakdownCreatedIssueRef,
   type IssueBreakdownPlanRecord,
@@ -6888,6 +6891,7 @@ describe("Orchestrator", () => {
     const observation = baseRefObservationForTest({
       operation: "review_feedback",
     });
+    const provenance = baseRefProvenanceForTest(observation);
     const blockedReason = baseRefBlockedReason(observation);
     const base = mergePolicyRulesetSnapshot({
       trackerState: "In Review",
@@ -6900,6 +6904,11 @@ describe("Orchestrator", () => {
       latestWorkspacePath: observation.workspacePath,
       latestGitBranchName: observation.branchName,
       latestBaseRef: observation.baseRef,
+      lastReviewVerdictId: provenance.reviewVerdictId,
+      latestRunId: provenance.runId,
+      latestPrNumber: provenance.pullRequestNumber,
+      latestPrHeadSha: provenance.pullRequestHeadSha,
+      activeBlockerProvenance: provenance,
       mergeQueueStatus: "inactive",
       candidateSource: "reviewer_candidates",
     });
@@ -6941,8 +6950,59 @@ describe("Orchestrator", () => {
       transitionKind: "base_ref_repair",
       baseRefObservationFingerprint: observation.inputFingerprint,
     });
+    expect(
+      repairRuleset?.evaluate(
+        {
+          ...base,
+          latestRunId: "new-review-run",
+        },
+        [],
+      ),
+    ).toBeNull();
+    expect(
+      repairRuleset?.evaluate(
+        {
+          ...base,
+          latestPrHeadSha: "new-pr-head",
+        },
+        [],
+      ),
+    ).toBeNull();
     const dispatchObservation = baseRefObservationForTest({
       operation: "dispatch_reviewer",
+    });
+    expect(
+      repairRuleset?.evaluate(
+        {
+          ...paraphrasedBase,
+          phase: "blocked",
+          activeBlockerProvenance: null,
+          lastBaseRefObservation: dispatchObservation,
+          lastBaseRefObservationFingerprint: dispatchObservation.inputFingerprint,
+          lastBaseRefObservationClassification: dispatchObservation.classification,
+        },
+        [],
+      ),
+    ).toBeNull();
+    const dispatchProvenance = baseRefProvenanceForTest(
+      dispatchObservation,
+      { reviewVerdictId: null },
+    );
+    expect(
+      repairRuleset?.evaluate(
+        {
+          ...paraphrasedBase,
+          phase: "blocked",
+          activeBlockerProvenance: dispatchProvenance,
+          lastBaseRefObservation: dispatchObservation,
+          lastBaseRefObservationFingerprint: dispatchObservation.inputFingerprint,
+          lastBaseRefObservationClassification: dispatchObservation.classification,
+        },
+        [],
+      ),
+    ).toMatchObject({
+      transitionKind: "base_ref_repair",
+      blockerProvenanceId: dispatchProvenance.id,
     });
     expect(
       repairRuleset?.evaluate(
@@ -7011,6 +7071,7 @@ describe("Orchestrator", () => {
       reason:
         "Base ref verification requires a workspace path, branch, and base ref",
     });
+    const provenance = baseRefProvenanceForTest(observation);
     const blockedReason = baseRefBlockedReason(observation);
     const base = mergePolicyRulesetSnapshot({
       trackerState: "In Review",
@@ -7023,6 +7084,11 @@ describe("Orchestrator", () => {
       latestWorkspacePath: observation.workspacePath,
       latestGitBranchName: observation.branchName,
       latestBaseRef: observation.baseRef,
+      lastReviewVerdictId: provenance.reviewVerdictId,
+      latestRunId: provenance.runId,
+      latestPrNumber: provenance.pullRequestNumber,
+      latestPrHeadSha: provenance.pullRequestHeadSha,
+      activeBlockerProvenance: provenance,
       mergeQueueStatus: "inactive",
       candidateSource: "reviewer_candidates",
     });
@@ -7048,8 +7114,339 @@ describe("Orchestrator", () => {
         { ...base, blockedReason: "review blocked: unrelated reviewer blocker" },
         [],
       ),
+    ).toMatchObject({
+      transitionKind: "base_ref_block",
+      blockerProvenanceId: provenance.id,
+    });
+    expect(
+      blockRuleset?.evaluate(
+        { ...base, activeBlockerProvenance: null },
+        [],
+      ),
     ).toBeNull();
     await orchestrator.stop();
+  });
+
+  it("routes exact unlinked review-feedback provenance only from the blocked latest reviewer run", async () => {
+    const config = mergePolicyOrchestratorConfig(root);
+    const logger = new StructuredLogger(() => undefined);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: emptyTracker(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+    const repairRuleset = orchestrator
+      .registeredTransitionRulesets()
+      .find(
+        (ruleset) => ruleset.id === "orchestrator.base_ref.repair_observed",
+      );
+    const observation = baseRefObservationForTest({
+      operation: "review_feedback",
+    });
+    const provenance = baseRefProvenanceForTest(observation, {
+      reviewVerdictId: null,
+    });
+    const base = mergePolicyRulesetSnapshot({
+      trackerState: "In Review",
+      phase: "blocked",
+      blockedReason: baseRefBlockedReason(observation),
+      lastBaseRefObservation: observation,
+      lastBaseRefObservationFingerprint: observation.inputFingerprint,
+      lastBaseRefObservationClassification: observation.classification,
+      latestWorkspacePath: observation.workspacePath,
+      latestGitBranchName: observation.branchName,
+      latestBaseRef: observation.baseRef,
+      latestRunId: provenance.runId,
+      latestRunRole: "reviewer",
+      latestPrNumber: provenance.pullRequestNumber,
+      latestPrHeadSha: provenance.pullRequestHeadSha,
+      activeBlockerProvenance: provenance,
+      candidateSource: "reviewer_candidates",
+    });
+
+    expect(repairRuleset?.evaluate(base, [])).toMatchObject({
+      transitionKind: "base_ref_repair",
+      blockerProvenanceId: provenance.id,
+    });
+    expect(
+      repairRuleset?.evaluate({ ...base, latestRunId: "stale-review-run" }, []),
+    ).toBeNull();
+    expect(
+      repairRuleset?.evaluate({ ...base, latestPrHeadSha: "stale-head" }, []),
+    ).toBeNull();
+    expect(
+      repairRuleset?.evaluate({ ...base, phase: "review" }, []),
+    ).toBeNull();
+    expect(
+      repairRuleset?.evaluate({ ...base, latestRunRole: "worker" }, []),
+    ).toBeNull();
+    expect(repairRuleset?.evaluate({ ...base, running: true }, [])).toBeNull();
+    await orchestrator.stop();
+  });
+
+  it("keeps transient review-feedback base-ref re-observation provenance-bound without blocking", async () => {
+    const config = mergePolicyOrchestratorConfig(root);
+    const logger = new StructuredLogger(() => undefined);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: emptyTracker(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+    const rulesets = orchestrator.registeredTransitionRulesets();
+    const refreshRuleset = rulesets.find(
+      (ruleset) =>
+        ruleset.id === "orchestrator.base_ref.refresh_observed_blocker",
+    );
+    const blockRuleset = rulesets.find(
+      (ruleset) => ruleset.id === "orchestrator.base_ref.block_observed",
+    );
+    const observation = baseRefObservationForTest({
+      classification: "base_ref_fetch_failed",
+      operation: "review_feedback",
+      localBaseIsAncestorOfHead: null,
+      reason: "Unable to fetch local base ref",
+      error: "temporary network failure",
+    });
+    const provenance = baseRefProvenanceForTest(observation, {
+      reviewVerdictId: null,
+      observationAttempt: 1,
+    });
+    const base = mergePolicyRulesetSnapshot({
+      trackerState: "In Review",
+      phase: "blocked",
+      blockedReason: baseRefBlockedReason(observation),
+      lastBaseRefObservation: observation,
+      lastBaseRefObservationFingerprint: observation.inputFingerprint,
+      lastBaseRefObservationClassification: observation.classification,
+      latestWorkspacePath: observation.workspacePath,
+      latestGitBranchName: observation.branchName,
+      latestBaseRef: observation.baseRef,
+      latestRunId: provenance.runId,
+      latestRunRole: "reviewer",
+      latestPrNumber: provenance.pullRequestNumber,
+      latestPrHeadSha: provenance.pullRequestHeadSha,
+      activeBlockerProvenance: provenance,
+      candidateSource: "reviewer_candidates",
+    });
+
+    expect(refreshRuleset?.evaluate(base, [])).toMatchObject({
+      transitionKind: "base_ref_observe",
+      reason: "transient_review_feedback_base_ref_verification_retry",
+      blockerProvenanceId: provenance.id,
+      baseRefObservationOperation: "review_feedback",
+      baseRefObservationAttempt: 1,
+    });
+    const laterAttempt = {
+      ...base,
+      activeBlockerProvenance: {
+        ...provenance,
+        observationAttempt: 3,
+      },
+    };
+    expect(refreshRuleset?.evaluate(laterAttempt, [])).toMatchObject({
+      transitionKind: "base_ref_observe",
+      blockerProvenanceId: provenance.id,
+      baseRefObservationAttempt: 3,
+    });
+    expect(blockRuleset?.evaluate(laterAttempt, [])).toBeNull();
+    expect(
+      refreshRuleset?.evaluate({ ...base, trackerState: "Blocked" }, []),
+    ).toBeNull();
+    await orchestrator.stop();
+  });
+
+  it("re-observes transient review-feedback provenance until recovery and then redispatches review", async () => {
+    await mkdir(path.join(root, ".git"));
+    const config = mergePolicyOrchestratorConfig(root);
+    const candidate = issue({
+      state: "In Review",
+      branchName: "symphony/TEST-1",
+    });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const harness = new FakeHarness();
+    const initialObservation = baseRefObservationForTest({
+      classification: "base_ref_fetch_failed",
+      operation: "review_feedback",
+      checkedAt: "2026-01-01T00:00:00.000Z",
+      workspacePath: root,
+      localBaseIsAncestorOfHead: null,
+      reason: "Unable to fetch local base ref",
+      error: "temporary network failure",
+    });
+    const initialProvenance = baseRefProvenanceForTest(initialObservation, {
+      reviewVerdictId: null,
+      observationAttempt: 1,
+    });
+    const report = completionReportRecord(candidate);
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "blocked",
+      blockedReason: baseRefBlockedReason(initialObservation),
+      lastCompletionReportId: report.id,
+      completionReports: [report],
+      baseRefObservation: initialObservation,
+      blockerProvenances: [initialProvenance],
+      activeBlockerProvenanceId: initialProvenance.id,
+      summaryPointers: {
+        workspaceKey: candidate.identifier,
+        workspacePath: initialObservation.workspacePath,
+        branchName: candidate.branchName,
+        gitBranchName: initialObservation.branchName,
+        repoPath: root,
+        baseRef: initialObservation.baseRef,
+        lastRunId: initialProvenance.runId,
+        prUrl: "https://github.com/acme/symphony/pull/42",
+        prNumber: initialProvenance.pullRequestNumber,
+        prHeadSha: initialProvenance.pullRequestHeadSha,
+        prBranch: candidate.branchName,
+      },
+    });
+    await runStore.startRun({
+      runId: initialProvenance.runId,
+      sessionId: "review-session-1",
+      agentId: "review-agent-1",
+      role: "reviewer",
+      runPhase: "review",
+      runKind: "review",
+      issueId: candidate.id,
+      issueIdentifier: candidate.identifier,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "Review the pull request",
+      workspaceKey: candidate.identifier,
+      workspacePath: initialObservation.workspacePath ?? root,
+      gitBranchName:
+        initialObservation.branchName ?? candidate.branchName ?? "TEST-1",
+      repoPath: root,
+      baseRef: initialObservation.baseRef ?? "origin/main",
+    });
+    await runStore.updateRun(initialProvenance.runId, {
+      status: "succeeded",
+      completedAt: "2026-01-01T00:00:01.000Z",
+      metadata: {
+        prUrl: "https://github.com/acme/symphony/pull/42",
+        prNumber: initialProvenance.pullRequestNumber,
+        prHeadSha: initialProvenance.pullRequestHeadSha,
+        prBranch: candidate.branchName,
+      },
+    });
+    const verificationOperations: string[] = [];
+    const baseRefVerifier = {
+      verify: async (input: {
+        workspacePath: string | null | undefined;
+        branchName: string | null | undefined;
+        baseRef: string | null | undefined;
+        operation: string;
+      }) => {
+        verificationOperations.push(input.operation);
+        if (verificationOperations.length === 1) {
+          return baseRefObservationForTest({
+            ...initialObservation,
+            checkedAt: "2026-01-01T00:00:02.000Z",
+          });
+        }
+        return baseRefObservationForTest({
+          classification: "ok",
+          operation: input.operation,
+          checkedAt: `2026-01-01T00:00:0${verificationOperations.length + 1}.000Z`,
+          workspacePath: input.workspacePath ?? null,
+          branchName: input.branchName ?? null,
+          baseRef: input.baseRef ?? null,
+          localBaseIsAncestorOfHead: true,
+          reason: null,
+          error: null,
+        });
+      },
+    };
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      pullRequestMergeClient: new FailingRequiredCheckMergeClient(),
+      baseRefVerifier,
+    });
+
+    await orchestrator.refreshNow();
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      phase: "blocked",
+      activeBlockerProvenanceId: expect.any(String),
+      blockerProvenances: [
+        expect.objectContaining({
+          id: initialProvenance.id,
+          observationAttempt: 2,
+          resolvedAt: null,
+        }),
+      ],
+    });
+
+    await orchestrator.refreshNow();
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      phase: "review",
+      blockedReason: null,
+      activeBlockerProvenanceId: null,
+      blockerProvenances: [
+        expect.objectContaining({
+          id: initialProvenance.id,
+          observationAttempt: 3,
+          initialClassification: "base_ref_fetch_failed",
+          classification: "ok",
+          resolution: "base_ref_recheck",
+        }),
+      ],
+    });
+
+    for (let index = 0; index < 3 && harness.runs.length === 0; index += 1) {
+      await orchestrator.refreshNow();
+    }
+    await waitForAsync(
+      async () => harness.runs.length === 1,
+      "reviewer redispatch after review-feedback base-ref recovery",
+    );
+    await orchestrator.stop();
+
+    expect(verificationOperations).toEqual([
+      "review_feedback",
+      "review_feedback",
+      "dispatch_reviewer",
+    ]);
+    expect(harness.runs.map((run) => run.ctx.role)).toEqual(["reviewer"]);
   });
 
   it("retries transient base-ref failures inside a guarded transition chain", async () => {
@@ -7087,6 +7484,9 @@ describe("Orchestrator", () => {
       localBaseIsAncestorOfHead: null,
       reason: "Fetched local base ref does not match GitHub live base",
     });
+    const provenance = baseRefProvenanceForTest(observation, {
+      reviewVerdictId: null,
+    });
     const snapshot = mergePolicyRulesetSnapshot({
       triggerType: "runtime.requested",
       triggerSource: "transition",
@@ -7110,6 +7510,10 @@ describe("Orchestrator", () => {
       latestWorkspacePath: observation.workspacePath,
       latestGitBranchName: observation.branchName,
       latestBaseRef: observation.baseRef,
+      latestRunId: provenance.runId,
+      latestPrNumber: provenance.pullRequestNumber,
+      latestPrHeadSha: provenance.pullRequestHeadSha,
+      activeBlockerProvenance: provenance,
     });
 
     expect(chainRuleset?.evaluate(snapshot, [])).toMatchObject({
@@ -7117,6 +7521,8 @@ describe("Orchestrator", () => {
       reason: "transient_base_ref_verification_retry",
       baseRefTargetTransitionKind: "dispatch_worker",
       baseRefTargetRequest: targetRequest,
+      blockerProvenanceId: provenance.id,
+      baseRefObservationOperation: "base_ref_recheck",
     });
     await orchestrator.stop();
   });
@@ -7157,6 +7563,11 @@ describe("Orchestrator", () => {
       error: "fetch failed",
     });
     const blockedReason = baseRefBlockedReason(observation);
+    const provenance = baseRefProvenanceForTest(observation, {
+      reviewVerdictId: null,
+      pullRequestNumber: null,
+      pullRequestHeadSha: null,
+    });
     const base = mergePolicyRulesetSnapshot({
       trackerState: "In Progress",
       phase: "blocked",
@@ -7167,6 +7578,10 @@ describe("Orchestrator", () => {
       latestWorkspacePath: observation.workspacePath,
       latestGitBranchName: observation.branchName,
       latestBaseRef: observation.baseRef,
+      latestRunId: provenance.runId,
+      latestPrNumber: provenance.pullRequestNumber,
+      latestPrHeadSha: provenance.pullRequestHeadSha,
+      activeBlockerProvenance: provenance,
       candidateSource: "tick_candidates",
     });
 
@@ -7174,6 +7589,8 @@ describe("Orchestrator", () => {
       transitionKind: "base_ref_observe",
       reason: "base_ref_reobserve_after_operator_resume",
       baseRefTargetTransitionKind: "dispatch_worker",
+      blockerProvenanceId: provenance.id,
+      baseRefObservationOperation: "operator_resume",
       baseRefTargetRequest: expect.objectContaining({
         transitionKind: "dispatch_worker",
         role: "worker",
@@ -7187,6 +7604,245 @@ describe("Orchestrator", () => {
       transitionKind: "base_ref_observe",
       baseRefTargetTransitionKind: "dispatch_worker",
     });
+    expect(
+      refreshRuleset?.evaluate(
+        { ...base, activeBlockerProvenance: null },
+        [],
+      ),
+    ).toBeNull();
+    await orchestrator.stop();
+  });
+
+  it("replaces continuing operator-resume base-ref provenance and resets the failure budget", async () => {
+    await mkdir(path.join(root, ".git"));
+    const config = mergePolicyOrchestratorConfig(root);
+    const candidate = issue({
+      state: "In Progress",
+      branchName: "symphony/TEST-1",
+    });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    const initialObservation = baseRefObservationForTest({
+      classification: "base_ref_unavailable",
+      operation: "reconcile_completion_report_handoff",
+      checkedAt: "2026-01-01T00:00:00.000Z",
+      workspacePath: root,
+      localBaseIsAncestorOfHead: null,
+      reason: "Base ref verification metadata is incomplete",
+      error: "missing base metadata",
+    });
+    const initialProvenance = baseRefProvenanceForTest(initialObservation, {
+      runId: "worker-run-1",
+      reviewVerdictId: null,
+      pullRequestNumber: null,
+      pullRequestHeadSha: null,
+    });
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "blocked",
+      reviewRound: 3,
+      incompleteTurnCount: 2,
+      blockedReason: baseRefBlockedReason(initialObservation),
+      baseRefObservation: initialObservation,
+      blockerProvenances: [initialProvenance],
+      activeBlockerProvenanceId: initialProvenance.id,
+      summaryPointers: {
+        workspaceKey: candidate.identifier,
+        workspacePath: root,
+        branchName: candidate.branchName,
+        gitBranchName: initialObservation.branchName,
+        repoPath: root,
+        baseRef: initialObservation.baseRef,
+        lastRunId: initialProvenance.runId,
+        prUrl: null,
+        prNumber: null,
+        prHeadSha: null,
+        prBranch: null,
+      },
+    });
+    const verificationOperations: string[] = [];
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      pullRequestMergeClient: new FailingRequiredCheckMergeClient(),
+      baseRefVerifier: {
+        async verify(input) {
+          verificationOperations.push(input.operation);
+          return baseRefObservationForTest({
+            classification: "base_ref_unavailable",
+            operation: input.operation,
+            checkedAt: "2026-01-01T00:00:02.000Z",
+            workspacePath: input.workspacePath ?? root,
+            branchName: input.branchName ?? candidate.branchName,
+            baseRef: input.baseRef ?? initialObservation.baseRef,
+            localBaseIsAncestorOfHead: null,
+            reason: "Base ref verification metadata is still incomplete",
+            error: "base metadata remains unavailable",
+          });
+        },
+      },
+    });
+
+    await orchestrator.refreshNow();
+    const updated = await lifecycleStore.get(candidate.id);
+    await orchestrator.stop();
+
+    expect(verificationOperations).toEqual(["dispatch_worker"]);
+    expect(updated).not.toBeNull();
+    expect(updated).toMatchObject({
+      phase: "blocked",
+      reviewRound: 0,
+      incompleteTurnCount: 0,
+      blockedReason: expect.stringContaining("base ref metadata is unavailable"),
+      baseRefObservation: {
+        operation: "dispatch_worker",
+        classification: "base_ref_unavailable",
+        checkedAt: "2026-01-01T00:00:02.000Z",
+      },
+    });
+    expect(updated?.activeBlockerProvenanceId).not.toBe(
+      initialProvenance.id,
+    );
+    const blockerProvenances = updated?.blockerProvenances ?? [];
+    const replacementProvenanceId =
+      updated?.activeBlockerProvenanceId ?? null;
+    expect(
+      blockerProvenances.find(
+        (record) => record.id === initialProvenance.id,
+      ),
+    ).toMatchObject({
+      resolution: "superseded",
+      resolvedAt: "2026-01-01T00:00:02.000Z",
+    });
+    expect(
+      blockerProvenances.find(
+        (record) => record.id === replacementProvenanceId,
+      ),
+    ).toMatchObject({
+      operation: "dispatch_worker",
+      runId: initialProvenance.runId,
+      pullRequestNumber: null,
+      pullRequestHeadSha: null,
+      classification: "base_ref_unavailable",
+      sourceObservationFingerprint:
+        updated?.baseRefObservation?.inputFingerprint,
+      lastObservedAt: "2026-01-01T00:00:02.000Z",
+      resolvedAt: null,
+      resolution: null,
+    });
+  });
+
+  it("binds operator-resume re-observation to review provenance and defers carried conflicts", async () => {
+    const config = mergePolicyOrchestratorConfig(root);
+    config.tracker.activeStates = ["Todo", "In Progress"];
+    const logger = new StructuredLogger(() => undefined);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: emptyTracker(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+    const rulesets = orchestrator.registeredTransitionRulesets();
+    const refreshRuleset = rulesets.find(
+        (ruleset) =>
+          ruleset.id === "orchestrator.base_ref.refresh_observed_blocker",
+      );
+    const resetRuleset = rulesets.find(
+      (ruleset) =>
+        ruleset.id === "orchestrator.reset_lifecycle_after_operator_resume",
+    );
+    const workerRuleset = rulesets.find(
+      (ruleset) =>
+        ruleset.id === "orchestrator.dispatch.worker.implementation",
+    );
+    const observation = baseRefObservationForTest({
+      classification: "base_ref_unavailable",
+      operation: "review_feedback",
+      localBaseIsAncestorOfHead: null,
+      reason: "Base ref verification is unavailable",
+      error: "missing base ref",
+    });
+    const provenance = baseRefProvenanceForTest(observation, {
+      reviewVerdictId: null,
+    });
+    const base = mergePolicyRulesetSnapshot({
+      trackerState: "In Progress",
+      phase: "blocked",
+      blockedReason: baseRefBlockedReason(observation),
+      lastBaseRefObservation: observation,
+      lastBaseRefObservationFingerprint: observation.inputFingerprint,
+      lastBaseRefObservationClassification: observation.classification,
+      latestWorkspacePath: observation.workspacePath,
+      latestGitBranchName: observation.branchName,
+      latestBaseRef: observation.baseRef,
+      latestRunId: provenance.runId,
+      latestRunRole: "reviewer",
+      latestPrNumber: provenance.pullRequestNumber,
+      latestPrHeadSha: provenance.pullRequestHeadSha,
+      activeBlockerProvenance: provenance,
+      candidateSource: "tick_candidates",
+    });
+
+    expect(refreshRuleset?.evaluate(base, [])).toMatchObject({
+      transitionKind: "base_ref_observe",
+      reason: "base_ref_reobserve_after_operator_resume",
+      blockerProvenanceId: provenance.id,
+      baseRefObservationOperation: "operator_resume",
+      baseRefObservationFingerprint: observation.inputFingerprint,
+      baseRefObservationClassification: observation.classification,
+    });
+    const carriedBlockedConflict = {
+      ...openMergeConflict(issue()),
+      status: "blocked" as const,
+      resolutionStatus: "blocked" as const,
+      blockerProvenanceId: provenance.id,
+      blockedAt: "2026-01-01T00:00:02.000Z",
+      blockedReason: "carried stash apply conflict needs another repair turn",
+    };
+    const staleReviewedHead = {
+      ...base,
+      latestPrHeadSha: "new-pr-head",
+      mergeConflict: carriedBlockedConflict,
+    };
+    expect(refreshRuleset?.evaluate(staleReviewedHead, [])).toBeNull();
+    expect(resetRuleset?.evaluate(staleReviewedHead, [])).toBeNull();
+    expect(
+      workerRuleset?.evaluate(
+        {
+          ...staleReviewedHead,
+          phase: "implementation",
+          blockedReason: null,
+        },
+        [],
+      ),
+    ).toBeNull();
     await orchestrator.stop();
   });
 
@@ -10096,7 +10752,10 @@ describe("Orchestrator", () => {
           expect.objectContaining({
             runId: "report-run-1",
             idempotencyKey: "idem-1",
-            writebackOperationKeys: [],
+            writebackOperationKeys: [
+              "comment:issue-1:report-run-1:completion-report:idem-1:publication-approval-pending",
+              "transition:issue-1:report-run-1:completion-report:idem-1:publication-approval-pending:Blocked",
+            ],
           }),
         ],
       });
@@ -10548,9 +11207,27 @@ describe("Orchestrator", () => {
       ).resolves.toBeNull();
       expect(writer.comments).toEqual([]);
       expect(writer.transitions).toEqual([]);
-      await expect(lifecycleStore.get(candidate.id)).resolves.toEqual(
-        lifecycleBefore,
-      );
+      const lifecycleAfter = await lifecycleStore.get(candidate.id);
+      expect(lifecycleAfter).toMatchObject({
+        phase: lifecycleBefore?.phase,
+        blockedReason: lifecycleBefore?.blockedReason,
+        incompleteTurnCount: lifecycleBefore?.incompleteTurnCount,
+        completionReports: [
+          expect.objectContaining({
+            runId: "run-1",
+            idempotencyKey: "idem-1",
+            writebackOperationKeys: [
+              "comment:issue-1:run-1:completion-report:idem-1:publication-approval-pending",
+              "transition:issue-1:run-1:completion-report:idem-1:publication-approval-pending:Blocked",
+            ],
+          }),
+        ],
+      });
+      const pendingReport = lifecycleAfter?.completionReports[0];
+      expect(pendingReport).toBeDefined();
+      expect(
+        isFinalizedCompletionReport(pendingReport!, lifecycleAfter),
+      ).toBe(false);
       expect(
         (await runStore.getRun("run-1"))?.pendingApprovalRequestId ?? null,
       ).toBeNull();
@@ -10880,7 +11557,10 @@ describe("Orchestrator", () => {
             runId: "run-1",
             idempotencyKey: "idem-1",
             pullRequest: null,
-            writebackOperationKeys: [],
+            writebackOperationKeys: [
+              "comment:issue-1:run-1:completion-report:idem-1:publication-approval-pending",
+              "transition:issue-1:run-1:completion-report:idem-1:publication-approval-pending:Blocked",
+            ],
           }),
         ],
       });
@@ -12081,7 +12761,10 @@ describe("Orchestrator", () => {
         {
           idempotencyKey: "idem-1",
           runId: "report-run-1",
-          writebackOperationKeys: [],
+          writebackOperationKeys: [
+            "comment:issue-1:report-run-1:completion-report:idem-1:publication-approval-pending",
+            "transition:issue-1:report-run-1:completion-report:idem-1:publication-approval-pending:Blocked",
+          ],
         },
       ],
     });
@@ -14182,7 +14865,7 @@ describe("Orchestrator", () => {
     await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
       phase: "review",
       reviewRound: 0,
-      blockedReason: "review blocked: Required validation is unavailable to reviewer command surfaces.",
+      blockedReason: "review blocked: non_worker_owned",
       lastReviewVerdictId: "review-verdict:issue-1:review-verdict-blocked-1",
       reviewVerdicts: [
         {
@@ -17588,6 +18271,7 @@ async function submitTwoChildPlan(
     {
       runId,
       issueId: parentIssue.id,
+      finalDisposition: "Split the work into two dependency-ordered child issues.",
       summary: "Split into child issues.",
       proposedIssues: [
         {
@@ -18141,6 +18825,49 @@ function baseRefObservationForTest(
       overrides.reason ??
       "Worktree HEAD is not based on the live origin base",
     error: overrides.error ?? null,
+  };
+}
+
+function baseRefProvenanceForTest(
+  observation: IssueBaseRefObservation,
+  overrides: Partial<IssueBlockerProvenanceRecord> = {},
+): IssueBlockerProvenanceRecord {
+  return {
+    version: 1,
+    id: "blocker-provenance-1",
+    code:
+      observation.classification === "branch_not_based_on_live_base"
+        ? "base_ref_drift"
+        : "base_ref_verification_failure",
+    recoveryKind:
+      observation.classification === "branch_not_based_on_live_base"
+        ? "automatic_rebase"
+        : baseRefObservationIsTransient(observation)
+          ? "automatic_recheck"
+          : "operator_triage",
+    sourceKind: "base_ref_observation",
+    initialObservationFingerprint: observation.inputFingerprint,
+    initialClassification: observation.classification,
+    initialLiveBaseHeadSha: observation.githubBaseHeadSha,
+    initialWorktreeHeadSha: observation.worktreeHeadSha,
+    sourceObservationFingerprint: observation.inputFingerprint,
+    classification: observation.classification,
+    operation: observation.operation,
+    runId: "review-run-1",
+    issueId: "issue-1",
+    issueIdentifier: "TEST-1",
+    pullRequestNumber: 42,
+    pullRequestHeadSha: observation.worktreeHeadSha ?? "head-sha-1",
+    baseRef: observation.baseRef,
+    liveBaseHeadSha: observation.githubBaseHeadSha,
+    worktreeHeadSha: observation.worktreeHeadSha,
+    observationAttempt: 1,
+    lastObservedAt: observation.checkedAt,
+    reviewVerdictId: "review-verdict-1",
+    createdAt: observation.checkedAt,
+    resolvedAt: null,
+    resolution: null,
+    ...overrides,
   };
 }
 
@@ -18792,6 +19519,7 @@ class ManualDispatchRecordingHarness implements AgentHarness {
         {
           runId,
           issueId: ctx.issue.id,
+          finalDisposition: "Completed the manually dispatched implementation work.",
           summary: "Manual worker dispatch completed.",
           validationEvidence: ["manual dispatch test"],
           acceptanceChecklist: [
@@ -18885,6 +19613,7 @@ class MergeConflictResolutionSubmittingHarness implements AgentHarness {
       {
         runId,
         issueId: ctx.issue.id,
+        finalDisposition: "Resolved the merge conflict and verified the resulting head.",
         resolutionStatus: "resolved",
         summary: "Resolved merge conflicts.",
         validationEvidence: ["test"],
@@ -19106,6 +19835,7 @@ class IssueBreakdownAcceptingHarness implements AgentHarness {
         {
           runId,
           issueId: ctx.issue.id,
+          finalDisposition: "Decomposed the issue into one implementation task.",
           idempotencyKey: `test-plan-${runId}`,
           summary: "Break implementation into one task.",
           proposedIssues: [
@@ -19154,6 +19884,7 @@ class IssueTriageAcceptingHarness implements AgentHarness {
         {
           runId,
           issueId: ctx.issue.id,
+          finalDisposition: "Identified hidden child scope as the active blocker and recommended decomposition.",
           triggerFingerprint: issueTriageTriggerFingerprint(lifecycle),
           summary: "Repeated review failures exposed hidden child scope.",
           blockers: [
@@ -19218,6 +19949,7 @@ class IssueBreakdownHandoffHarness implements AgentHarness {
       {
         runId,
         issueId: ctx.issue.id,
+        finalDisposition: "Decomposed the issue into one implementation task.",
         idempotencyKey: `test-plan-${runId}`,
         summary: "Break implementation into one task.",
         proposedIssues: [
@@ -19408,6 +20140,7 @@ class RejectedCompletionReportHarness implements AgentHarness {
           {
             runId,
             issueId: ctx.issue.id,
+            finalDisposition: "Reported the incomplete validation state so the worker turn can be rejected explicitly.",
             summary: "Implemented part of the requested handoff.",
             validationEvidence: [
               "Focused validation could not run in this worker environment.",
@@ -19491,6 +20224,7 @@ class ReportingHarness implements AgentHarness {
         {
           runId: "report-run-1",
           issueId: ctx.issue.id,
+          finalDisposition: "Implemented the requested handoff and verified it with the test suite.",
           summary: "Implemented the requested handoff.",
           validationEvidence: ["npm test"],
           acceptanceChecklist: [
@@ -19581,6 +20315,10 @@ class ManufacturedReviewLoopHarness implements AgentHarness {
       {
         runId,
         issueId: ctx.issue.id,
+        finalDisposition:
+          runNumber === 1
+            ? "Submitted the initial manufactured implementation for review."
+            : "Addressed the manufactured reviewer feedback and resubmitted the implementation.",
         summary:
           runNumber === 1
             ? "Submitted the manufactured smoke implementation."
@@ -19637,6 +20375,7 @@ class ManufacturedReviewLoopHarness implements AgentHarness {
         ? {
             runId,
             issueId: ctx.issue.id,
+            finalDisposition: "Rejected the initial implementation and requested the manufactured smoke revision.",
             verdict: "fail",
             acceptanceResults: [
               {
@@ -19653,6 +20392,7 @@ class ManufacturedReviewLoopHarness implements AgentHarness {
         : {
             runId,
             issueId: ctx.issue.id,
+            finalDisposition: "Approved the revised implementation after verifying the manufactured smoke revision.",
             verdict: "pass",
             acceptanceResults: [
               {
@@ -19705,6 +20445,7 @@ class ReviewVerdictSubmittingHarness implements AgentHarness {
         ? {
             runId,
             issueId: ctx.issue.id,
+            finalDisposition: "Rejected the implementation because reviewer MCP integration remains missing.",
             verdict: "fail",
             acceptanceResults: [
               {
@@ -19723,6 +20464,7 @@ class ReviewVerdictSubmittingHarness implements AgentHarness {
           ? {
               runId,
               issueId: ctx.issue.id,
+              finalDisposition: "Blocked review because required validation is unavailable to the reviewer.",
               verdict: "blocked",
               acceptanceResults: [
                 {
@@ -19740,6 +20482,7 @@ class ReviewVerdictSubmittingHarness implements AgentHarness {
         : {
             runId,
             issueId: ctx.issue.id,
+            finalDisposition: "Approved the implementation after confirming the reviewer MCP path is present.",
             verdict: "pass",
             acceptanceResults: [
               {
@@ -19820,6 +20563,7 @@ class MissingReviewVerdictThenRepairHarness implements AgentHarness {
         {
           runId,
           issueId: ctx.issue.id,
+          finalDisposition: "Repaired the missing reviewer handoff by submitting the previously omitted verdict.",
           verdict: "fail",
           acceptanceResults: [
             {

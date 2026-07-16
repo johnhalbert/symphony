@@ -2,6 +2,7 @@ import type { ServiceConfig } from "../config/Config.js";
 import type {
   ExpectedRedArtifactEvidence,
   IssueAcceptedArtifactRecord,
+  IssueBlockerProvenanceRecord,
   IssueCompletionReportRecord,
   IssueMergeGateMergeabilityState,
   IssueMergeConflictResolutionReportRecord,
@@ -31,11 +32,19 @@ export interface ReviewVerdictWritebackContext {
 
 export interface ReviewVerdictWritebackDetails {
   idempotencyKey: string;
+  finalDisposition?: string;
   acceptanceResults: Array<{ text: string; satisfied: boolean; evidence: string | null }>;
   findings: string[];
   gateFindings?: ReviewGateFindingRecord[];
   discoveryFindings?: ReviewDiscoveryFindingRecord[];
   evidence: string[];
+  blockerProvenance?: IssueBlockerProvenanceRecord | null;
+}
+
+export interface ReviewVerdictDispositionOnlyWritebackDetails {
+  idempotencyKey: string;
+  verdict: "pass" | "fail" | "blocked";
+  finalDisposition?: string;
 }
 
 export interface BlockedEscalationWritebackContext {
@@ -49,6 +58,8 @@ export interface BlockedEscalationWritebackContext {
   lastCompletionReport?: IssueCompletionReportRecord | null;
   lastReviewVerdict?: IssueReviewVerdictRecord | null;
   requiredAction?: string;
+  finalDisposition?: string;
+  blockerProvenance?: IssueBlockerProvenanceRecord | null;
 }
 
 export interface IssueTriageReportWritebackContext {
@@ -132,6 +143,11 @@ export interface MergeConflictResolvedWritebackContext {
   conflictsState: string;
 }
 
+export interface MergeConflictStillConflictedWritebackContext {
+  issue: Issue;
+  report: IssueMergeConflictResolutionReportRecord;
+}
+
 export interface BaseRefRepairWritebackContext {
   issue: Issue;
   operationId: string;
@@ -175,6 +191,7 @@ export interface MergeGateHeadSupersessionRecoveryWritebackContext {
 export interface CompletionReportWritebackDetails {
   reportId: string;
   idempotencyKey: string;
+  finalDisposition?: string;
   summary: string;
   validationEvidence: string[];
   acceptanceChecklist: Array<{ text: string; satisfied: boolean; evidence: string | null }>;
@@ -358,6 +375,35 @@ export function planCompletionReportAcceptedWritebacks(
         fromStates: completionReportFromStates,
         toState: reviewState,
         reason: "Symphony completion report accepted",
+      },
+    },
+  ];
+}
+
+export function planCompletionReportDispositionOnlyWriteback(
+  context: RunWritebackContext,
+  config: ServiceConfig,
+  report: CompletionReportWritebackDetails,
+): NewWritebackOperation[] {
+  if (!config.writeback.enabled || report.finalDisposition === undefined) {
+    return [];
+  }
+  const eventKey = `${context.runId}:completion-report:${safeKeySegment(report.idempotencyKey)}:disposition-only`;
+  return [
+    {
+      idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
+      kind: "comment",
+      issueId: context.issue.id,
+      runId: context.runId,
+      payload: {
+        dedupeKey: eventKey,
+        body: [
+          "## Symphony Completion Report",
+          "",
+          "Status: accepted by manual state-gate override",
+          `Run: ${context.runId}`,
+          ...formatFinalDispositionForComment(report.finalDisposition),
+        ].join("\n"),
       },
     },
   ];
@@ -749,6 +795,12 @@ export function planReviewBlockedWritebacks(
 
   const details = reviewVerdictDetailsFromInput(summary);
   const blockedState = config.reviewLoop.blockedStates[0] ?? null;
+  const provenance = details.blockerProvenance ?? null;
+  const recoveryKind = provenance?.recoveryKind ?? null;
+  const automaticBaseRefRepair = recoveryKind === "automatic_rebase";
+  const automaticBaseRefRecheck = recoveryKind === "automatic_recheck";
+  const automaticBaseRefRecovery =
+    automaticBaseRefRepair || automaticBaseRefRecheck;
   const eventKey = `${context.runId}:review-verdict-blocked`;
   return [
     {
@@ -761,11 +813,19 @@ export function planReviewBlockedWritebacks(
         body: [
           "## Symphony Review Verdict: Blocked",
           "",
-          "Status: review blocked, triage required",
-          "Symphony review could not complete because the reviewer identified a non-worker-owned blocker.",
-          blockedState === null
-            ? "Next state: unchanged; no blocked state is configured, so operator routing is required."
-            : `Next state: ${blockedState}; Symphony will transition the issue before triage or operator routing.`,
+          automaticBaseRefRecovery
+            ? "Status: review paused, automatic Symphony recovery pending"
+            : "Status: review blocked, triage required",
+          automaticBaseRefRepair
+            ? "Symphony's review-feedback base check identified repairable base-ref drift."
+            : automaticBaseRefRecheck
+              ? "Symphony's review-feedback base check encountered a transient verification failure."
+              : "Symphony review could not complete because the reviewer identified a non-worker-owned blocker.",
+          automaticBaseRefRecovery
+            ? "Linear state: unchanged in review while Symphony performs service-owned recovery."
+            : blockedState === null
+              ? "Next state: unchanged; no blocked state is configured, so operator routing is required."
+              : `Next state: ${blockedState}; Symphony will transition the issue before triage or operator routing.`,
           "",
           `Run: ${context.runId}`,
           `Reviewer: ${context.reviewer ?? "n/a"}`,
@@ -773,9 +833,14 @@ export function planReviewBlockedWritebacks(
           "Blocked findings:",
           ...listOrFallback(details.findings, "No blocker summary supplied."),
           ...formatReviewBlockedDetails(details),
+          ...formatBlockerProvenanceForComment(provenance),
           "",
           "Next action:",
-          "Symphony will run issue triage when enabled; otherwise inspect the reviewer blocker and choose the appropriate recovery path.",
+          automaticBaseRefRepair
+            ? "Symphony will run its service-owned base-ref repair using the linked observation; no human triage is required unless that repair fails."
+            : automaticBaseRefRecheck
+              ? "Symphony will re-run the provenance-bound base-ref check on the next polling tick; no human triage is required while the failure remains transient."
+              : "Symphony will run issue triage when enabled; otherwise inspect the reviewer blocker and choose the appropriate recovery path.",
         ].join("\n"),
       },
     },
@@ -870,6 +935,36 @@ export function planReviewAcceptedArtifactPassWritebacks(
   ];
 }
 
+export function planReviewVerdictDispositionOnlyWriteback(
+  context: ReviewVerdictWritebackContext,
+  config: ServiceConfig,
+  details: ReviewVerdictDispositionOnlyWritebackDetails,
+): NewWritebackOperation[] {
+  if (!config.writeback.enabled || details.finalDisposition === undefined) {
+    return [];
+  }
+  const eventKey = `${context.runId}:review-verdict-${details.verdict}:${safeKeySegment(details.idempotencyKey)}:disposition-only`;
+  return [
+    {
+      idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
+      kind: "comment",
+      issueId: context.issue.id,
+      runId: context.runId,
+      payload: {
+        dedupeKey: eventKey,
+        body: [
+          `## Symphony Review Verdict: ${reviewVerdictTitle(details.verdict)}`,
+          "",
+          "Status: accepted by manual state-gate override",
+          `Run: ${context.runId}`,
+          `Reviewer: ${context.reviewer ?? "n/a"}`,
+          ...formatFinalDispositionForComment(details.finalDisposition),
+        ].join("\n"),
+      },
+    },
+  ];
+}
+
 export function planBlockedEscalationWritebacks(
   context: BlockedEscalationWritebackContext,
   config: ServiceConfig,
@@ -919,6 +1014,10 @@ export function planBlockedEscalationWritebacks(
           "",
           "Required human action:",
           requiredAction,
+          ...formatBlockerProvenanceForComment(
+            context.blockerProvenance ?? null,
+          ),
+          ...formatFinalDispositionForComment(context.finalDisposition),
           "",
           blockedState === null
             ? "No blocked state is configured, so Symphony left the issue state unchanged and automation should remain paused."
@@ -978,6 +1077,7 @@ export function planIssueTriageReportWritebacks(
           "",
           "Operator next-action matrix:",
           ...formatIssueTriageNextActionMatrix(context, config),
+          ...formatFinalDispositionForComment(context.report.finalDisposition),
         ].join("\n"),
       },
     },
@@ -1113,6 +1213,7 @@ export function planIssuePostMortemReportWritebacks(
           "",
           "Process lessons:",
           ...formatListOrNone(context.report.processLessons),
+          ...formatFinalDispositionForComment(context.report.finalDisposition),
         ].join("\n"),
       },
     },
@@ -1422,6 +1523,7 @@ export function planMergeConflictResolvedWritebacks(
           "",
           "Required action:",
           "Symphony finalized the prepared conflict repair. The implementation worker must revalidate the repaired changes and submit a fresh completion report before review and merge can continue.",
+          ...formatFinalDispositionForComment(context.report.finalDisposition),
         ].join("\n"),
       },
     },
@@ -1438,6 +1540,49 @@ export function planMergeConflictResolvedWritebacks(
         ]),
         toState: config.writeback.dispatchState,
         reason: "Symphony conflict repair resolved; worker reverification required",
+      },
+    },
+  ];
+}
+
+export function planMergeConflictStillConflictedWritebacks(
+  context: MergeConflictStillConflictedWritebackContext,
+  config: ServiceConfig,
+): NewWritebackOperation[] {
+  if (!config.writeback.enabled) return [];
+  const currentHeadSha = context.report.newHeadSha ?? context.report.pullRequest.headSha ?? "unknown";
+  const eventKey = `merge-conflict-still-conflicted:${safeKeySegment(context.report.idempotencyKey)}:${safeKeySegment(currentHeadSha)}`;
+  return [
+    {
+      idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
+      kind: "comment",
+      issueId: context.issue.id,
+      runId: context.report.runId,
+      payload: {
+        dedupeKey: eventKey,
+        body: [
+          "## Symphony Conflict Repair Attempt",
+          "",
+          "Status: conflicts remain after this repair attempt",
+          "The report was accepted and the issue remains in conflict-repair routing for another bounded attempt.",
+          "",
+          `Run: ${context.report.runId}`,
+          `Pull request: ${formatPullRequest(context.report.pullRequest)}`,
+          `Base branch: ${context.report.baseBranch ?? "n/a"}`,
+          `Base head SHA: ${context.report.baseHeadSha ?? "n/a"}`,
+          `Previous conflicted head SHA: ${context.report.previousHeadSha ?? "n/a"}`,
+          `Current head SHA: ${currentHeadSha}`,
+          "",
+          "Validation evidence:",
+          ...listOrFallback(context.report.validationEvidence, "No validation evidence supplied."),
+          "",
+          "Changed files:",
+          ...listOrFallback(context.report.changedFiles, "No changed files supplied."),
+          "",
+          "Risks / follow-ups:",
+          ...listOrFallback(context.report.risks, "No known risks or follow-ups."),
+          ...formatFinalDispositionForComment(context.report.finalDisposition),
+        ].join("\n"),
       },
     },
   ];
@@ -1558,6 +1703,7 @@ function formatCompletionReportForComment(report: string | CompletionReportWrite
   if (report === null) return [];
 
   return [
+    ...formatFinalDispositionForComment(report.finalDisposition),
     "",
     "Completion report:",
     `Report: ${report.reportId}`,
@@ -1692,6 +1838,7 @@ function formatDiscoveryFindingsForComment(findings: ReviewDiscoveryFindingRecor
 
 function formatReviewVerdictDetails(details: ReviewVerdictWritebackDetails): string[] {
   return [
+    ...formatFinalDispositionForComment(details.finalDisposition),
     "",
     "Gate findings:",
     ...formatGateFindingsForComment(reviewGateFindingsForDetails(details)),
@@ -1714,6 +1861,7 @@ function formatReviewVerdictDetails(details: ReviewVerdictWritebackDetails): str
 
 function formatReviewBlockedDetails(details: ReviewVerdictWritebackDetails): string[] {
   return [
+    ...formatFinalDispositionForComment(details.finalDisposition),
     "",
     "Discovery findings (not worker-gating):",
     ...formatDiscoveryFindingsForComment(details.discoveryFindings ?? []),
@@ -1728,6 +1876,46 @@ function formatReviewBlockedDetails(details: ReviewVerdictWritebackDetails): str
     "Review evidence:",
     ...listOrFallback(details.evidence, "No review evidence supplied."),
     ...(details.idempotencyKey === "n/a" ? [] : ["", `Idempotency key: ${details.idempotencyKey}`]),
+  ];
+}
+
+function formatFinalDispositionForComment(disposition: string | null | undefined): string[] {
+  if (disposition === null || disposition === undefined || disposition.length === 0) return [];
+  return ["", "Agent final disposition:", disposition];
+}
+
+function reviewVerdictTitle(verdict: "pass" | "fail" | "blocked"): string {
+  return verdict === "pass" ? "Pass" : verdict === "fail" ? "Fail" : "Blocked";
+}
+
+function formatBlockerProvenanceForComment(
+  provenance: IssueBlockerProvenanceRecord | null,
+): string[] {
+  if (provenance === null) return [];
+  return [
+    "",
+    "Symphony blocker provenance:",
+    `- Record: ${provenance.id}`,
+    `- Code: ${provenance.code}`,
+    `- Recovery: ${provenance.recoveryKind}`,
+    `- Source: ${provenance.sourceKind}`,
+    `- Initial classification: ${provenance.initialClassification}`,
+    `- Initial observation fingerprint: ${provenance.initialObservationFingerprint}`,
+    `- Current classification: ${provenance.classification}`,
+    `- Current observation fingerprint: ${provenance.sourceObservationFingerprint}`,
+    `- Operation: ${provenance.operation}`,
+    `- Run: ${provenance.runId}`,
+    `- Review verdict: ${provenance.reviewVerdictId ?? "pending"}`,
+    `- Pull request: ${provenance.pullRequestNumber === null ? "n/a" : `#${provenance.pullRequestNumber}`}`,
+    `- Pull request head SHA: ${provenance.pullRequestHeadSha ?? "n/a"}`,
+    `- Base ref: ${provenance.baseRef ?? "n/a"}`,
+    `- Live base head SHA: ${provenance.liveBaseHeadSha ?? "n/a"}`,
+    `- Worktree head SHA: ${provenance.worktreeHeadSha ?? "n/a"}`,
+    `- Initial live base head SHA: ${provenance.initialLiveBaseHeadSha ?? "n/a"}`,
+    `- Initial worktree head SHA: ${provenance.initialWorktreeHeadSha ?? "n/a"}`,
+    `- Observation attempt: ${provenance.observationAttempt ?? 1}`,
+    `- First observed at: ${provenance.createdAt}`,
+    `- Last observed at: ${provenance.lastObservedAt ?? provenance.createdAt}`,
   ];
 }
 
@@ -1830,7 +2018,6 @@ function formatMergeGateMergeability(mergeability: IssueMergeGateMergeabilitySta
     ...(mergeability.observedBaseHeadSha !== null && mergeability.observedBaseHeadSha !== mergeability.baseHeadSha
       ? [`- Observed PR base head SHA: ${mergeability.observedBaseHeadSha}`]
       : []),
-    `- Checked at: ${mergeability.checkedAt}`,
   ];
 }
 

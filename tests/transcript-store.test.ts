@@ -43,6 +43,118 @@ describe("FileRunTranscriptStore", () => {
     await rm(root, { recursive: true, force: true });
   });
 
+  it("persists and replays the complete redacted terminal response without excerpting", async () => {
+    const store = new FileRunTranscriptStore(root);
+    const finalResponseText = `Complete disposition\n\n${"review evidence ".repeat(900)}`;
+    await startBasicRun(store, "run-final-response");
+    await store.appendEvent({
+      runId: "run-final-response",
+      at: "2026-01-01T00:00:01.000Z",
+      source: "harness",
+      eventType: "completed",
+      message: "Complete disposition review evidence ...[truncated]",
+      payload: {
+        kind: "terminal",
+        status: "succeeded",
+        finalResponseText,
+        redacted: true,
+      },
+    });
+
+    await expect(store.getRun("run-final-response")).resolves.toMatchObject({
+      status: "succeeded",
+      finalResponse: {
+        text: finalResponseText,
+        capturedAt: "2026-01-01T00:00:01.000Z",
+        redacted: true,
+      },
+    });
+    expect((await store.getRun("run-final-response"))?.finalResponse?.text.length).toBeGreaterThan(10_000);
+
+    const reloaded = new FileRunTranscriptStore(root);
+    await expect(reloaded.rebuildRunFromTranscript("run-final-response")).resolves.toMatchObject({
+      finalResponse: { text: finalResponseText },
+    });
+  });
+
+  it("does not promote a synthetic no-response completion message to finalResponse", async () => {
+    const store = new FileRunTranscriptStore(root);
+    await startBasicRun(store, "run-without-final-response");
+    await store.appendEvent({
+      runId: "run-without-final-response",
+      at: "2026-01-01T00:00:01.000Z",
+      source: "harness",
+      eventType: "completed",
+      message: "Run completed",
+      payload: { kind: "terminal", status: "succeeded" },
+    });
+
+    const persisted = await store.getRun("run-without-final-response");
+    expect(persisted?.status).toBe("succeeded");
+    expect(persisted?.finalResponse ?? null).toBeNull();
+
+    const rebuilt = await store.rebuildRunFromTranscript("run-without-final-response");
+    expect(rebuilt?.status).toBe("succeeded");
+    expect(rebuilt?.finalResponse ?? null).toBeNull();
+  });
+
+  it("does not promote a legacy truncated completed-row preview to finalResponse", async () => {
+    const store = new FileRunTranscriptStore(root);
+    await startBasicRun(store, "run-legacy-completed-preview");
+    await store.appendEvent({
+      runId: "run-legacy-completed-preview",
+      at: "2026-01-01T00:00:01.000Z",
+      source: "harness",
+      eventType: "completed",
+      message: "Legacy assistant response excerpt ...[truncated]",
+      payload: {
+        kind: "terminal",
+        status: "succeeded",
+        textPreview: "Legacy assistant response excerpt ...[truncated]",
+        truncated: true,
+      },
+    });
+
+    expect((await store.getRun("run-legacy-completed-preview"))?.finalResponse ?? null).toBeNull();
+    expect((await store.rebuildRunFromTranscript("run-legacy-completed-preview"))?.finalResponse ?? null).toBeNull();
+  });
+
+  it("captures a run_succeeded response after an accepted planning handoff terminalizes the run", async () => {
+    const store = new FileRunTranscriptStore(root);
+    const finalResponseText = `Accepted plan disposition\n\n${"complete proposal evidence ".repeat(600)}`;
+    await startBasicRun(store, "run-accepted-plan-response", { runPhase: "issue_breakdown" });
+    await store.appendEvent({
+      runId: "run-accepted-plan-response",
+      at: "2026-01-01T00:00:01.000Z",
+      source: "orchestrator",
+      eventType: "handoff_terminal",
+      payload: { status: "succeeded" },
+    });
+    await store.appendEvent({
+      runId: "run-accepted-plan-response",
+      at: "2026-01-01T00:00:02.000Z",
+      source: "harness",
+      eventType: "run_succeeded",
+      message: finalResponseText,
+      payload: { finalResponseText, redacted: true },
+    });
+
+    await expect(store.getRun("run-accepted-plan-response")).resolves.toMatchObject({
+      status: "succeeded",
+      error: null,
+      finalResponse: {
+        text: finalResponseText,
+        capturedAt: "2026-01-01T00:00:02.000Z",
+        redacted: true,
+      },
+    });
+    await expect(store.rebuildRunFromTranscript("run-accepted-plan-response")).resolves.toMatchObject({
+      status: "succeeded",
+      error: null,
+      finalResponse: { text: finalResponseText },
+    });
+  });
+
   it("persists runs and paginates transcript events across store instances", async () => {
     const store = new FileRunTranscriptStore(root);
     await store.startRun({

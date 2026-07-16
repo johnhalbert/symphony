@@ -151,6 +151,8 @@ function lifecycleEvidencePayload(
     mergeConflict: lifecycle.mergeConflict ?? null,
     reviewFeedback: lifecycle.reviewFeedback,
     baseRefObservation: lifecycle.baseRefObservation,
+    blockerProvenances: lifecycle.blockerProvenances ?? [],
+    activeBlockerProvenanceId: lifecycle.activeBlockerProvenanceId ?? null,
     preservedWorktreeStashes: lifecycle.preservedWorktreeStashes ?? [],
     summaryPointers: lifecycle.summaryPointers,
     ...(audit === undefined ? {} : { audit }),

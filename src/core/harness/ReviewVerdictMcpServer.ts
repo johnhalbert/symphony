@@ -70,6 +70,7 @@ export async function submitReviewVerdictFromMcp(input: unknown, options: {
       replayed: result.replayed,
       verdictId: result.verdict.id,
       verdict: result.verdict.verdict,
+      finalDisposition: result.verdict.finalDisposition,
       writebackOperationKeys: result.writebackOperations.map((operation) => operation.idempotencyKey),
       handoffStatus: result.handoffStatus,
     };
@@ -107,12 +108,27 @@ async function readReviewVerdictContext(filePath: string): Promise<ReviewVerdict
   return parsed;
 }
 
-function reviewVerdictInputSchema(): Record<string, unknown> {
+export function reviewVerdictInputSchema(): Record<string, unknown> {
   return {
     type: "object",
     additionalProperties: false,
-    required: ["verdict", "acceptanceResults", "findings", "gateFindings", "discoveryFindings", "evidence", "idempotencyKey"],
+    required: [
+      "finalDisposition",
+      "verdict",
+      "acceptanceResults",
+      "findings",
+      "gateFindings",
+      "discoveryFindings",
+      "evidence",
+      "idempotencyKey",
+    ],
     properties: {
+      finalDisposition: {
+        type: "string",
+        minLength: 1,
+        description:
+          "Complete standalone final response for this review run. Symphony stores this text untruncated and writes it verbatim to Linear; return the same text as the terminal assistant response after the handoff is accepted.",
+      },
       verdict: {
         enum: ["pass", "fail", "blocked"],
         description:
@@ -234,4 +250,3 @@ function reviewVerdictInputFromMcp(input: unknown, context: ReviewVerdictActiveC
     issueId: context.issue.id,
   };
 }
-

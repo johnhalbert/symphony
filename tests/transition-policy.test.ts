@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { createReviewFeedbackBaseRefProvenance } from "../src/core/BlockerProvenance.js";
 import type { ServiceConfig } from "../src/core/config/Config.js";
 import type {
   IssuePostMortemReportRecord,
@@ -18,6 +19,7 @@ import {
   planMergeGateRepairWritebacks,
   planPullRequestHandoffWritebacks,
   planReviewFailWritebacks,
+  planReviewBlockedWritebacks,
   planReviewPassWritebacks,
 } from "../src/core/writeback/TransitionPolicy.js";
 import { issue, testConfig } from "./helpers.js";
@@ -376,6 +378,95 @@ describe("TransitionPolicy review-loop planners", () => {
     });
   });
 
+  it("describes provenance-owned rebase and transient recheck recovery without a Blocked transition", () => {
+    const config = reviewLoopConfig();
+    const reviewIssue = issue({ state: "In Review" });
+    const baseObservation = {
+      version: 1 as const,
+      inputFingerprint: "base-ref-observation-1",
+      operation: "review_feedback",
+      checkedAt: "2026-01-01T00:00:00.000Z",
+      workspacePath: "/tmp/workspace",
+      branchName: "symphony/TEST-1",
+      baseRef: "origin/main",
+      normalizedBaseBranch: "main",
+      localBaseRef: "refs/remotes/origin/main",
+      githubBaseHeadSha: "base-head-2",
+      localBaseHeadShaBeforeFetch: "base-head-1",
+      localBaseHeadShaAfterFetch: "base-head-2",
+      worktreeHeadSha: "review-head-1",
+      localBaseIsAncestorOfHead: false,
+      reason: "Worktree HEAD is not based on the live origin base",
+      error: null,
+    };
+    const details = (blockerProvenance: ReturnType<typeof createReviewFeedbackBaseRefProvenance>) => ({
+      idempotencyKey: "review-blocked-1",
+      finalDisposition: "Complete reviewer disposition.",
+      acceptanceResults: [],
+      findings: ["Review feedback could not be published."],
+      evidence: ["Structured base-ref observation."],
+      blockerProvenance,
+    });
+
+    const rebaseOperations = planReviewBlockedWritebacks(
+      { issue: reviewIssue, runId: "review-run-1", reviewer: "reviewer" },
+      config,
+      details(
+        createReviewFeedbackBaseRefProvenance({
+          issue: reviewIssue,
+          runId: "review-run-1",
+          pullRequestNumber: 42,
+          pullRequestHeadSha: "review-head-1",
+          observation: {
+            ...baseObservation,
+            classification: "branch_not_based_on_live_base" as const,
+          },
+        }),
+      ),
+    );
+    expect(rebaseOperations).toHaveLength(1);
+    expect(commentBody(rebaseOperations, 0)).toContain(
+      "Status: review paused, automatic Symphony recovery pending",
+    );
+    expect(commentBody(rebaseOperations, 0)).toContain(
+      "Linear state: unchanged in review while Symphony performs service-owned recovery.",
+    );
+    expect(commentBody(rebaseOperations, 0)).toContain(
+      "- Recovery: automatic_rebase",
+    );
+
+    const recheckOperations = planReviewBlockedWritebacks(
+      { issue: reviewIssue, runId: "review-run-1", reviewer: "reviewer" },
+      config,
+      details(
+        createReviewFeedbackBaseRefProvenance({
+          issue: reviewIssue,
+          runId: "review-run-1",
+          pullRequestNumber: 42,
+          pullRequestHeadSha: "review-head-1",
+          observation: {
+            ...baseObservation,
+            classification: "base_ref_fetch_failed" as const,
+            localBaseHeadShaAfterFetch: null,
+            localBaseIsAncestorOfHead: null,
+            reason: "Unable to fetch the live base ref from origin",
+            error: "temporary network failure",
+          },
+        }),
+      ),
+    );
+    expect(recheckOperations).toHaveLength(1);
+    expect(commentBody(recheckOperations, 0)).toContain(
+      "transient verification failure",
+    );
+    expect(commentBody(recheckOperations, 0)).toContain(
+      "- Recovery: automatic_recheck",
+    );
+    expect(commentBody(recheckOperations, 0)).toContain(
+      "no human triage is required while the failure remains transient",
+    );
+  });
+
   it("does not plan review fail writebacks outside review states", () => {
     const config = reviewLoopConfig();
 
@@ -446,11 +537,21 @@ describe("TransitionPolicy review-loop planners", () => {
 
   it("plans blocked escalation comment and transition from active or review states", () => {
     const config = reviewLoopConfig();
+    const blockedIssue = issue({ state: "In Review" });
+    const observation = blockerObservationForWriteback();
+    const provenance = createReviewFeedbackBaseRefProvenance({
+      issue: blockedIssue,
+      runId: "run-blocked-1",
+      pullRequestNumber: 42,
+      pullRequestHeadSha: "head-sha-1",
+      observation,
+    });
     const operations = planBlockedEscalationWritebacks(
       {
-        issue: issue({ state: "In Review" }),
+        issue: blockedIssue,
         runId: "run-blocked-1",
         reason: "review loop ceiling reached",
+        blockerProvenance: provenance,
       },
       config,
     );
@@ -465,6 +566,11 @@ describe("TransitionPolicy review-loop planners", () => {
     });
     expect(commentBody(operations, 0)).toContain("## Symphony Blocked Escalation");
     expect(commentBody(operations, 0)).toContain("Ceiling reason: review loop ceiling reached");
+    expect(commentBody(operations, 0)).toContain(`- Record: ${provenance.id}`);
+    expect(commentBody(operations, 0)).toContain("- Recovery: operator_triage");
+    expect(commentBody(operations, 0)).toContain(
+      `- Current observation fingerprint: ${observation.inputFingerprint}`,
+    );
     expect(operations[1]).toMatchObject({
       idempotencyKey: "transition:issue-1:run-blocked-1:blocked-escalation:Blocked",
       kind: "transition",
@@ -953,5 +1059,27 @@ function reviewEvidence(): PullRequestReviewEvidenceItem {
     updatedAt: "2026-01-01T00:00:02Z",
     submittedAt: null,
     cursor: "2026-01-01T00:00:02Z",
+  };
+}
+
+function blockerObservationForWriteback() {
+  return {
+    version: 1 as const,
+    inputFingerprint: "base-ref-block-observation-1",
+    classification: "base_ref_unavailable" as const,
+    operation: "review_feedback",
+    checkedAt: "2026-01-01T00:00:00.000Z",
+    workspacePath: "/tmp/workspace",
+    branchName: "symphony/TEST-1",
+    baseRef: "origin/main",
+    normalizedBaseBranch: "main",
+    localBaseRef: "refs/remotes/origin/main",
+    githubBaseHeadSha: null,
+    localBaseHeadShaBeforeFetch: null,
+    localBaseHeadShaAfterFetch: null,
+    worktreeHeadSha: "head-sha-1",
+    localBaseIsAncestorOfHead: null,
+    reason: "Base ref verification is unavailable",
+    error: "missing base ref",
   };
 }

@@ -2,12 +2,23 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { createReviewFeedbackBaseRefProvenance } from "../src/core/BlockerProvenance.js";
 import { MergeConflictResolutionService } from "../src/core/MergeConflictResolutionService.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileWritebackOutboxStore } from "../src/core/writeback/WritebackOutbox.js";
 import { issue, testConfig } from "./helpers.js";
 
 const CONFLICT_STATE = "Conflict Repair";
+const FINAL_DISPOSITION =
+  "Resolved the prepared merge conflicts and reran the required validation.\n\nThe repaired head is ready for worker reverification; no conflict finding or residual risk was omitted.";
+const FULL_STILL_CONFLICTED_DISPOSITION = [
+  "The bounded repair attempt completed, but conflicts remain for a subsequent worker pass.",
+  "",
+  ...Array.from(
+    { length: 300 },
+    (_, index) => `Conflict observation ${index + 1}: the complete unresolved evidence remains available without truncation.`,
+  ),
+].join("\n");
 
 describe("MergeConflictResolutionService", () => {
   let root: string;
@@ -31,6 +42,7 @@ describe("MergeConflictResolutionService", () => {
     expect(result.replayed).toBe(false);
     expect(result.report.resolutionStatus).toBe("resolved");
     expect(result.report).toMatchObject({
+      finalDisposition: FINAL_DISPOSITION,
       previousHeadSha: "head-sha-1",
       newHeadSha: "head-sha-2",
       baseBranch: "main",
@@ -56,7 +68,11 @@ describe("MergeConflictResolutionService", () => {
       mergeConflictResolutionReports: [
         {
           id: "merge-conflict-resolution:issue-1:resolve-1",
+          finalDisposition: FINAL_DISPOSITION,
           resolutionStatus: "resolved",
+          writebackOperationKeys: result.writebackOperations.map(
+            (operation) => operation.idempotencyKey,
+          ),
         },
       ],
     });
@@ -68,29 +84,155 @@ describe("MergeConflictResolutionService", () => {
     expect(operations).toMatchObject([
       {
         kind: "comment",
+        lifecycleBinding: {
+          kind: "merge_conflict_resolution_report",
+          recordId: "merge-conflict-resolution:issue-1:resolve-1",
+        },
         payload: expect.objectContaining({
           body: expect.stringContaining("worker reverification required"),
         }),
       },
       {
         kind: "transition",
+        lifecycleBinding: {
+          kind: "merge_conflict_resolution_report",
+          recordId: "merge-conflict-resolution:issue-1:resolve-1",
+        },
         payload: expect.objectContaining({
           fromStates: [CONFLICT_STATE, "In Progress"],
           toState: "In Progress",
         }),
       },
     ]);
+    expect(operations[0]?.kind === "comment" ? operations[0].payload.body : "").toContain(FINAL_DISPOSITION);
+  });
+
+  it("writes the full disposition for an accepted still-conflicted attempt without transitioning", async () => {
+    const { service, lifecycleStore, outbox } = await fixture();
+
+    const result = await service.submit_merge_conflict_resolution(
+      resolutionReport({
+        idempotencyKey: "still-audit-1",
+        resolutionStatus: "still_conflicted",
+        finalDisposition: FULL_STILL_CONFLICTED_DISPOSITION,
+      }),
+      context(),
+    );
+
+    expect(FULL_STILL_CONFLICTED_DISPOSITION.length).toBeGreaterThan(10_000);
+    expect(result.replayed).toBe(false);
+    expect(result.writebackOperations.map((operation) => operation.kind)).toEqual(["comment"]);
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      phase: "merge_conflict_resolution",
+      blockedReason: null,
+      mergeConflict: {
+        status: "open",
+        resolutionStatus: "still_conflicted",
+        fixTurnCount: 1,
+      },
+      mergeConflictResolutionReports: [
+        expect.objectContaining({
+          idempotencyKey: "still-audit-1",
+          finalDisposition: FULL_STILL_CONFLICTED_DISPOSITION,
+          resolutionStatus: "still_conflicted",
+        }),
+      ],
+    });
+    const operations = await outbox.list();
+    expect(operations).toHaveLength(1);
+    expect(operations[0]?.kind).toBe("comment");
+    expectExactDisposition(
+      operations[0]?.kind === "comment" ? operations[0].payload.body : "",
+      FULL_STILL_CONFLICTED_DISPOSITION,
+    );
+  });
+
+  it("resolves the provenance carried by a successfully finalized base-ref conflict", async () => {
+    const finalizerCalls: unknown[] = [];
+    const { service, lifecycleStore } = await fixture({
+      blockerProvenance: true,
+      servicePreparation: servicePreparationRecord(),
+      finalizer: {
+        async finalize(input) {
+          finalizerCalls.push(input);
+          return { newHeadSha: "service-finalized-head-sha" };
+        },
+      },
+    });
+
+    const result = await service.submit_merge_conflict_resolution(
+      resolutionReport({
+        idempotencyKey: "resolve-provenance-1",
+        resolutionStatus: "resolved",
+        headSha: "worker-supplied-head-sha",
+      }),
+      context({ workspacePath: "/tmp/service-prepared-workspace" }),
+    );
+
+    expect(finalizerCalls).toHaveLength(1);
+    expect(result.report.newHeadSha).toBe("service-finalized-head-sha");
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      activeBlockerProvenanceId: null,
+      blockerProvenances: [
+        expect.objectContaining({
+          id: "blocker-provenance:base-ref-repair",
+          resolution: "base_ref_repair",
+          resolvedAt: expect.any(String),
+        }),
+      ],
+      mergeConflict: {
+        blockerProvenanceId: "blocker-provenance:base-ref-repair",
+        status: "resolved",
+        currentHeadSha: "service-finalized-head-sha",
+        resolvedHeadSha: "service-finalized-head-sha",
+        servicePreparation: {
+          status: "finalized",
+          finalizedHeadSha: "service-finalized-head-sha",
+        },
+      },
+    });
+  });
+
+  it("refuses to persist a carried blocker that is no longer the active unresolved provenance", async () => {
+    const { lifecycleStore } = await fixture({
+      blockerProvenance: true,
+      servicePreparation: servicePreparationRecord(),
+    });
+
+    await expect(
+      lifecycleStore.updateIssue(issue({ state: CONFLICT_STATE }), {
+        activeBlockerProvenanceId: null,
+      }),
+    ).rejects.toMatchObject({
+      code: "lifecycle_store_corrupt",
+      message: expect.stringContaining("unfinished merge conflict has inconsistent blocker provenance"),
+    });
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      activeBlockerProvenanceId: "blocker-provenance:base-ref-repair",
+    });
   });
 
   it("counts still-conflicted reports once and blocks at the configured conflict-fix limit", async () => {
-    const { service, lifecycleStore, outbox } = await fixture({ fixTurnCount: 2 });
+    const { service, lifecycleStore, outbox } = await fixture({
+      fixTurnCount: 2,
+      blockerProvenance: true,
+      servicePreparation: servicePreparationRecord(),
+    });
 
     const first = await service.submit_merge_conflict_resolution(
-      resolutionReport({ idempotencyKey: "still-1", resolutionStatus: "still_conflicted" }),
+      resolutionReport({
+        idempotencyKey: "still-1",
+        resolutionStatus: "still_conflicted",
+        finalDisposition: FULL_STILL_CONFLICTED_DISPOSITION,
+      }),
       context(),
     );
     const replay = await service.submit_merge_conflict_resolution(
-      resolutionReport({ idempotencyKey: "still-1", resolutionStatus: "still_conflicted" }),
+      resolutionReport({
+        idempotencyKey: "still-1",
+        resolutionStatus: "still_conflicted",
+        finalDisposition: FULL_STILL_CONFLICTED_DISPOSITION,
+      }),
       context(),
     );
 
@@ -109,6 +251,72 @@ describe("MergeConflictResolutionService", () => {
     const operations = await outbox.list();
     expect(operations.some((operation) => operation.kind === "comment")).toBe(true);
     expect(operations.some((operation) => operation.kind === "transition")).toBe(true);
+    const comment = operations.find((operation) => operation.kind === "comment");
+    const body = comment?.kind === "comment" ? comment.payload.body : "";
+    expect(body).toContain(
+      [
+        "Symphony blocker provenance:",
+        "- Record: blocker-provenance:base-ref-repair",
+        "- Code: base_ref_drift",
+        "- Recovery: automatic_rebase",
+        "- Source: base_ref_observation",
+        "- Initial classification: branch_not_based_on_live_base",
+        "- Initial observation fingerprint: base-ref-drift-observation",
+        "- Current classification: branch_not_based_on_live_base",
+        "- Current observation fingerprint: base-ref-drift-observation",
+        "- Operation: review_feedback",
+        "- Run: review-run-1",
+        "- Review verdict: pending",
+        "- Pull request: #42",
+        "- Pull request head SHA: head-sha-1",
+        "- Base ref: main",
+        "- Live base head SHA: base-sha-1",
+        "- Worktree head SHA: head-sha-1",
+        "- Initial live base head SHA: base-sha-1",
+        "- Initial worktree head SHA: head-sha-1",
+        "- Observation attempt: 1",
+        "- First observed at: 2026-01-01T00:00:00.000Z",
+        "- Last observed at: 2026-01-01T00:00:00.000Z",
+      ].join("\n"),
+    );
+    const dispositionMarker = "Agent final disposition:\n";
+    const dispositionStart = body.indexOf(dispositionMarker);
+    const dispositionEnd = body.indexOf(
+      "\n\nTransitioning to blocked state: Blocked",
+      dispositionStart,
+    );
+    expect(dispositionStart).toBeGreaterThanOrEqual(0);
+    expect(dispositionEnd).toBeGreaterThan(dispositionStart);
+    expect(
+      body.slice(dispositionStart + dispositionMarker.length, dispositionEnd),
+    ).toBe(FULL_STILL_CONFLICTED_DISPOSITION);
+  });
+
+  it("rejects a head advance from a still-conflicted service-prepared report", async () => {
+    const { service, lifecycleStore } = await fixture({
+      servicePreparation: servicePreparationRecord(),
+    });
+
+    await expect(
+      service.submit_merge_conflict_resolution(
+        resolutionReport({
+          idempotencyKey: "still-conflicted-head-change",
+          resolutionStatus: "still_conflicted",
+          headSha: "worker-supplied-head-sha",
+        }),
+        context(),
+      ),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      message: "Service-prepared non-resolved reports cannot advance the conflict head",
+    });
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      mergeConflict: {
+        currentHeadSha: "head-sha-1",
+        servicePreparation: { status: "conflicted" },
+      },
+      mergeConflictResolutionReports: [],
+    });
   });
 
   it("records explicit blocked reports with durable head and base metadata", async () => {
@@ -415,6 +623,7 @@ describe("MergeConflictResolutionService", () => {
       preparedBaseHeadSha: "base-sha-2",
       previousRepairHeadSha: "head-sha-2",
     });
+    expect(result.writebackOperations.map((operation) => operation.kind)).toEqual(["comment"]);
     expect(finalizerCalls).toHaveLength(1);
     expect(reprepareCalls).toEqual([
       expect.objectContaining({
@@ -454,7 +663,13 @@ describe("MergeConflictResolutionService", () => {
         }),
       ],
     });
-    await expect(outbox.list()).resolves.toEqual([]);
+    const operations = await outbox.list();
+    expect(operations).toHaveLength(1);
+    expect(operations[0]?.kind).toBe("comment");
+    expectExactDisposition(
+      operations[0]?.kind === "comment" ? operations[0].payload.body : "",
+      FINAL_DISPOSITION,
+    );
   });
 
   it("publishes a clean prepared-base drift reprepare and routes back to implementation", async () => {
@@ -581,6 +796,7 @@ describe("MergeConflictResolutionService", () => {
       | ReturnType<typeof stashApplyServicePreparationRecord>
       | null;
     finalizer?: ConstructorParameters<typeof MergeConflictResolutionService>[0]["finalizer"];
+    blockerProvenance?: boolean;
   } = {}) {
     const config = testConfig(root);
     config.writeback.enabled = true;
@@ -592,12 +808,32 @@ describe("MergeConflictResolutionService", () => {
     config.tracker.activeStates = ["Todo", "In Progress"];
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
     const conflictIssue = issue({ state: CONFLICT_STATE });
+    const provenance = createReviewFeedbackBaseRefProvenance({
+      issue: conflictIssue,
+      runId: "review-run-1",
+      pullRequestNumber: 42,
+      pullRequestHeadSha: "head-sha-1",
+      observation: baseRefDriftObservation(),
+    });
+    const boundProvenance = {
+      ...provenance,
+      id: "blocker-provenance:base-ref-repair",
+    };
     await lifecycleStore.ensureIssue(conflictIssue, {
       phase: "merge_conflict_resolution",
       mergeConflict: mergeConflictRecord({
         fixTurnCount: input.fixTurnCount ?? 0,
         servicePreparation: input.servicePreparation ?? null,
+        blockerProvenanceId:
+          input.blockerProvenance === true ? boundProvenance.id : null,
       }),
+      ...(input.blockerProvenance === true
+        ? {
+            baseRefObservation: baseRefDriftObservation(),
+            blockerProvenances: [boundProvenance],
+            activeBlockerProvenanceId: boundProvenance.id,
+          }
+        : {}),
     });
     const outbox = new FileWritebackOutboxStore(config.workspace.stateDir);
     return {
@@ -628,6 +864,7 @@ function context(overrides: Partial<Parameters<MergeConflictResolutionService["s
 function resolutionReport(input: {
   idempotencyKey?: string;
   resolutionStatus: "resolved" | "still_conflicted" | "blocked";
+  finalDisposition?: string;
   headSha?: string;
   previousHeadSha?: string;
   baseBranch?: string;
@@ -640,6 +877,7 @@ function resolutionReport(input: {
   return {
     runId: "conflict-run-1",
     issueId: "issue-1",
+    finalDisposition: input.finalDisposition ?? FINAL_DISPOSITION,
     resolutionStatus: input.resolutionStatus,
     summary: "Resolved merge conflicts.",
     validationEvidence: ["npm test"],
@@ -660,8 +898,16 @@ function resolutionReport(input: {
   };
 }
 
+function expectExactDisposition(body: string, expected: string): void {
+  const marker = "Agent final disposition:\n";
+  const markerIndex = body.indexOf(marker);
+  expect(markerIndex).toBeGreaterThanOrEqual(0);
+  expect(body.slice(markerIndex + marker.length)).toBe(expected);
+}
+
 function mergeConflictRecord(input: {
   fixTurnCount: number;
+  blockerProvenanceId?: string | null;
   servicePreparation?:
     | ReturnType<typeof servicePreparationRecord>
     | ReturnType<typeof stashApplyServicePreparationRecord>
@@ -686,6 +932,7 @@ function mergeConflictRecord(input: {
     conflictsState: CONFLICT_STATE,
     reason: "Pull request has merge conflicts with the base branch",
     mergeableState: "dirty",
+    blockerProvenanceId: input.blockerProvenanceId ?? null,
     servicePreparation: input.servicePreparation ?? null,
     detectedAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
@@ -697,6 +944,28 @@ function mergeConflictRecord(input: {
     writebackOperationKeys: [],
     blockedAt: null,
     blockedReason: null,
+  };
+}
+
+function baseRefDriftObservation() {
+  return {
+    version: 1 as const,
+    inputFingerprint: "base-ref-drift-observation",
+    classification: "branch_not_based_on_live_base" as const,
+    operation: "review_feedback",
+    checkedAt: "2026-01-01T00:00:00.000Z",
+    workspacePath: "/tmp/workspace",
+    branchName: "symphony/TEST-1",
+    baseRef: "main",
+    normalizedBaseBranch: "main",
+    localBaseRef: "refs/remotes/origin/main",
+    githubBaseHeadSha: "base-sha-1",
+    localBaseHeadShaBeforeFetch: "base-sha-0",
+    localBaseHeadShaAfterFetch: "base-sha-1",
+    worktreeHeadSha: "head-sha-1",
+    localBaseIsAncestorOfHead: false,
+    reason: "Worktree HEAD is not based on the live origin base",
+    error: null,
   };
 }
 

@@ -65,6 +65,7 @@ describe("CompletionReportService", () => {
           runId: "run-1",
           issueId: "issue-1",
           issueIdentifier: "TEST-1",
+          finalDisposition: report().finalDisposition,
           summary: "Implemented the service contract.",
           changedFiles: ["src/core/CompletionReportService.ts"],
           branchName: "symphony/TEST-1",
@@ -90,11 +91,16 @@ describe("CompletionReportService", () => {
     expect(commentOperation).toMatchObject({
       kind: "comment",
       idempotencyKey: "comment:issue-1:run-1:completion-report:idem-1",
+      lifecycleBinding: {
+        kind: "completion_report",
+        recordId: "completion-report:issue-1:run-1:idem-1",
+      },
       payload: {
         dedupeKey: "run-1:completion-report:idem-1",
       },
     });
     expect(commentOperation?.kind === "comment" ? commentOperation.payload.body : "").toContain("Completion report:");
+    expect(commentOperation?.kind === "comment" ? commentOperation.payload.body : "").toContain(report().finalDisposition);
     expect(transitionOperation).toMatchObject({
       kind: "transition",
       idempotencyKey: "transition:issue-1:run-1:completion-report:idem-1:In Review",
@@ -183,6 +189,41 @@ describe("CompletionReportService", () => {
       reasonCode: "unsatisfied_acceptance_checklist",
     });
     expect(buildWorkerHandoffPacket(lifecycle!).memo.entries.join("\n")).toContain("Latest completion report rejection");
+  });
+
+  it("rejects disposition drift when an idempotent rejected completion report is retried", async () => {
+    const { service, lifecycleStore, outbox } = fixture();
+    const acceptanceChecklist = [
+      {
+        text: "REQ-1 Required validation is complete.",
+        satisfied: false,
+        evidence: "Focused validation could not run.",
+      },
+    ];
+    const original = report({ acceptanceChecklist });
+    const changedDisposition = "A corrected but different full worker disposition.";
+
+    await expect(
+      service.submitCompletionReport(original, context()),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    await expect(
+      service.submitCompletionReport(
+        report({ acceptanceChecklist, finalDisposition: changedDisposition }),
+        context(),
+      ),
+    ).rejects.toMatchObject({
+      code: "conflict",
+      message: "Rejected completion report idempotency key was reused with a different final disposition",
+    });
+
+    const lifecycle = await lifecycleStore.get("issue-1");
+    expect(lifecycle?.completionReportRejections).toHaveLength(1);
+    expect(lifecycle?.completionReportRejections[0]?.finalDisposition).toBe(original.finalDisposition);
+    const operations = await outbox.list();
+    expect(operations).toHaveLength(1);
+    const body = operations[0]?.kind === "comment" ? operations[0].payload.body : "";
+    expect(body).toContain(original.finalDisposition);
+    expect(body).not.toContain(changedDisposition);
   });
 
   it("supersedes an old-head merge gate on new-head completion and scrubs stale repair state", async () => {
@@ -480,6 +521,66 @@ describe("CompletionReportService", () => {
     expect(second.replayed).toBe(true);
     expect(second.report.summary).toBe("Implemented the service contract.");
     expect((await lifecycleStore.get("issue-1"))?.completionReports).toHaveLength(1);
+    expect(await outbox.list()).toHaveLength(2);
+  });
+
+  it("rejects canonical final disposition drift without replacing lifecycle or Linear writebacks", async () => {
+    const workspacePath = await createGitWorkspace(root);
+    const { service, lifecycleStore, outbox } = fixture();
+    const replayContext = contextWithWorkspace({
+      workspacePath,
+      issue: issue({ state: "In Progress", branchName: "main" }),
+      workspace: workspaceForGitFixture(workspacePath),
+    });
+    const original = report({ branchName: "main" });
+    const changedDisposition = "A different canonical final disposition must not replace the accepted one.";
+
+    await service.submitCompletionReport(original, replayContext);
+
+    await expect(
+      service.submitCompletionReport(
+        report({ branchName: "main", finalDisposition: changedDisposition }),
+        replayContext,
+      ),
+    ).rejects.toMatchObject({
+      code: "conflict",
+      message: "Completion report idempotency key was reused with a different final disposition",
+    });
+
+    const lifecycle = await lifecycleStore.get("issue-1");
+    expect(lifecycle?.completionReports).toHaveLength(1);
+    expect(lifecycle?.completionReports[0]?.finalDisposition).toBe(original.finalDisposition);
+    const operations = await outbox.list();
+    expect(operations).toHaveLength(2);
+    const comment = operations.find((operation) => operation.kind === "comment");
+    expect(comment?.kind === "comment" ? comment.payload.body : "").toContain(original.finalDisposition);
+    expect(comment?.kind === "comment" ? comment.payload.body : "").not.toContain(changedDisposition);
+  });
+
+  it("replays a finalized legacy report without synthesizing its missing final disposition", async () => {
+    const workspacePath = await createGitWorkspace(root);
+    const { service, lifecycleStore, outbox } = fixture();
+    const replayContext = contextWithWorkspace({
+      workspacePath,
+      issue: issue({ state: "In Progress", branchName: "main" }),
+      workspace: workspaceForGitFixture(workspacePath),
+    });
+    const input = report({ branchName: "main" });
+    const accepted = await service.submitCompletionReport(input, replayContext);
+    const legacyReport = { ...accepted.report };
+    delete legacyReport.finalDisposition;
+    await lifecycleStore.updateIssue(replayContext.issue, {
+      completionReports: [legacyReport],
+      lastCompletionReportId: legacyReport.id,
+    });
+
+    const replayed = await service.submitCompletionReport(input, replayContext);
+
+    expect(replayed.replayed).toBe(true);
+    expect(replayed.report).not.toHaveProperty("finalDisposition");
+    const lifecycle = await lifecycleStore.get("issue-1");
+    expect(lifecycle?.completionReports).toHaveLength(1);
+    expect(lifecycle?.completionReports[0]).not.toHaveProperty("finalDisposition");
     expect(await outbox.list()).toHaveLength(2);
   });
 
@@ -1358,6 +1459,38 @@ describe("CompletionReportService", () => {
     expect((await lifecycleStore.get("issue-1"))?.completionReports).toHaveLength(1);
   });
 
+  it("fails closed when a pre-lifecycle retry finds different queued disposition intent", async () => {
+    const config = testConfig(root);
+    config.writeback.enabled = true;
+    config.writeback.dispatchState = "In Progress";
+    config.reviewLoop.reviewStates = ["In Review"];
+    const lifecycleStore = new FileIssueLifecycleStore(root);
+    const outbox = new FileWritebackOutboxStore(root);
+    await outbox.enqueueOnce({
+      idempotencyKey: "comment:issue-1:run-1:completion-report:idem-1",
+      kind: "comment",
+      issueId: "issue-1",
+      runId: "run-1",
+      payload: {
+        dedupeKey: "run-1:completion-report:idem-1",
+        body: "A different full final disposition was queued before the crash.",
+      },
+    });
+    const service = new CompletionReportService({
+      config,
+      lifecycleStore,
+      writebackOutbox: outbox,
+    });
+
+    await expect(
+      service.submitCompletionReport(report(), context()),
+    ).rejects.toThrow(/different intent/);
+
+    const lifecycle = await lifecycleStore.get("issue-1");
+    expect(lifecycle?.lastCompletionReportId).toBeNull();
+    expect(lifecycle?.completionReports).toEqual([]);
+  });
+
   it("scopes publication approval setup drains to the report writeback keys", async () => {
     const config = testConfig(root);
     config.writeback.enabled = true;
@@ -1480,9 +1613,11 @@ describe("CompletionReportService", () => {
 
   it("accepts a manual completion report with the issue state gate explicitly ignored", async () => {
     const { service, lifecycleStore, outbox } = fixture();
+    const finalDisposition =
+      "Manual completion accepted outside the normal state gate.\n\nThe complete worker response remains visible without truncation.";
 
     const result = await service.submitCompletionReport(
-      report(),
+      report({ finalDisposition }),
       context({
         issue: issue({ state: "In Review", branchName: "symphony/TEST-1" }),
         ignoreStateGate: true,
@@ -1490,12 +1625,29 @@ describe("CompletionReportService", () => {
     );
 
     expect(result.replayed).toBe(false);
-    expect(result.writebackOperations).toHaveLength(0);
+    expect(result.writebackOperations).toHaveLength(1);
+    expect(result.writebackOperations[0]).toMatchObject({
+      kind: "comment",
+      lifecycleBinding: {
+        kind: "completion_report",
+        recordId: "completion-report:issue-1:run-1:idem-1",
+      },
+    });
+    expect(
+      result.writebackOperations[0]?.kind === "comment"
+        ? result.writebackOperations[0].payload.body
+        : "",
+    ).toContain(finalDisposition);
+    expect(result.writebackOperations.some((operation) => operation.kind === "transition"))
+      .toBe(false);
     await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
       phase: "review",
       lastCompletionReportId: "completion-report:issue-1:run-1:idem-1",
+      completionReports: [
+        expect.objectContaining({ finalDisposition }),
+      ],
     });
-    expect(await outbox.list()).toHaveLength(0);
+    await expect(outbox.list()).resolves.toHaveLength(1);
   });
 
   it("rejects missing required report fields", async () => {
@@ -1562,6 +1714,8 @@ function report(overrides: Partial<CompletionReportInput> = {}): CompletionRepor
   return {
     runId: "run-1",
     issueId: "issue-1",
+    finalDisposition:
+      "Implemented the service contract and validated every acceptance criterion.\n\nValidation: typecheck and tests passed.\nRisks: reviewer handling remains explicitly out of scope.",
     summary: "Implemented the service contract.",
     validationEvidence: ["npm run typecheck", "npm test"],
     acceptanceChecklist: [

@@ -10,6 +10,11 @@ import type {
   ArtifactFileManifestEntry,
   WorkspaceSeedBinding,
 } from "../types.js";
+import {
+  inspectAcceptedArtifactManifestAtHead,
+  inspectAcceptedArtifactWorktreePath,
+  type AcceptedArtifactManifestVerificationFailure,
+} from "../AcceptedArtifactManifestVerification.js";
 
 export interface CreateWorktreeOptions {
   source: WorkspaceSourceConfig;
@@ -114,6 +119,10 @@ export async function verifyGitWorktreeSeedBinding(
       "Prepared accepted-artifact workspace is missing its prepared head",
     );
   }
+  assertFullGitObjectId(
+    binding.preparedHeadSha,
+    "Persisted accepted-artifact prepared head",
+  );
   if ((await activeRebaseState(workspacePath, timeoutMs)) !== null) {
     throw new SymphonyError(
       "workspace_error",
@@ -128,36 +137,67 @@ export async function verifyGitWorktreeSeedBinding(
       `Seeded workspace is on branch ${branch.stdout.trim() || "(detached)"}, expected ${binding.targetBranch}`,
     );
   }
-  const preparedHeadSha = await resolveExactCommit(
-    workspacePath,
-    binding.preparedHeadSha,
-    "persisted prepared workspace head",
-    timeoutMs,
-  );
-  const currentHead = (
-    await runGit(["rev-parse", "--verify", "HEAD^{commit}"], workspacePath, timeoutMs)
-  ).stdout.trim();
-  await assertCommitAncestor(
-    workspacePath,
-    preparedHeadSha,
-    currentHead,
-    "Existing workspace no longer descends from its persisted accepted-artifact prepared head",
-    timeoutMs,
-  );
-  await verifyPreparedArtifactFiles(
-    workspacePath,
-    preparedHeadSha,
-    binding.fileManifest,
-    timeoutMs,
-  );
-  await verifyPreparedArtifactDiff(
-    workspacePath,
-    binding.preparedBaseHeadSha,
-    preparedHeadSha,
-    binding.fileManifest,
-    timeoutMs,
-  );
+  const failure = await inspectAcceptedArtifactManifestAtHead({
+    manifest: binding.fileManifest,
+    runGit: async (args) => {
+      const result = await runGit(args, workspacePath, timeoutMs, {
+        allowFailure: true,
+      });
+      return result.code === 0 ? result.stdout : null;
+    },
+    inspectWorktreePath: (filePath) =>
+      inspectAcceptedArtifactWorktreePath(workspacePath, filePath),
+  });
+  if (failure !== null) throw seedManifestVerificationError(failure);
   return binding;
+}
+
+function seedManifestVerificationError(
+  failure: AcceptedArtifactManifestVerificationFailure,
+): SymphonyError {
+  if (failure.kind === "empty_manifest") {
+    return new SymphonyError(
+      "workspace_error",
+      "Prepared accepted-artifact workspace has an empty manifest",
+    );
+  }
+  if (failure.kind === "invalid_manifest") {
+    return new SymphonyError("workspace_error", failure.message);
+  }
+  if (failure.kind === "worktree_inspection_failed") {
+    return new SymphonyError(
+      "workspace_error",
+      "Unable to inspect accepted-artifact files in the prepared workspace",
+    );
+  }
+  if (failure.kind === "worktree_dirty") {
+    return new SymphonyError(
+      "workspace_error",
+      "Prepared accepted-artifact files have uncommitted changes",
+    );
+  }
+  if (failure.kind === "tree_inspection_failed") {
+    return new SymphonyError(
+      "workspace_error",
+      `Unable to inspect accepted-artifact file ${failure.path} at the current workspace head`,
+    );
+  }
+  if (failure.kind === "deleted_path_present") {
+    return new SymphonyError(
+      "workspace_error",
+      `Accepted-artifact deleted path ${failure.path} is present at the current workspace head`,
+    );
+  }
+  if (failure.kind === "mode_mismatch") {
+    return new SymphonyError(
+      "workspace_error",
+      `Accepted-artifact Git mode for ${failure.path} does not match its reviewed manifest at the current workspace head`,
+    );
+  }
+  return new SymphonyError(
+    "workspace_error",
+    `Accepted-artifact blob for ${failure.path} does not match its reviewed manifest at the current workspace head`,
+  );
 }
 
 export async function finalizeGitWorktreeSeedConflict(
@@ -1222,9 +1262,12 @@ async function assertConflictResolutionMatchesManifest(
   const conflicts = new Set(conflictPaths);
   for (const entry of manifest) {
     if (!conflicts.has(entry.path)) continue;
-    const filePath = path.join(workspacePath, entry.path);
     if (entry.status === "deleted") {
-      if (await pathExists(filePath)) {
+      const observation = await inspectAcceptedArtifactWorktreePath(
+        workspacePath,
+        entry.path,
+      );
+      if (observation.kind !== "missing") {
         throw new SymphonyError(
           "workspace_error",
           `Accepted-artifact conflict resolution retained reviewed deletion ${entry.path}`,
@@ -1232,23 +1275,55 @@ async function assertConflictResolutionMatchesManifest(
       }
       continue;
     }
-    const hashed = await runGit(
-      ["hash-object", "--", entry.path],
+    const observation = await inspectAcceptedArtifactWorktreePath(
       workspacePath,
-      timeoutMs,
-      { allowFailure: true },
+      entry.path,
     );
-    const actualBlobSha = hashed.stdout.trim();
-    if (
-      hashed.code !== 0 ||
-      actualBlobSha.toLowerCase() !== entry.blobSha?.toLowerCase()
-    ) {
+    const actualMode = worktreeGitMode(observation);
+    if (entry.mode !== undefined && actualMode !== entry.mode) {
+      throw new SymphonyError(
+        "workspace_error",
+        `Accepted-artifact conflict resolution for ${entry.path} does not match its reviewed Git mode`,
+      );
+    }
+    let matchesReviewedBlob = false;
+    if (observation.kind === "symlink") {
+      const expectedTarget = await runGit(
+        ["cat-file", "blob", entry.blobSha!],
+        workspacePath,
+        timeoutMs,
+        { allowFailure: true },
+      );
+      matchesReviewedBlob =
+        expectedTarget.code === 0 && expectedTarget.stdout === observation.target;
+    } else if (observation.kind === "file") {
+      const hashed = await runGit(
+        ["hash-object", "--", entry.path],
+        workspacePath,
+        timeoutMs,
+        { allowFailure: true },
+      );
+      matchesReviewedBlob =
+        hashed.code === 0 &&
+        hashed.stdout.trim().toLowerCase() === entry.blobSha?.toLowerCase();
+    }
+    if (!matchesReviewedBlob) {
       throw new SymphonyError(
         "workspace_error",
         `Accepted-artifact conflict resolution for ${entry.path} does not match its reviewed blob`,
       );
     }
   }
+}
+
+function worktreeGitMode(
+  observation: Awaited<ReturnType<typeof inspectAcceptedArtifactWorktreePath>>,
+): ArtifactFileManifestEntry["mode"] | undefined {
+  if (observation.kind === "symlink") return "120000";
+  if (observation.kind === "file") {
+    return observation.executable ? "100755" : "100644";
+  }
+  return undefined;
 }
 
 function literalPathspec(filePath: string): string {
@@ -1362,9 +1437,7 @@ async function resolveExactCommit(
   label: string,
   timeoutMs: number,
 ): Promise<string> {
-  if (!/^[0-9a-f]{40,64}$/i.test(expectedSha)) {
-    throw new SymphonyError("workspace_error", `${label} must be a full git object ID`);
-  }
+  assertFullGitObjectId(expectedSha, label);
   const result = await runGit(["rev-parse", "--verify", `${expectedSha}^{commit}`], repoPath, timeoutMs, {
     allowFailure: true,
   });
@@ -1376,6 +1449,15 @@ async function resolveExactCommit(
     throw new SymphonyError("workspace_error", `${label} did not resolve to the exact accepted object ID`);
   }
   return resolved;
+}
+
+function assertFullGitObjectId(value: string, label: string): void {
+  if (!/^[0-9a-f]{40,64}$/i.test(value)) {
+    throw new SymphonyError(
+      "workspace_error",
+      `${label} must be a full git object ID`,
+    );
+  }
 }
 
 async function assertCommitAncestor(
@@ -1455,7 +1537,7 @@ async function verifyPreparedArtifactFiles(
 ): Promise<void> {
   validatedManifestByPath(manifest);
   for (const entry of manifest) {
-    const preparedObject = await treeObjectSha(
+    const preparedObject = await treeObjectEntry(
       repoPath,
       preparedHeadSha,
       entry.path,
@@ -1476,10 +1558,19 @@ async function verifyPreparedArtifactFiles(
         `Accepted-artifact path ${entry.path} is missing from prepared workspace`,
       );
     }
-    if (preparedObject.toLowerCase() !== entry.blobSha?.toLowerCase()) {
+    if (
+      preparedObject.objectType !== "blob" ||
+      preparedObject.objectSha.toLowerCase() !== entry.blobSha?.toLowerCase()
+    ) {
       throw new SymphonyError(
         "workspace_error",
         `Accepted-artifact blob for ${entry.path} does not match its reviewed manifest`,
+      );
+    }
+    if (entry.mode !== undefined && preparedObject.mode !== entry.mode) {
+      throw new SymphonyError(
+        "workspace_error",
+        `Accepted-artifact Git mode for ${entry.path} does not match its reviewed manifest`,
       );
     }
   }
@@ -1531,10 +1622,26 @@ function validatedManifestByPath(
           `Deleted accepted-artifact path ${entry.path} must have a null blob SHA`,
         );
       }
+      if (entry.mode !== undefined && entry.mode !== null) {
+        throw new SymphonyError(
+          "workspace_error",
+          `Deleted accepted-artifact path ${entry.path} must have a null Git mode`,
+        );
+      }
     } else if (entry.blobSha === null || !/^[0-9a-f]{40,64}$/i.test(entry.blobSha)) {
       throw new SymphonyError(
         "workspace_error",
         `Accepted-artifact path ${entry.path} must have a full blob SHA`,
+      );
+    } else if (
+      entry.mode !== undefined &&
+      entry.mode !== "100644" &&
+      entry.mode !== "100755" &&
+      entry.mode !== "120000"
+    ) {
+      throw new SymphonyError(
+        "workspace_error",
+        `Accepted-artifact path ${entry.path} has an invalid Git mode`,
       );
     }
     entries.set(entry.path, entry);
@@ -1603,9 +1710,9 @@ async function verifyManifestObjects(
 ): Promise<void> {
   validatedManifestByPath(manifest);
   for (const entry of manifest) {
-    const actualBlob = await treeObjectSha(repoPath, commitSha, entry.path, timeoutMs);
+    const actualObject = await treeObjectEntry(repoPath, commitSha, entry.path, timeoutMs);
     if (entry.status === "deleted") {
-      if (actualBlob !== null) {
+      if (actualObject !== null) {
         throw new SymphonyError(
           "workspace_error",
           `Accepted-artifact deleted path ${entry.path} is present in ${label}`,
@@ -1613,30 +1720,60 @@ async function verifyManifestObjects(
       }
       continue;
     }
-    if (actualBlob?.toLowerCase() !== entry.blobSha?.toLowerCase()) {
+    if (
+      actualObject?.objectType !== "blob" ||
+      actualObject.objectSha.toLowerCase() !== entry.blobSha?.toLowerCase()
+    ) {
       throw new SymphonyError(
         "workspace_error",
         `Accepted-artifact blob for ${entry.path} did not survive in ${label}`,
       );
     }
+    if (entry.mode !== undefined && actualObject.mode !== entry.mode) {
+      throw new SymphonyError(
+        "workspace_error",
+        `Accepted-artifact Git mode for ${entry.path} did not survive in ${label}`,
+      );
+    }
   }
 }
 
-async function treeObjectSha(
+interface ArtifactTreeObjectEntry {
+  mode: string;
+  objectType: string;
+  objectSha: string;
+}
+
+async function treeObjectEntry(
   repoPath: string,
   commitSha: string,
   filePath: string,
   timeoutMs: number,
-): Promise<string | null> {
+): Promise<ArtifactTreeObjectEntry | null> {
   const result = await runGit(
     ["ls-tree", "-z", commitSha, "--", `:(literal)${filePath}`],
     repoPath,
     timeoutMs,
   );
   if (result.stdout.length === 0) return null;
-  const header = result.stdout.slice(0, result.stdout.indexOf("\t"));
-  const objectSha = header.split(" ")[2];
-  return objectSha?.trim() || null;
+  const tab = result.stdout.indexOf("\t");
+  const match =
+    tab < 0
+      ? null
+      : /^([0-7]{6}) (blob|tree|commit) ([0-9a-f]{40,64})$/i.exec(
+          result.stdout.slice(0, tab),
+        );
+  if (match === null || result.stdout.slice(tab + 1).replace(/\0$/, "") !== filePath) {
+    throw new SymphonyError(
+      "workspace_error",
+      `Unable to inspect accepted-artifact tree object for ${filePath}`,
+    );
+  }
+  return {
+    mode: match[1]!,
+    objectType: match[2]!.toLowerCase(),
+    objectSha: match[3]!,
+  };
 }
 
 async function conflictedFiles(workspacePath: string, timeoutMs: number): Promise<string[]> {

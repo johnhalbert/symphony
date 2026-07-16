@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { ServiceConfig } from "./config/Config.js";
 import { SymphonyError } from "./errors.js";
+import { resolveActiveBlockerProvenancePatch } from "./BlockerProvenance.js";
 import { createGitHubPullRequestClientForCapability } from "../integrations/github/GitHubCredentialResolver.js";
 import {
   ServiceOwnedMergeConflictGit,
@@ -15,6 +16,7 @@ import {
 } from "./merge/ServiceOwnedMergeConflictGit.js";
 import type {
   CompletionReportPullRequestRef,
+  IssueBlockerProvenanceRecord,
   IssueLifecycleStore,
   IssueMergeConflictMetadata,
   IssueMergeConflictResolutionReportRecord,
@@ -24,16 +26,19 @@ import type { Issue, Workspace } from "./types.js";
 import {
   planBlockedEscalationWritebacks,
   planMergeConflictResolvedWritebacks,
+  planMergeConflictStillConflictedWritebacks,
 } from "./writeback/TransitionPolicy.js";
 import type {
   WritebackOperation,
   WritebackOutboxStore,
   WritebackProcessor,
 } from "./writeback/WritebackOutbox.js";
+import { bindWritebackOperationToLifecycle } from "./writeback/WritebackOutbox.js";
 
 const mergeConflictResolutionSchema = z.object({
   runId: z.string().trim().min(1),
   issueId: z.string().trim().min(1),
+  finalDisposition: z.string().min(1).refine((value) => value.trim().length > 0, "Final disposition cannot be blank"),
   resolutionStatus: z.enum(["resolved", "still_conflicted", "blocked"]),
   summary: z.string().trim().min(1),
   validationEvidence: z.array(z.string().trim().min(1)).min(1),
@@ -152,6 +157,10 @@ export class MergeConflictResolutionService {
       throw new SymphonyError("invalid_request", "Merge conflict resolution requires an open merge conflict lifecycle record");
     }
 
+    const blockerProvenance = assertCarriedBlockerProvenanceIsActive(
+      lifecycle,
+      mergeConflict,
+    );
     assertPullRequestMatchesConflict(report.pullRequest, mergeConflict);
     const finalReport = await this.normalizeReportForServicePreparation(report, mergeConflict, context);
     if (!finalReport.serviceRemediation) assertReportMatchesConflict(finalReport, mergeConflict);
@@ -206,18 +215,52 @@ export class MergeConflictResolutionService {
             };
 
     const resolved = !blocked && nextConflict.resolutionStatus === "resolved";
+    const blockerResolutionPatch =
+      resolved && mergeConflict.blockerProvenanceId
+        ? resolveActiveBlockerProvenancePatch(lifecycle, {
+            expectedProvenanceId: mergeConflict.blockerProvenanceId,
+            resolution: "base_ref_repair",
+            resolvedAt: now,
+          })
+        : {};
+    if (
+      resolved &&
+      mergeConflict.blockerProvenanceId &&
+      blockerResolutionPatch.activeBlockerProvenanceId !== null
+    ) {
+      throw new SymphonyError(
+        "invalid_request",
+        "Resolved merge conflict did not match the active blocker provenance",
+      );
+    }
+    const continuation = mergeConflictContinuation(finalReport);
     const writebackOperations = blocked
-      ? await this.enqueueBlockedWritebacks(context, nextConflict)
+      ? await this.enqueueBlockedWritebacks(
+          context,
+          storedReport,
+          nextConflict,
+          blockerProvenance,
+        )
       : resolved
         ? await this.enqueueResolvedWritebacks(context, storedReport, nextConflict)
-        : [];
-    const continuation = mergeConflictContinuation(finalReport);
+        : await this.enqueueStillConflictedWritebacks(
+            context,
+            storedReport,
+            nextConflict,
+          );
+    const durableReport: IssueMergeConflictResolutionReportRecord = {
+      ...storedReport,
+      writebackOperationKeys: writebackOperations.map(
+        (operation) => operation.idempotencyKey,
+      ),
+    };
     const activeStash = preservedStashFromReport(finalReport);
     const preservedWorktreeStashes =
       activeStash === null
         ? preservedWorktreeStashesOf(lifecycle)
         : upsertPreservedWorktreeStash(preservedWorktreeStashesOf(lifecycle), activeStash);
     const updated = await this.options.lifecycleStore.updateIssue(context.issue, {
+      ...blockerResolutionPatch,
       phase: blocked
         ? "blocked"
         : resolved
@@ -233,7 +276,7 @@ export class MergeConflictResolutionService {
       },
       mergeConflictResolutionReports: upsertMergeConflictResolutionReport(
         lifecycle.mergeConflictResolutionReports,
-        storedReport,
+        durableReport,
       ),
       preservedWorktreeStashes,
       summaryPointers: {
@@ -251,7 +294,7 @@ export class MergeConflictResolutionService {
     return {
       accepted: true,
       replayed: false,
-      report: storedReport,
+      report: durableReport,
       mergeConflict: updated.mergeConflict ?? nextConflict,
       writebackOperations,
       ...(continuation === undefined ? {} : { continuation }),
@@ -289,12 +332,16 @@ export class MergeConflictResolutionService {
 
   private async enqueueBlockedWritebacks(
     context: MergeConflictResolutionActiveContext,
+    report: IssueMergeConflictResolutionReportRecord,
     mergeConflict: IssueMergeConflictMetadata,
+    blockerProvenance: IssueBlockerProvenanceRecord | null,
   ): Promise<WritebackOperation[]> {
     const operations = planBlockedEscalationWritebacks(
       {
         issue: context.issue,
         runId: context.activeRunId,
+        ...(report.finalDisposition === undefined ? {} : { finalDisposition: report.finalDisposition }),
+        blockerProvenance,
         reason: mergeConflict.blockedReason ?? conflictBlockedReason(mergeConflict.fixTurnCount, mergeConflict.maxFixTurns),
         requiredAction: [
           "Merge conflicts remain unresolved after the configured conflict-fix attempts.",
@@ -307,7 +354,13 @@ export class MergeConflictResolutionService {
       this.options.config,
     );
     const enqueued: WritebackOperation[] = [];
-    for (const operation of operations) enqueued.push(await this.options.writebackOutbox.enqueueOnce(operation));
+    for (const rawOperation of operations) {
+      const operation = bindWritebackOperationToLifecycle(rawOperation, {
+        kind: "merge_conflict_resolution_report",
+        recordId: report.id,
+      });
+      enqueued.push(await this.options.writebackOutbox.enqueueOnce(operation));
+    }
     return enqueued;
   }
 
@@ -327,7 +380,33 @@ export class MergeConflictResolutionService {
       this.options.config,
     );
     const enqueued: WritebackOperation[] = [];
-    for (const operation of operations) enqueued.push(await this.options.writebackOutbox.enqueueOnce(operation));
+    for (const rawOperation of operations) {
+      const operation = bindWritebackOperationToLifecycle(rawOperation, {
+        kind: "merge_conflict_resolution_report",
+        recordId: report.id,
+      });
+      enqueued.push(await this.options.writebackOutbox.enqueueOnce(operation));
+    }
+    return enqueued;
+  }
+
+  private async enqueueStillConflictedWritebacks(
+    context: MergeConflictResolutionActiveContext,
+    report: IssueMergeConflictResolutionReportRecord,
+    mergeConflict: IssueMergeConflictMetadata,
+  ): Promise<WritebackOperation[]> {
+    const operations = planMergeConflictStillConflictedWritebacks(
+      { issue: context.issue, report },
+      this.options.config,
+    );
+    const enqueued: WritebackOperation[] = [];
+    for (const rawOperation of operations) {
+      const operation = bindWritebackOperationToLifecycle(rawOperation, {
+        kind: "merge_conflict_resolution_report",
+        recordId: report.id,
+      });
+      enqueued.push(await this.options.writebackOutbox.enqueueOnce(operation));
+    }
     return enqueued;
   }
 
@@ -336,7 +415,41 @@ export class MergeConflictResolutionService {
     mergeConflict: IssueMergeConflictMetadata,
     context: MergeConflictResolutionActiveContext,
   ): Promise<NormalizedMergeConflictResolutionInput> {
-    if (report.newHeadSha !== undefined && report.newHeadSha !== null) return normalizeProvidedNewHeadSha(report);
+    const servicePreparationIsConflicted =
+      mergeConflict.servicePreparation?.status === "conflicted";
+    const requiresServiceFinalization =
+      report.resolutionStatus === "resolved" && servicePreparationIsConflicted;
+    if (
+      report.resolutionStatus !== "resolved" &&
+      servicePreparationIsConflicted
+    ) {
+      if (
+        (report.newHeadSha !== undefined &&
+          report.newHeadSha !== null &&
+          report.newHeadSha !== mergeConflict.currentHeadSha) ||
+        report.pullRequest.headSha !== mergeConflict.currentHeadSha
+      ) {
+        throw new SymphonyError(
+          "invalid_request",
+          "Service-prepared non-resolved reports cannot advance the conflict head",
+        );
+      }
+      return {
+        ...report,
+        pullRequest: {
+          ...report.pullRequest,
+          headSha: mergeConflict.currentHeadSha,
+        },
+        newHeadSha: mergeConflict.currentHeadSha,
+      };
+    }
+    if (
+      !requiresServiceFinalization &&
+      report.newHeadSha !== undefined &&
+      report.newHeadSha !== null
+    ) {
+      return normalizeProvidedNewHeadSha(report);
+    }
     if (!canOmitNewHeadShaForServicePreparation(report, mergeConflict)) {
       throw new SymphonyError(
         "invalid_request",
@@ -360,7 +473,11 @@ export class MergeConflictResolutionService {
     }
     const branchName = requireValue(mergeConflict.pullRequest.branch, "Merge conflict finalization requires the PR branch");
     const baseBranch = requireValue(mergeConflict.baseBranch, "Merge conflict finalization requires the PR base branch");
-    const finalizer = this.options.finalizer ?? new ServiceOwnedMergeConflictGit();
+    const finalizer =
+      this.options.finalizer ??
+      new ServiceOwnedMergeConflictGit({
+        journalDir: this.options.config.workspace.stateDir,
+      });
     const authHeader = await this.gitAuthHeader();
     if (servicePreparation.strategy === "stash_apply") {
       const finalizeStashApply = finalizer.finalizeStashApply?.bind(finalizer);
@@ -596,6 +713,7 @@ function buildMergeConflictResolutionReport(input: {
     runId: input.report.runId,
     issueId: input.issue.id,
     issueIdentifier: input.issue.identifier,
+    finalDisposition: input.report.finalDisposition,
     resolutionStatus: input.report.resolutionStatus,
     summary: input.report.summary,
     validationEvidence: input.report.validationEvidence,
@@ -608,6 +726,7 @@ function buildMergeConflictResolutionReport(input: {
     blockedReason: input.report.resolutionStatus === "blocked" ? input.report.blockedReason ?? null : null,
     risks: input.report.risks,
     submittedAt: new Date().toISOString(),
+    writebackOperationKeys: [],
   };
 }
 
@@ -625,6 +744,30 @@ function assertPullRequestMatchesConflict(
   requireMatches("conflict resolution PR number", pullRequest.number, mergeConflict.pullRequest.number);
   requireMatches("conflict resolution PR URL", pullRequest.url, mergeConflict.pullRequest.url);
   requireMatches("conflict resolution PR branch", pullRequest.branch, mergeConflict.pullRequest.branch);
+}
+
+function assertCarriedBlockerProvenanceIsActive(
+  lifecycle: NonNullable<Awaited<ReturnType<IssueLifecycleStore["get"]>>>,
+  mergeConflict: IssueMergeConflictMetadata,
+): IssueBlockerProvenanceRecord | null {
+  const provenanceId = mergeConflict.blockerProvenanceId ?? null;
+  if (provenanceId === null) return null;
+  const provenance = (lifecycle.blockerProvenances ?? []).find(
+    (candidate) => candidate.id === provenanceId,
+  );
+  if (
+    lifecycle.activeBlockerProvenanceId !== provenanceId ||
+    provenance === undefined ||
+    provenance.resolvedAt !== null ||
+    provenance.resolution !== null ||
+    mergeConflict.servicePreparation?.status !== "conflicted"
+  ) {
+    throw new SymphonyError(
+      "invalid_request",
+      "Merge conflict blocker provenance is not the active unresolved service-prepared blocker",
+    );
+  }
+  return provenance;
 }
 
 function assertReportMatchesConflict(
@@ -671,7 +814,10 @@ function assertReplayMatchesReport(
     blockedReason: report.resolutionStatus === "blocked" ? report.blockedReason ?? null : null,
     risks: report.risks,
   };
-  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+  if (
+    (existing.finalDisposition !== undefined && report.finalDisposition !== existing.finalDisposition) ||
+    JSON.stringify(actual) !== JSON.stringify(expected)
+  ) {
     throw new SymphonyError("invalid_request", "Merge conflict resolution idempotency key was reused with different report metadata");
   }
 }

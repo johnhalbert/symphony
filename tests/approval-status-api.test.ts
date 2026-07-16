@@ -637,7 +637,10 @@ describe("approval status API", () => {
           {
             runId: "live-report-run",
             idempotencyKey: "idem-live",
-            writebackOperationKeys: [],
+            writebackOperationKeys: [
+              "comment:issue-1:live-report-run:completion-report:idem-live:publication-approval-pending",
+              "transition:issue-1:live-report-run:completion-report:idem-live:publication-approval-pending:Blocked",
+            ],
           },
         ],
       });
@@ -897,7 +900,10 @@ describe("approval status API", () => {
           expect.objectContaining({
             runId: "live-report-run",
             idempotencyKey: "idem-live",
-            writebackOperationKeys: [],
+            writebackOperationKeys: [
+              "comment:issue-1:live-report-run:completion-report:idem-live:publication-approval-pending",
+              "transition:issue-1:live-report-run:completion-report:idem-live:publication-approval-pending:Blocked",
+            ],
           }),
         ],
       });
@@ -1086,7 +1092,10 @@ describe("approval status API", () => {
           idempotencyKey: evidenceCursor,
           summary: reportSummary,
           pullRequest: null,
-          writebackOperationKeys: [],
+          writebackOperationKeys: [
+            `comment:${candidate.id}:${runId}:completion-report:${evidenceCursor}:publication-approval-pending`,
+            `transition:${candidate.id}:${runId}:completion-report:${evidenceCursor}:publication-approval-pending:Blocked`,
+          ],
         }),
       ],
     });
@@ -1157,6 +1166,8 @@ describe("approval status API", () => {
               branch: "symphony/TEST-1",
             },
             writebackOperationKeys: [
+              "comment:issue-1:run-1:completion-report:idem-1:publication-approval-pending",
+              "transition:issue-1:run-1:completion-report:idem-1:publication-approval-pending:Blocked",
               "comment:issue-1:run-1:completion-report:idem-1",
               "transition:issue-1:run-1:completion-report:idem-1:In Review",
             ],
@@ -1859,6 +1870,7 @@ class LiveCompletionReportHarness implements AgentHarness {
       {
         runId: "live-report-run",
         issueId: ctx.issue.id,
+        finalDisposition: "Implemented the requested handoff and verified it with the integration test suite.",
         summary: "Implemented the requested handoff.",
         validationEvidence: ["npm test"],
         acceptanceChecklist: [

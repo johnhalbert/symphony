@@ -93,6 +93,13 @@ export interface PersistedCursorModelParam {
 
 export type PersistedRuntimeModelParam = PersistedCursorModelParam;
 
+export interface PersistedRunFinalResponse {
+  text: string;
+  sha256: string;
+  capturedAt: string;
+  redacted: boolean;
+}
+
 export interface WorkspaceRecord {
   workspaceKey: string;
   issueId: string | null;
@@ -200,6 +207,7 @@ export interface RunRecord {
   startedAt: string;
   updatedAt: string;
   completedAt: string | null;
+  finalResponse?: PersistedRunFinalResponse | null;
   error: string | null;
   tokens: TokenCounts;
   transcriptEventCount?: number;
@@ -1058,6 +1066,7 @@ function reduceRunActivityEvent(
       next = reducePlanningRunFailedEvent(next, event, payload, options, "Planning run failed");
       break;
     case "completed":
+    case "run_succeeded":
       next = reduceCompletedEvent(next, event, payload, options);
       break;
     case "failed":
@@ -1078,6 +1087,7 @@ function resetReplayableRunState(record: RunRecord): RunRecord {
     ...record,
     status: "running",
     completedAt: null,
+    finalResponse: null,
     error: null,
     tokens: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
     transcriptEventCount: 0,
@@ -1454,10 +1464,23 @@ function reduceCompletedEvent(
   payload: UnknownRecord | null,
   options: RunActivityReductionOptions,
 ): RunRecord {
-  if (record.runPhase === "issue_breakdown") {
-    return reducePlanningRunFailedEvent(record, event, payload, options, PLANNING_NO_PLAN_ERROR, true);
+  const finalResponseText = stringField(payload, "finalResponseText");
+  const withFinalResponse =
+    finalResponseText === undefined
+      ? record
+      : {
+          ...record,
+          finalResponse: {
+            text: finalResponseText,
+            sha256: createHash("sha256").update(finalResponseText).digest("hex"),
+            capturedAt: event.at,
+            redacted: payload?.redacted === true,
+          },
+        };
+  if (record.runPhase === "issue_breakdown" && record.status === "running") {
+    return reducePlanningRunFailedEvent(withFinalResponse, event, payload, options, PLANNING_NO_PLAN_ERROR, true);
   }
-  return reduceTerminalEvent(record, event, "succeeded", null, options);
+  return reduceTerminalEvent(withFinalResponse, event, "succeeded", null, options);
 }
 
 function reducePlanningRunFailedEvent(

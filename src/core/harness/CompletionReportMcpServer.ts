@@ -106,6 +106,7 @@ export async function submitCompletionReportFromMcp(input: unknown, options: {
       accepted: result.accepted,
       replayed: result.replayed,
       reportId: result.report.id,
+      finalDisposition: result.report.finalDisposition,
       pullRequest: result.report.pullRequest,
       writebackOperationKeys: result.report.writebackOperationKeys,
     };
@@ -144,11 +145,12 @@ async function readCompletionReportContext(filePath: string): Promise<Completion
   return parsed;
 }
 
-function completionReportInputSchema(): Record<string, unknown> {
+export function completionReportInputSchema(): Record<string, unknown> {
   return {
     type: "object",
     additionalProperties: false,
     required: [
+      "finalDisposition",
       "summary",
       "validationEvidence",
       "acceptanceChecklist",
@@ -159,6 +161,12 @@ function completionReportInputSchema(): Record<string, unknown> {
       "idempotencyKey",
     ],
     properties: {
+      finalDisposition: {
+        type: "string",
+        minLength: 1,
+        description:
+          "Complete standalone final response for this worker run. Symphony stores this text untruncated and writes it verbatim to Linear; return the same text as the terminal assistant response after the handoff is accepted.",
+      },
       summary: {
         type: "string",
         minLength: 1,

@@ -79,6 +79,7 @@ export async function submitIssuePostMortemReportFromMcp(
       accepted: result.accepted,
       replayed: result.replayed,
       reportId: result.report.id,
+      finalDisposition: result.report.finalDisposition,
       completionStatus: result.report.completionJudgment.status,
       specificationQuality: result.report.specificationAssessment.quality,
       followUpCandidateCount: result.report.followUpCandidates.length,
@@ -117,11 +118,12 @@ async function readIssuePostMortemContext(filePath: string): Promise<IssuePostMo
   return parsed;
 }
 
-function issuePostMortemReportInputSchema(): Record<string, unknown> {
+export function issuePostMortemReportInputSchema(): Record<string, unknown> {
   return {
     type: "object",
     additionalProperties: false,
     required: [
+      "finalDisposition",
       "summary",
       "completionJudgment",
       "specificationAssessment",
@@ -131,6 +133,12 @@ function issuePostMortemReportInputSchema(): Record<string, unknown> {
       "idempotencyKey",
     ],
     properties: {
+      finalDisposition: {
+        type: "string",
+        minLength: 1,
+        description:
+          "Complete standalone final response for this post-mortem run. Symphony stores this text untruncated and writes it verbatim to Linear; return the same text as the terminal assistant response after the handoff is accepted.",
+      },
       summary: {
         type: "string",
         minLength: 1,

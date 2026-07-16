@@ -71,6 +71,7 @@ export async function submitIssueTriageReportFromMcp(
       accepted: result.accepted,
       replayed: result.replayed,
       reportId: result.report.id,
+      finalDisposition: result.report.finalDisposition,
       disposition: result.report.disposition,
       confidence: result.report.confidence,
       blockers: result.report.blockers.map((blocker) => ({
@@ -114,12 +115,18 @@ async function readIssueTriageContext(filePath: string): Promise<IssueTriageMcpC
   return parsed;
 }
 
-function issueTriageReportInputSchema(): Record<string, unknown> {
+export function issueTriageReportInputSchema(): Record<string, unknown> {
   return {
     type: "object",
     additionalProperties: false,
-    required: ["summary", "blockers", "idempotencyKey"],
+    required: ["finalDisposition", "summary", "blockers", "idempotencyKey"],
     properties: {
+      finalDisposition: {
+        type: "string",
+        minLength: 1,
+        description:
+          "Complete standalone final response for this triage run. Symphony stores this text untruncated and writes it verbatim to Linear; return the same text as the terminal assistant response after the handoff is accepted.",
+      },
       summary: {
         type: "string",
         minLength: 1,

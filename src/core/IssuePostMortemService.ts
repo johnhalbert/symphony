@@ -22,6 +22,7 @@ import type { RunTranscriptStore } from "./persistence/RunTranscriptStore.js";
 import type { Issue } from "./types.js";
 import { planIssuePostMortemReportWritebacks } from "./writeback/TransitionPolicy.js";
 import type { WritebackOutboxStore } from "./writeback/WritebackOutbox.js";
+import { bindWritebackOperationToLifecycle } from "./writeback/WritebackOutbox.js";
 
 export const ISSUE_POST_MORTEM_COMPLETION_STATUSES = [
   "valid_done",
@@ -70,6 +71,7 @@ const issuePostMortemReportSchema = z.object({
   runId: z.string().trim().min(1),
   issueId: z.string().trim().min(1),
   triggerFingerprint: z.string().trim().min(1),
+  finalDisposition: z.string().min(1).refine((value) => value.trim().length > 0, "Final disposition cannot be blank"),
   summary: z.string().trim().min(1),
   completionJudgment: z.object({
     status: z.enum(ISSUE_POST_MORTEM_COMPLETION_STATUSES),
@@ -98,6 +100,7 @@ export interface IssuePostMortemReportInput {
   runId: string;
   issueId: string;
   triggerFingerprint: string;
+  finalDisposition: string;
   summary: string;
   completionJudgment: {
     status: IssuePostMortemCompletionStatus;
@@ -171,6 +174,7 @@ export class IssuePostMortemService {
     }
 
     const requestHash = issuePostMortemReportRequestHash(parsed);
+    const preFinalDispositionRequestHash = preFinalDispositionIssuePostMortemReportRequestHash(parsed);
     const existingScoped = existingLifecycle.postMortemReports.find(
       (report) => report.runId === context.activeRunId && report.idempotencyKey === parsed.idempotencyKey,
     );
@@ -179,6 +183,7 @@ export class IssuePostMortemService {
         idempotencyKey: parsed.idempotencyKey,
         activeRunId: context.activeRunId,
         requestHash,
+        preFinalDispositionRequestHash,
       });
       return { accepted: true, replayed: true, report: existingScoped };
     }
@@ -221,6 +226,7 @@ export class IssuePostMortemService {
       issueId: context.issue.id,
       issueIdentifier: context.issue.identifier,
       triggerFingerprint: parsed.triggerFingerprint,
+      finalDisposition: parsed.finalDisposition,
       summary: parsed.summary,
       completionJudgment: parsed.completionJudgment,
       specificationAssessment: parsed.specificationAssessment,
@@ -232,7 +238,11 @@ export class IssuePostMortemService {
     };
     const operations = planIssuePostMortemReportWritebacks({ issue: context.issue, report: reportBase }, this.options.config);
     const writebackOperationKeys: string[] = [];
-    for (const operation of operations) {
+    for (const rawOperation of operations) {
+      const operation = bindWritebackOperationToLifecycle(rawOperation, {
+        kind: "issue_post_mortem_report",
+        recordId: reportBase.id,
+      });
       const enqueued = await this.options.writebackOutbox.enqueueOnce(operation);
       writebackOperationKeys.push(enqueued.idempotencyKey);
     }
@@ -369,6 +379,24 @@ export function issuePostMortemReportRequestHash(input: IssuePostMortemReportInp
       stableJson({
         issueId: input.issueId,
         triggerFingerprint: input.triggerFingerprint,
+        finalDisposition: input.finalDisposition,
+        summary: normalizeString(input.summary),
+        completionJudgment: input.completionJudgment,
+        specificationAssessment: input.specificationAssessment,
+        reviewAssessment: input.reviewAssessment,
+        followUpCandidates: input.followUpCandidates,
+        processLessons: normalizeStringList(input.processLessons),
+      }),
+    )
+    .digest("hex");
+}
+
+export function preFinalDispositionIssuePostMortemReportRequestHash(input: IssuePostMortemReportInput): string {
+  return createHash("sha256")
+    .update(
+      stableJson({
+        issueId: input.issueId,
+        triggerFingerprint: input.triggerFingerprint,
         summary: normalizeString(input.summary),
         completionJudgment: input.completionJudgment,
         specificationAssessment: input.specificationAssessment,
@@ -406,6 +434,7 @@ function canonicalIssuePostMortemReportInput(input: RawIssuePostMortemReportInpu
     runId: normalizeString(input.runId),
     issueId: normalizeString(input.issueId),
     triggerFingerprint: normalizeString(input.triggerFingerprint),
+    finalDisposition: input.finalDisposition,
     summary: normalizeString(input.summary),
     completionJudgment: {
       status: input.completionJudgment.status,
@@ -450,9 +479,20 @@ function validateCaller(report: IssuePostMortemReportInput, context: IssuePostMo
 
 function assertIssuePostMortemReplayAllowed(
   existing: IssuePostMortemReportRecord,
-  expected: { idempotencyKey: string; activeRunId: string; requestHash: string },
+  expected: {
+    idempotencyKey: string;
+    activeRunId: string;
+    requestHash: string;
+    preFinalDispositionRequestHash: string;
+  },
 ): void {
-  if (existing.requestHash !== expected.requestHash) {
+  if (
+    existing.requestHash !== expected.requestHash &&
+    !(
+      existing.finalDisposition === undefined &&
+      existing.requestHash === expected.preFinalDispositionRequestHash
+    )
+  ) {
     throw issuePostMortemIdempotencyConflict("payload_mismatch", existing, expected);
   }
 }
@@ -460,7 +500,12 @@ function assertIssuePostMortemReplayAllowed(
 function issuePostMortemIdempotencyConflict(
   reason: "payload_mismatch" | "cross_run_key_reuse",
   existing: IssuePostMortemReportRecord,
-  expected: { idempotencyKey: string; activeRunId: string; requestHash: string },
+  expected: {
+    idempotencyKey: string;
+    activeRunId: string;
+    requestHash: string;
+    preFinalDispositionRequestHash?: string;
+  },
 ): SymphonyError {
   return new SymphonyError("conflict", "Issue post-mortem report idempotency key was reused with a different run or payload", {
     reason,

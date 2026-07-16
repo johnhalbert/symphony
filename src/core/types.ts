@@ -8,6 +8,8 @@ export interface ArtifactFileManifestEntry {
   path: string;
   status: "added" | "modified" | "deleted" | "renamed";
   blobSha: string | null;
+  /** Absent only on checkpoints created before Git mode provenance was recorded. */
+  mode?: "100644" | "100755" | "120000" | null;
 }
 
 export interface AcceptedArtifactWorkspaceSeed {

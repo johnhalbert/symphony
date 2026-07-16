@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   projectTranscriptEventForPublicRead,
   redactTextPreserveFormatting,
+  sanitizeAgentEventForPublicOutput,
 } from "../src/core/transcript/TranscriptProjection.js";
 import type { TranscriptEvent } from "../src/core/persistence/RunTranscriptStore.js";
 
@@ -14,6 +15,33 @@ describe("transcript public formatting redaction", () => {
       truncated: false,
       redacted: true,
     });
+  });
+
+  it("preserves the complete redacted terminal response before transcript persistence", () => {
+    const response = `Final disposition\n\n${"complete finding\n".repeat(800)}token=SECRET_TERMINAL_TOKEN`;
+
+    const sanitized = sanitizeAgentEventForPublicOutput({ type: "completed", message: response });
+
+    expect(sanitized).toMatchObject({
+      type: "completed",
+      message: expect.stringContaining("...[truncated]"),
+      payload: {
+        finalResponseText: expect.stringContaining(
+          "complete finding\ncomplete finding",
+        ),
+      },
+    });
+    expect(
+      sanitized.type === "completed" &&
+        typeof (sanitized.payload as Record<string, unknown>)
+          .finalResponseText === "string"
+        ? (sanitized.payload as Record<string, string>).finalResponseText
+        : null,
+    ).toHaveLength(
+      response.replace("SECRET_TERMINAL_TOKEN", "[redacted]").length,
+    );
+    expect(sanitized.type === "completed" ? sanitized.message?.length : null).toBeLessThanOrEqual(500);
+    expect(JSON.stringify(sanitized)).not.toContain("SECRET_TERMINAL_TOKEN");
   });
 
   it("preserves public transcript display fields without formatting arbitrary nested JSON", () => {

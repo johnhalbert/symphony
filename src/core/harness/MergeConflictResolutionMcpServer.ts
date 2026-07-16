@@ -74,6 +74,7 @@ export async function submitMergeConflictResolutionFromMcp(input: unknown, optio
       accepted: result.accepted,
       replayed: result.replayed,
       reportId: result.report.id,
+      finalDisposition: result.report.finalDisposition,
       resolutionStatus: result.report.resolutionStatus,
       mergeConflict: result.mergeConflict,
       writebackOperationKeys: result.writebackOperations.map((operation) => operation.idempotencyKey),
@@ -113,11 +114,12 @@ async function readMergeConflictResolutionContext(filePath: string): Promise<Mer
   return parsed;
 }
 
-function mergeConflictResolutionInputSchema(): Record<string, unknown> {
+export function mergeConflictResolutionInputSchema(): Record<string, unknown> {
   return {
     type: "object",
     additionalProperties: false,
     required: [
+      "finalDisposition",
       "resolutionStatus",
       "summary",
       "validationEvidence",
@@ -130,6 +132,12 @@ function mergeConflictResolutionInputSchema(): Record<string, unknown> {
       "idempotencyKey",
     ],
     properties: {
+      finalDisposition: {
+        type: "string",
+        minLength: 1,
+        description:
+          "Complete standalone final response for this conflict-repair run. Symphony stores this text untruncated and writes it verbatim to Linear; return the same text as the terminal assistant response after the handoff is accepted.",
+      },
       resolutionStatus: {
         type: "string",
         enum: ["resolved", "still_conflicted", "blocked"],

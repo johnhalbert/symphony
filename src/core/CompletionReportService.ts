@@ -38,7 +38,12 @@ import type {
 import { OPERATOR_REJECTED_PUBLICATION_ERROR } from "./approval/OperatorApprovalService.js";
 import type { Issue, Workspace } from "./types.js";
 import {
+  inspectAcceptedArtifactManifestAtHead,
+  inspectAcceptedArtifactWorktreePath,
+} from "./AcceptedArtifactManifestVerification.js";
+import {
   planCompletionReportAcceptedWritebacks,
+  planCompletionReportDispositionOnlyWriteback,
   planCompletionReportRejectedWritebacks,
   planCompletionReportPublicationApprovalPendingWritebacks,
   planCompletionReportPublicationApprovalTerminalWritebacks,
@@ -53,6 +58,7 @@ import type {
   WritebackProcessor,
   WritebackStatus,
 } from "./writeback/WritebackOutbox.js";
+import { bindWritebackOperationToLifecycle } from "./writeback/WritebackOutbox.js";
 
 export const PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON = "publication approval setup incomplete";
 export const PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON = "awaiting operator approval for PR publication";
@@ -69,6 +75,7 @@ class PullRequestPublicationFailure extends Error {
 const completionReportSchema = z.object({
   runId: z.string().trim().min(1),
   issueId: z.string().trim().min(1),
+  finalDisposition: z.string().min(1).refine((value) => value.trim().length > 0, "Final disposition cannot be blank"),
   summary: z.string().trim().min(1),
   validationEvidence: z.array(z.string().trim().min(1)).min(1),
   acceptanceChecklist: z
@@ -113,6 +120,9 @@ const completionReportSchema = z.object({
 });
 
 export type CompletionReportInput = z.infer<typeof completionReportSchema>;
+type LegacyCompatibleCompletionReportInput = Omit<CompletionReportInput, "finalDisposition"> & {
+  finalDisposition?: string;
+};
 export type CompletionReportSubmitterRole = "worker" | "orchestrator" | "reviewer" | string;
 type ExistingIssueLifecycle = Awaited<ReturnType<IssueLifecycleStore["get"]>>;
 type ExistingRunRecord = Awaited<ReturnType<RunTranscriptStore["getRun"]>>;
@@ -301,7 +311,10 @@ export class CompletionReportService {
     assertCompletionContractHasNotDrifted(existing, contractSnapshot);
     const inputPullRequest = normalizeInputPullRequest(report.pullRequest, report.branchName);
     const localSnapshot = await captureCompletionReportLocalGitSnapshot(report, context, existingLifecycle, this.options.config);
-    if (existing && isFinalizedCompletionReport(existing)) {
+    if (
+      existing &&
+      isFinalizedCompletionReport(existing, existingLifecycle)
+    ) {
       const currentAcceptanceContext = buildCompletionReportAcceptanceContext({
         report,
         context,
@@ -310,6 +323,7 @@ export class CompletionReportService {
         baseRefObservation: null,
         localSnapshot,
       });
+      assertCompletionFinalDispositionReplayAllowed(existing, report);
       if (
         completionReplayMatchesAuthoritativeState(existing, currentAcceptanceContext) &&
         completionReplayMatchesDeliveryEvidence(existing, report, contractSnapshot)
@@ -368,7 +382,7 @@ export class CompletionReportService {
           storedReport,
           storedPublicationInput: publicationInput,
         });
-        const pendingOperations = planCompletionReportPublicationApprovalPendingWritebacks(
+        const rawPendingOperations = planCompletionReportPublicationApprovalPendingWritebacks(
           runWritebackContext(storedContext, storedReport.runId),
           this.options.config,
           completionReportWritebackDetails(storedReport, storedContext.issue, storedInputPullRequest),
@@ -379,11 +393,35 @@ export class CompletionReportService {
             title: publicationInput.title,
           },
         );
+        const registeredPendingReport = {
+          ...pendingReport,
+          writebackOperationKeys: [
+            ...new Set([
+              ...pendingReport.writebackOperationKeys,
+              ...rawPendingOperations.map(
+                (operation) => operation.idempotencyKey,
+              ),
+            ]),
+          ],
+        };
+        const pendingOperations = rawPendingOperations.map((operation) =>
+          bindWritebackOperationToLifecycle(operation, {
+            kind: "completion_report",
+            recordId: pendingReport.id,
+          }),
+        );
         for (const operation of pendingOperations) {
           enqueuedPendingOperations.push(await this.options.writebackOutbox.enqueueOnce(operation));
         }
+        await this.options.lifecycleStore.updateIssue(storedContext.issue, {
+          lastCompletionReportId: registeredPendingReport.id,
+          completionReports: upsertCompletionReport(
+            pendingPublicationHandoff.lifecycle.completionReports,
+            registeredPendingReport,
+          ),
+        });
         await this.processAndVerifyPendingPublicationApprovalWritebacks(pendingOperations);
-        const existingApproval = await this.currentPublicationApproval(pendingReport, run.pendingApprovalRequestId ?? null);
+        const existingApproval = await this.currentPublicationApproval(registeredPendingReport, run.pendingApprovalRequestId ?? null);
         const approvalRequest =
           existingApproval ?? (await this.requestPublicationApproval(storedReport, storedContext, publicationInput));
         if (approvalRequest.status === "pending") {
@@ -395,7 +433,7 @@ export class CompletionReportService {
         }
         return this.waitForServiceOwnedPublicationApproval({
           approvalRequest,
-          pendingReport,
+          pendingReport: registeredPendingReport,
           pendingOperations: enqueuedPendingOperations,
           report: storedReport,
           context: storedContext,
@@ -404,7 +442,7 @@ export class CompletionReportService {
       }
 
       const publicationInput = this.buildPublicationInput(report, context, existingLifecycle);
-      const pendingOperations = planCompletionReportPublicationApprovalPendingWritebacks(
+      const rawPendingOperations = planCompletionReportPublicationApprovalPendingWritebacks(
         runWritebackContext(context, report.runId),
         this.options.config,
         completionReportWritebackDetails(report, context.issue, inputPullRequest),
@@ -429,8 +467,16 @@ export class CompletionReportService {
         }),
         contractSnapshot,
         acceptedAt: existing?.acceptedAt ?? null,
-        writebackOperationKeys: [],
+        writebackOperationKeys: rawPendingOperations.map(
+          (operation) => operation.idempotencyKey,
+        ),
       });
+      const pendingOperations = rawPendingOperations.map((operation) =>
+        bindWritebackOperationToLifecycle(operation, {
+          kind: "completion_report",
+          recordId: pendingReport.id,
+        }),
+      );
       for (const operation of pendingOperations) {
         enqueuedPendingOperations.push(await this.options.writebackOutbox.enqueueOnce(operation));
       }
@@ -512,7 +558,7 @@ export class CompletionReportService {
       existing.runId !== input.approval.runId ||
       existing.idempotencyKey !== input.approval.evidenceCursor
     ) return null;
-    if (isFinalizedCompletionReport(existing)) {
+    if (isFinalizedCompletionReport(existing, lifecycle)) {
       return { accepted: true, replayed: true, report: existing, writebackOperations: [] };
     }
     const pendingReport = pendingPublicationHandoffForRun(lifecycle, {
@@ -582,7 +628,12 @@ export class CompletionReportService {
     const existing = lifecycle === null
       ? null
       : latestCurrentCompletionReport(lifecycle);
-    if (!lifecycle || !existing || isFinalizedCompletionReport(existing)) return [];
+    if (
+      !lifecycle ||
+      !existing ||
+      isFinalizedCompletionReport(existing, lifecycle)
+    )
+      return [];
     if (
       existing.runId !== input.approval.runId ||
       existing.idempotencyKey !== input.approval.evidenceCursor
@@ -658,7 +709,7 @@ export class CompletionReportService {
     const inputPullRequest = normalizeInputPullRequest(report.pullRequest, report.branchName);
     const publicationInput = this.buildPublicationInput(report, context, handoffLifecycle);
     const existingApproval = await this.currentPublicationApproval(pendingReport, run.pendingApprovalRequestId ?? null);
-    const pendingOperations = planCompletionReportPublicationApprovalPendingWritebacks(
+    const rawPendingOperations = planCompletionReportPublicationApprovalPendingWritebacks(
       runWritebackContext(context, report.runId),
       this.options.config,
       completionReportWritebackDetails(report, context.issue, inputPullRequest),
@@ -669,12 +720,40 @@ export class CompletionReportService {
         title: publicationInput.title,
       },
     );
+    const registeredPendingReport: IssueCompletionReportRecord = {
+      ...pendingReport,
+      writebackOperationKeys: [
+        ...new Set([
+          ...pendingReport.writebackOperationKeys,
+          ...rawPendingOperations.map(
+            (operation) => operation.idempotencyKey,
+          ),
+        ]),
+      ],
+    };
+    const pendingOperations = rawPendingOperations.map((operation) =>
+      bindWritebackOperationToLifecycle(operation, {
+        kind: "completion_report",
+        recordId: registeredPendingReport.id,
+      }),
+    );
+    await this.options.lifecycleStore.updateIssue(context.issue, {
+      lastCompletionReportId: registeredPendingReport.id,
+      completionReports: upsertCompletionReport(
+        handoffLifecycle.completionReports,
+        registeredPendingReport,
+      ),
+    });
 
     try {
       await this.processAndVerifyPendingPublicationApprovalWritebacks(pendingOperations);
     } catch (error) {
       if (error instanceof SymphonyError && error.code === "tracker_error") {
-        return { recovered: false, reason: "audit_not_settled", report: pendingReport };
+        return {
+          recovered: false,
+          reason: "audit_not_settled",
+          report: registeredPendingReport,
+        };
       }
       throw error;
     }
@@ -686,24 +765,45 @@ export class CompletionReportService {
         phase: "blocked",
         blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
       });
-      return { recovered: true, approvalRequest, report: pendingReport, outcome: "pending" };
+      return {
+        recovered: true,
+        approvalRequest,
+        report: registeredPendingReport,
+        outcome: "pending",
+      };
     }
     if (approvalRequest.status === "approved") {
       const result = await this.resumeApprovedPublication({ approval: approvalRequest, issue: input.issue });
       if (!result) {
-        return { recovered: false, reason: "approval_not_pending", report: pendingReport };
+        return {
+          recovered: false,
+          reason: "approval_not_pending",
+          report: registeredPendingReport,
+        };
       }
-      return { recovered: true, report: pendingReport, outcome: "approved" };
+      return {
+        recovered: true,
+        report: registeredPendingReport,
+        outcome: "approved",
+      };
     }
     if (isTerminalApprovalStatus(approvalRequest.status)) {
       await this.recordPublicationApprovalTerminal({ approval: approvalRequest, issue: input.issue });
-      return { recovered: true, report: pendingReport, outcome: "terminal" };
+      return {
+        recovered: true,
+        report: registeredPendingReport,
+        outcome: "terminal",
+      };
     }
-    return { recovered: false, reason: "approval_not_pending", report: pendingReport };
+    return {
+      recovered: false,
+      reason: "approval_not_pending",
+      report: registeredPendingReport,
+    };
   }
 
   private async finalizeCompletionReport(input: {
-    report: CompletionReportInput;
+    report: LegacyCompatibleCompletionReportInput;
     context: CompletionReportActiveContext;
     inputPullRequest: CompletionReportPullRequestRef | null;
     publication: CompletionReportPullRequestPublication | null;
@@ -752,7 +852,7 @@ export class CompletionReportService {
     });
     const writebackContext = runWritebackContext(input.context, input.report.runId);
     const writebackReport = completionReportWritebackDetails(input.report, input.context.issue, pullRequest);
-    const operations = acceptedArtifact
+    let operations = acceptedArtifact
       ? verifiedPullRequest && input.report.artifactEvidence
         ? planAcceptedArtifactHandoffWritebacks(writebackContext, this.options.config, {
             pullRequest: verifiedPullRequest,
@@ -769,6 +869,17 @@ export class CompletionReportService {
           })
         : []
         : planCompletionReportAcceptedWritebacks(writebackContext, this.options.config, writebackReport);
+    if (
+      operations.length === 0 &&
+      input.context.ignoreStateGate === true &&
+      !this.options.config.github.prHandoff.enabled
+    ) {
+      operations = planCompletionReportDispositionOnlyWriteback(
+        writebackContext,
+        this.options.config,
+        writebackReport,
+      );
+    }
     if (operations.length === 0) {
       if (input.context.ignoreStateGate !== true || this.options.config.github.prHandoff.enabled) {
         throw new SymphonyError(
@@ -795,11 +906,22 @@ export class CompletionReportService {
         localSnapshot: acceptedLocalSnapshot,
       }),
       contractSnapshot: input.contractSnapshot,
-      writebackOperationKeys: operations.map((operation) => operation.idempotencyKey),
+      writebackOperationKeys: [
+        ...new Set([
+          ...(input.existing?.writebackOperationKeys ?? []),
+          ...operations.map((operation) => operation.idempotencyKey),
+        ]),
+      ],
       acceptedAt: input.existing?.acceptedAt ?? null,
     });
+    const boundOperations = operations.map((operation) =>
+      bindWritebackOperationToLifecycle(operation, {
+        kind: "completion_report",
+        recordId: storedReport.id,
+      }),
+    );
     const enqueued: WritebackOperation[] = [];
-    for (const operation of operations) {
+    for (const operation of boundOperations) {
       enqueued.push(await this.options.writebackOutbox.enqueueOnce(operation));
     }
     await this.recordPullRequestMetadata(input.context, input.publication);
@@ -845,16 +967,26 @@ export class CompletionReportService {
     existingLifecycle: ExistingIssueLifecycle;
     rejection: CompletionReportReadinessRejection;
   }): Promise<never> {
+    const existingRejection = (
+      input.existingLifecycle?.completionReportRejections ?? []
+    ).find(
+      (candidate) =>
+        candidate.runId === input.report.runId &&
+        candidate.idempotencyKey === input.report.idempotencyKey,
+    );
+    if (existingRejection !== undefined) {
+      assertCompletionRejectionFinalDispositionReplayAllowed(
+        existingRejection,
+        input.report,
+      );
+      throwCompletionReportRejection(existingRejection, []);
+    }
     const inputPullRequest = normalizeInputPullRequest(input.report.pullRequest, input.report.branchName);
     const writebackDetails = completionReportWritebackDetails(input.report, input.context.issue, inputPullRequest);
     const operations = planCompletionReportRejectedWritebacks(runWritebackContext(input.context, input.report.runId), this.options.config, {
       reason: input.rejection.reason,
       report: writebackDetails,
     });
-    const enqueued: WritebackOperation[] = [];
-    for (const operation of operations) {
-      enqueued.push(await this.options.writebackOutbox.enqueueOnce(operation));
-    }
     const rejectedReport = buildCompletionReportRejectionRecord({
       report: input.report,
       issue: input.context.issue,
@@ -863,6 +995,16 @@ export class CompletionReportService {
       rejection: input.rejection,
       writebackOperationKeys: operations.map((operation) => operation.idempotencyKey),
     });
+    const boundOperations = operations.map((operation) =>
+      bindWritebackOperationToLifecycle(operation, {
+        kind: "completion_report_rejection",
+        recordId: rejectedReport.id,
+      }),
+    );
+    const enqueued: WritebackOperation[] = [];
+    for (const operation of boundOperations) {
+      enqueued.push(await this.options.writebackOutbox.enqueueOnce(operation));
+    }
     const lifecycle = await this.options.lifecycleStore.ensureIssue(input.context.issue, {
       lastCompletionReportRejectionId: rejectedReport.id,
       completionReportRejections: upsertCompletionReportRejection(
@@ -872,13 +1014,10 @@ export class CompletionReportService {
       summaryPointers: rejectionSummaryPointersFor(input.context, inputPullRequest, input.existingLifecycle),
     });
     await appendLaneMemoTelemetry(this.options.runStore, input.context.activeRunId, lifecycle, "completion_report_rejection");
-    throw new SymphonyError("invalid_request", input.rejection.reason, {
-      reasonCode: input.rejection.reasonCode,
-      rejectionId: rejectedReport.id,
-      reportId: rejectedReport.reportId,
-      unsatisfiedAcceptanceChecklist: input.rejection.unsatisfiedAcceptanceChecklist,
-      writebackOperationKeys: enqueued.map((operation) => operation.idempotencyKey),
-    });
+    throwCompletionReportRejection(
+      rejectedReport,
+      enqueued.map((operation) => operation.idempotencyKey),
+    );
   }
 
   private validateCaller(report: CompletionReportInput, context: CompletionReportActiveContext): void {
@@ -1000,7 +1139,7 @@ export class CompletionReportService {
   }
 
   private async requestPublicationApproval(
-    report: CompletionReportInput,
+    report: LegacyCompatibleCompletionReportInput,
     context: CompletionReportActiveContext,
     publicationInput: CompletionReportPullRequestPublicationInput,
   ): Promise<OperatorApprovalRecord> {
@@ -1061,7 +1200,7 @@ export class CompletionReportService {
     approvalRequest: OperatorApprovalRecord;
     pendingReport: IssueCompletionReportRecord;
     pendingOperations: WritebackOperation[];
-    report: CompletionReportInput;
+    report: LegacyCompatibleCompletionReportInput;
     context: CompletionReportActiveContext;
     inputPullRequest: CompletionReportPullRequestRef | null;
   }): Promise<CompletionReportResult> {
@@ -1082,7 +1221,10 @@ export class CompletionReportService {
             "Approved completion report is no longer the current lifecycle evidence",
           );
         }
-        if (finalized && isFinalizedCompletionReport(finalized)) {
+        if (
+          finalized &&
+          isFinalizedCompletionReport(finalized, lifecycle)
+        ) {
           return { accepted: true, replayed: true, report: finalized, writebackOperations: [] };
         }
       }
@@ -1099,7 +1241,7 @@ export class CompletionReportService {
   }
 
   private buildPublicationInput(
-    report: CompletionReportInput,
+    report: LegacyCompatibleCompletionReportInput,
     context: CompletionReportActiveContext,
     existingLifecycle: ExistingIssueLifecycle,
   ): CompletionReportPullRequestPublicationInput {
@@ -1216,7 +1358,7 @@ export class CompletionReportService {
 
   private async recordPublicationApprovalTerminalIfNeeded(
     error: unknown,
-    report: CompletionReportInput,
+    report: LegacyCompatibleCompletionReportInput,
     context: CompletionReportActiveContext,
     pullRequest: CompletionReportPullRequestRef | null,
   ): Promise<boolean> {
@@ -1228,7 +1370,7 @@ export class CompletionReportService {
 
   private async enqueuePublicationApprovalTerminal(
     approval: OperatorApprovalRecord,
-    report: CompletionReportInput,
+    report: LegacyCompatibleCompletionReportInput,
     context: CompletionReportActiveContext,
     pullRequest: CompletionReportPullRequestRef | null,
   ): Promise<WritebackOperation[]> {
@@ -1344,7 +1486,7 @@ function isAcceptedArtifactContract(
 }
 
 async function validateCompletionDeliveryEvidence(input: {
-  report: CompletionReportInput;
+  report: LegacyCompatibleCompletionReportInput;
   contractSnapshot: IssueContractSnapshot | null;
   lifecycle: ExistingIssueLifecycle;
   lifecycleStore: Pick<IssueLifecycleStore, "get">;
@@ -1550,6 +1692,59 @@ function completionReplayMatchesDeliveryEvidence(
   );
 }
 
+function assertCompletionFinalDispositionReplayAllowed(
+  existing: IssueCompletionReportRecord,
+  report: CompletionReportInput,
+): void {
+  if (existing.finalDisposition === undefined || existing.finalDisposition === report.finalDisposition) return;
+  throw new SymphonyError(
+    "conflict",
+    "Completion report idempotency key was reused with a different final disposition",
+    {
+      reportId: existing.id,
+      runId: report.runId,
+      idempotencyKey: report.idempotencyKey,
+    },
+  );
+}
+
+function assertCompletionRejectionFinalDispositionReplayAllowed(
+  existing: IssueCompletionReportRejectionRecord,
+  report: CompletionReportInput,
+): void {
+  if (
+    existing.finalDisposition === undefined ||
+    existing.finalDisposition === report.finalDisposition
+  ) {
+    return;
+  }
+  throw new SymphonyError(
+    "conflict",
+    "Rejected completion report idempotency key was reused with a different final disposition",
+    {
+      rejectionId: existing.id,
+      reportId: existing.reportId,
+      runId: report.runId,
+      idempotencyKey: report.idempotencyKey,
+    },
+  );
+}
+
+function throwCompletionReportRejection(
+  rejection: IssueCompletionReportRejectionRecord,
+  writebackOperationKeys: string[],
+): never {
+  throw new SymphonyError("invalid_request", rejection.reason, {
+    reasonCode: rejection.reasonCode,
+    rejectionId: rejection.id,
+    reportId: rejection.reportId,
+    unsatisfiedAcceptanceChecklist: rejection.acceptanceChecklist
+      .filter((item) => !item.satisfied)
+      .map((item) => ({ text: item.text, evidence: item.evidence })),
+    writebackOperationKeys,
+  });
+}
+
 function normalizeArtifactEvidence(
   evidence: CompletionReportInput["artifactEvidence"],
 ): ExpectedRedArtifactEvidence | null {
@@ -1607,7 +1802,18 @@ function reportRejectionIdFor(issueId: string, idempotencyKey: string): string {
   return `completion-report-rejection:${issueId}:${idempotencyKey}`;
 }
 
-export function isFinalizedCompletionReport(report: IssueCompletionReportRecord): boolean {
+export function isFinalizedCompletionReport(
+  report: IssueCompletionReportRecord,
+  lifecycle?: IssueLifecycleRecord | null,
+): boolean {
+  if (
+    lifecycle !== undefined &&
+    lifecycle !== null &&
+    lifecycle.lastCompletionReportId === report.id &&
+    isPendingPublicationApprovalReason(lifecycle.blockedReason)
+  ) {
+    return false;
+  }
   return report.writebackOperationKeys.length > 0;
 }
 
@@ -1629,7 +1835,9 @@ export function isAwaitingPublicationApprovalLifecycle(
 
 export function pendingPublicationReport(lifecycle: IssueLifecycleRecord): IssueCompletionReportRecord | null {
   const current = latestCurrentCompletionReport(lifecycle);
-  return current !== null && !isFinalizedCompletionReport(current) ? current : null;
+  return current !== null && !isFinalizedCompletionReport(current, lifecycle)
+    ? current
+    : null;
 }
 
 export function pendingPublicationHandoffForRun(
@@ -1676,7 +1884,7 @@ function findCompletionReportForRun(
 }
 
 function buildCompletionReportRecord(input: {
-  report: CompletionReportInput;
+  report: LegacyCompatibleCompletionReportInput;
   issue: Issue;
   pullRequest: CompletionReportPullRequestRef | null;
   acceptanceContext: CompletionReportAcceptanceContext | null;
@@ -1690,6 +1898,9 @@ function buildCompletionReportRecord(input: {
     runId: input.report.runId,
     issueId: input.issue.id,
     issueIdentifier: input.issue.identifier,
+    ...(input.report.finalDisposition === undefined
+      ? {}
+      : { finalDisposition: input.report.finalDisposition }),
     summary: input.report.summary,
     validationEvidence: input.report.validationEvidence,
     acceptanceChecklist: normalizeChecklist(input.report.acceptanceChecklist),
@@ -1707,7 +1918,7 @@ function buildCompletionReportRecord(input: {
 }
 
 function buildCompletionReportAcceptanceContext(input: {
-  report: CompletionReportInput;
+  report: LegacyCompatibleCompletionReportInput;
   context: CompletionReportActiveContext;
   pullRequest: CompletionReportPullRequestRef | null;
   publication: CompletionReportPullRequestPublication | null;
@@ -1801,6 +2012,7 @@ function buildCompletionReportRejectionRecord(input: {
     issueIdentifier: input.issue.identifier,
     reasonCode: input.rejection.reasonCode,
     reason: input.rejection.reason,
+    finalDisposition: input.report.finalDisposition,
     summary: input.report.summary,
     validationEvidence: input.report.validationEvidence,
     acceptanceChecklist: normalizeChecklist(input.report.acceptanceChecklist),
@@ -1873,7 +2085,7 @@ function rejectionSummaryPointersFor(
 }
 
 async function captureCompletionReportLocalGitSnapshot(
-  report: CompletionReportInput,
+  report: LegacyCompatibleCompletionReportInput,
   context: CompletionReportActiveContext,
   existingLifecycle: ExistingIssueLifecycle,
   config: ServiceConfig,
@@ -1986,70 +2198,56 @@ function runGit(workspacePath: string, args: string[]): Promise<string | null> {
 export async function verifyDependencyArtifactManifest(
   input: DependencyArtifactManifestVerificationInput,
 ): Promise<void> {
-  const manifest = input.artifact.fileManifest;
-  if (manifest.length === 0) {
+  const failure = await inspectAcceptedArtifactManifestAtHead({
+    manifest: input.artifact.fileManifest,
+    runGit: (args) => runGit(input.workspacePath, args),
+    inspectWorktreePath: (filePath) =>
+      inspectAcceptedArtifactWorktreePath(input.workspacePath, filePath),
+  });
+  if (failure === null) return;
+  if (failure.kind === "empty_manifest") {
     throw new SymphonyError(
       "conflict",
       "Accepted-artifact manifest is empty and cannot be verified",
     );
   }
-  const literalPaths = manifest.map((entry) => `:(literal)${entry.path}`);
-  const status = await runGit(input.workspacePath, [
-    "status",
-    "--porcelain=v1",
-    "-z",
-    "--untracked-files=all",
-    "--",
-    ...literalPaths,
-  ]);
-  if (status === null) {
+  if (failure.kind === "invalid_manifest") {
+    throw new SymphonyError("conflict", failure.message);
+  }
+  if (failure.kind === "worktree_inspection_failed") {
     throw new SymphonyError(
       "conflict",
       "Unable to inspect inherited accepted-artifact files in the implementation worktree",
     );
   }
-  if (status.length > 0) {
+  if (failure.kind === "worktree_dirty") {
     throw new SymphonyError(
       "conflict",
       "Inherited accepted-artifact files have uncommitted changes",
     );
   }
-
-  for (const entry of manifest) {
-    const treeEntry = await runGit(input.workspacePath, [
-      "ls-tree",
-      "-z",
-      "HEAD",
-      "--",
-      `:(literal)${entry.path}`,
-    ]);
-    if (treeEntry === null) {
-      throw new SymphonyError(
-        "conflict",
-        `Unable to inspect inherited accepted-artifact file ${entry.path}`,
-      );
-    }
-    const tab = treeEntry.indexOf("\t");
-    const actualBlob =
-      tab < 0
-        ? null
-        : (treeEntry.slice(0, tab).trim().split(/\s+/)[2] ?? null);
-    if (entry.status === "deleted") {
-      if (actualBlob !== null) {
-        throw new SymphonyError(
-          "conflict",
-          `Inherited accepted-artifact deleted path ${entry.path} was restored`,
-        );
-      }
-      continue;
-    }
-    if (actualBlob?.toLowerCase() !== entry.blobSha?.toLowerCase()) {
-      throw new SymphonyError(
-        "conflict",
-        `Inherited accepted-artifact file ${entry.path} no longer matches the reviewed checkpoint`,
-      );
-    }
+  if (failure.kind === "tree_inspection_failed") {
+    throw new SymphonyError(
+      "conflict",
+      `Unable to inspect inherited accepted-artifact file ${failure.path}`,
+    );
   }
+  if (failure.kind === "deleted_path_present") {
+    throw new SymphonyError(
+      "conflict",
+      `Inherited accepted-artifact deleted path ${failure.path} was restored`,
+    );
+  }
+  if (failure.kind === "mode_mismatch") {
+    throw new SymphonyError(
+      "conflict",
+      `Inherited accepted-artifact file ${failure.path} no longer has its reviewed Git mode`,
+    );
+  }
+  throw new SymphonyError(
+    "conflict",
+    `Inherited accepted-artifact file ${failure.path} no longer matches the reviewed checkpoint`,
+  );
 }
 
 function normalizeChecklist(items: CompletionReportInput["acceptanceChecklist"]): CompletionReportChecklistItem[] {
@@ -2139,13 +2337,14 @@ function runWritebackContext(context: CompletionReportActiveContext, runId: stri
 }
 
 function completionReportWritebackDetails(
-  report: CompletionReportInput,
+  report: LegacyCompatibleCompletionReportInput,
   issue: Issue,
   pullRequest: CompletionReportPullRequestRef | null,
 ) {
   return {
     reportId: reportIdFor(issue.id, report.idempotencyKey, report.runId),
     idempotencyKey: report.idempotencyKey,
+    ...(report.finalDisposition === undefined ? {} : { finalDisposition: report.finalDisposition }),
     summary: report.summary,
     validationEvidence: report.validationEvidence,
     acceptanceChecklist: report.acceptanceChecklist,
@@ -2159,10 +2358,16 @@ function completionReportWritebackDetails(
 function assertPendingPublicationReplayMatches(input: {
   incomingReport: CompletionReportInput;
   incomingPublicationInput: CompletionReportPullRequestPublicationInput;
-  storedReport: CompletionReportInput;
+  storedReport: LegacyCompatibleCompletionReportInput;
   storedPublicationInput: CompletionReportPullRequestPublicationInput;
 }): void {
   const mismatchedFields: string[] = [];
+  if (
+    input.storedReport.finalDisposition !== undefined &&
+    input.incomingReport.finalDisposition !== input.storedReport.finalDisposition
+  ) {
+    mismatchedFields.push("finalDisposition");
+  }
   if (input.incomingReport.summary !== input.storedReport.summary) mismatchedFields.push("summary");
   if (!sameStringSet(input.incomingReport.changedFiles, input.storedReport.changedFiles)) mismatchedFields.push("changedFiles");
   if (input.incomingReport.branchName !== input.storedReport.branchName) mismatchedFields.push("branchName");
@@ -2216,10 +2421,11 @@ function sameJson(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
-function completionReportInputFromRecord(record: IssueCompletionReportRecord): CompletionReportInput {
+function completionReportInputFromRecord(record: IssueCompletionReportRecord): LegacyCompatibleCompletionReportInput {
   return {
     runId: record.runId,
     issueId: record.issueId,
+    ...(record.finalDisposition === undefined ? {} : { finalDisposition: record.finalDisposition }),
     summary: record.summary,
     validationEvidence: record.validationEvidence,
     acceptanceChecklist: record.acceptanceChecklist,
@@ -2275,7 +2481,7 @@ function approvalRecordFromDetails(details: unknown): OperatorApprovalRecord | n
   return typeof record.requestId === "string" && typeof record.status === "string" ? (record as OperatorApprovalRecord) : null;
 }
 
-function formatPullRequestBody(report: CompletionReportInput, context: CompletionReportActiveContext): string {
+function formatPullRequestBody(report: LegacyCompatibleCompletionReportInput, context: CompletionReportActiveContext): string {
   const artifactEvidence = report.artifactEvidence;
   return [
     artifactEvidence
@@ -2309,7 +2515,7 @@ function formatPullRequestBody(report: CompletionReportInput, context: Completio
 }
 
 function shouldForceFreshHeadForNoChangeMergeGateRepair(
-  report: CompletionReportInput,
+  report: LegacyCompatibleCompletionReportInput,
   lifecycle: ExistingIssueLifecycle,
 ): boolean {
   if (report.changedFiles.length > 0) return false;

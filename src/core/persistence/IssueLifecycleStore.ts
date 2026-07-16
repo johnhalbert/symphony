@@ -82,6 +82,7 @@ export interface IssueBreakdownPlanRecord {
   runId: string;
   issueId: string;
   issueIdentifier: string;
+  finalDisposition?: string;
   summary: string;
   proposedIssues: ProposedIssueRecord[];
   transcriptPointers: string[];
@@ -193,6 +194,7 @@ export interface IssueCompletionReportRecord extends LifecycleSupersessionFields
   runId: string;
   issueId: string;
   issueIdentifier: string;
+  finalDisposition?: string;
   summary: string;
   validationEvidence: string[];
   acceptanceChecklist: CompletionReportChecklistItem[];
@@ -217,6 +219,7 @@ export interface IssueCompletionReportRejectionRecord {
   issueIdentifier: string;
   reasonCode: IssueCompletionReportRejectionReasonCode;
   reason: string;
+  finalDisposition?: string;
   summary: string;
   validationEvidence: string[];
   acceptanceChecklist: CompletionReportChecklistItem[];
@@ -300,12 +303,14 @@ export interface IssueReviewVerdictRecord extends LifecycleSupersessionFields {
   issueIdentifier: string;
   verdict: IssueReviewVerdict;
   passDisposition?: "merge" | "accepted_artifact" | null;
+  finalDisposition?: string;
   acceptanceResults: ReviewVerdictAcceptanceResult[];
   findings: string[];
   gateFindings: ReviewGateFindingRecord[];
   discoveryFindings: ReviewDiscoveryFindingRecord[];
   evidence: string[];
   reviewer: string | null;
+  blockerProvenanceId?: string | null;
   submittedAt: string;
   writebackOperationKeys: string[];
 }
@@ -320,12 +325,14 @@ export interface IssueReviewVerdictSubmissionRecord {
   issueIdentifier: string;
   verdict: IssueReviewVerdict;
   passDisposition?: "merge" | "accepted_artifact" | null;
+  finalDisposition?: string;
   acceptanceResults: ReviewVerdictAcceptanceResult[];
   findings: string[];
   gateFindings: ReviewGateFindingRecord[];
   discoveryFindings: ReviewDiscoveryFindingRecord[];
   evidence: string[];
   reviewer: string | null;
+  blockerProvenanceId?: string | null;
   submittedAt: string;
   status: IssueReviewVerdictSubmissionStatus;
   ignoreStateGate: boolean;
@@ -333,6 +340,49 @@ export interface IssueReviewVerdictSubmissionRecord {
   acceptedVerdictId: string | null;
   supersededAt: string | null;
   supersededReason: string | null;
+}
+
+export type IssueBlockerProvenanceCode =
+  | "base_ref_drift"
+  | "base_ref_verification_failure";
+
+export type IssueBlockerProvenanceResolution =
+  | "base_ref_repair"
+  | "base_ref_recheck"
+  | "superseded";
+
+export type IssueBlockerProvenanceRecoveryKind =
+  | "automatic_rebase"
+  | "automatic_recheck"
+  | "operator_triage";
+
+export interface IssueBlockerProvenanceRecord {
+  version: 1;
+  id: string;
+  code: IssueBlockerProvenanceCode;
+  recoveryKind: IssueBlockerProvenanceRecoveryKind;
+  sourceKind: "base_ref_observation";
+  initialObservationFingerprint: string;
+  initialClassification: IssueBaseRefObservation["classification"];
+  initialLiveBaseHeadSha: string | null;
+  initialWorktreeHeadSha: string | null;
+  sourceObservationFingerprint: string;
+  classification: IssueBaseRefObservation["classification"];
+  operation: string;
+  runId: string;
+  issueId: string;
+  issueIdentifier: string;
+  pullRequestNumber: number | null;
+  pullRequestHeadSha: string | null;
+  baseRef: string | null;
+  liveBaseHeadSha: string | null;
+  worktreeHeadSha: string | null;
+  observationAttempt: number;
+  lastObservedAt: string;
+  reviewVerdictId: string | null;
+  createdAt: string;
+  resolvedAt: string | null;
+  resolution: IssueBlockerProvenanceResolution | null;
 }
 
 export type PullRequestReviewFeedbackKind = "review" | "review_comment" | "issue_comment";
@@ -409,6 +459,7 @@ export interface IssueTriageReportRecord extends LifecycleSupersessionFields {
   issueId: string;
   issueIdentifier: string;
   triggerFingerprint: string;
+  finalDisposition?: string;
   disposition: IssueTriageDisposition;
   confidence: IssueTriageConfidence;
   summary: string;
@@ -466,6 +517,7 @@ export interface IssuePostMortemReportRecord {
   issueId: string;
   issueIdentifier: string;
   triggerFingerprint: string;
+  finalDisposition?: string;
   summary: string;
   completionJudgment: IssuePostMortemCompletionJudgmentRecord;
   specificationAssessment: IssuePostMortemSpecificationAssessmentRecord;
@@ -695,6 +747,7 @@ export interface IssueMergeConflictResolutionReportRecord {
   runId: string;
   issueId: string;
   issueIdentifier: string;
+  finalDisposition?: string;
   resolutionStatus: "resolved" | "still_conflicted" | "blocked";
   summary: string;
   validationEvidence: string[];
@@ -707,6 +760,7 @@ export interface IssueMergeConflictResolutionReportRecord {
   blockedReason: string | null;
   risks: string[];
   submittedAt: string;
+  writebackOperationKeys: string[];
 }
 
 export interface IssueMergeConflictMetadata {
@@ -723,6 +777,7 @@ export interface IssueMergeConflictMetadata {
   conflictsState: string;
   reason: string;
   mergeableState: string | null;
+  blockerProvenanceId?: string | null;
   servicePreparation: IssueMergeConflictServicePreparation | null;
   detectedAt: string;
   updatedAt: string;
@@ -822,6 +877,8 @@ export interface IssueLifecycleRecord {
   reviewVerdictSubmissions?: IssueReviewVerdictSubmissionRecord[];
   mergeGateResults?: IssueMergeGateResultRecord[];
   reviewFeedback: IssueReviewFeedbackRecord[];
+  blockerProvenances?: IssueBlockerProvenanceRecord[];
+  activeBlockerProvenanceId?: string | null;
   issueTriageReports: IssueTriageReportRecord[];
   postMortemReports: IssuePostMortemReportRecord[];
   reviewEvidence: PullRequestReviewEvidenceState;
@@ -863,6 +920,8 @@ export interface IssueLifecyclePatch {
   reviewVerdictSubmissions?: IssueReviewVerdictSubmissionRecord[];
   mergeGateResults?: IssueMergeGateResultRecord[];
   reviewFeedback?: IssueReviewFeedbackRecord[];
+  blockerProvenances?: IssueBlockerProvenanceRecord[];
+  activeBlockerProvenanceId?: string | null;
   issueTriageReports?: IssueTriageReportRecord[];
   postMortemReports?: IssuePostMortemReportRecord[];
   reviewEvidence?: PullRequestReviewEvidenceState;
@@ -947,6 +1006,13 @@ export class FileIssueLifecycleStore {
         patch.reviewVerdictSubmissions ?? existing?.reviewVerdictSubmissions ?? [],
       mergeGateResults: patch.mergeGateResults ?? existing?.mergeGateResults ?? [],
       reviewFeedback: patch.reviewFeedback ?? existing?.reviewFeedback ?? [],
+      blockerProvenances:
+        patch.blockerProvenances ?? existing?.blockerProvenances ?? [],
+      activeBlockerProvenanceId: patchValue(
+        patch,
+        "activeBlockerProvenanceId",
+        existing?.activeBlockerProvenanceId ?? null,
+      ),
       issueTriageReports: patch.issueTriageReports ?? existing?.issueTriageReports ?? [],
       postMortemReports: patch.postMortemReports ?? existing?.postMortemReports ?? [],
       reviewEvidence: patch.reviewEvidence ?? existing?.reviewEvidence ?? defaultReviewEvidence(),
@@ -975,6 +1041,7 @@ export class FileIssueLifecycleStore {
       ...baseRecord,
       handoff: patch.handoff ?? buildIssueHandoffState(baseRecord),
     };
+    validateBlockerProvenanceRelations(record, this.recordPath(record.issueId));
     await this.write(record);
     this.notifyProjectionChanged();
     return record;
@@ -1482,6 +1549,11 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
     reviewVerdictSubmissions: normalizeReviewVerdictSubmissions(value.reviewVerdictSubmissions, filePath),
     mergeGateResults: normalizeMergeGateResults(value.mergeGateResults, filePath),
     reviewFeedback: normalizeReviewFeedback(value.reviewFeedback, filePath),
+    blockerProvenances: normalizeBlockerProvenances(value.blockerProvenances, filePath),
+    activeBlockerProvenanceId:
+      value.activeBlockerProvenanceId === undefined
+        ? null
+        : nullableString(value.activeBlockerProvenanceId, filePath, "activeBlockerProvenanceId"),
     issueTriageReports: normalizeIssueTriageReports(value.issueTriageReports, filePath),
     postMortemReports: normalizePostMortemReports(value.postMortemReports, filePath),
     reviewEvidence: normalizeReviewEvidence(value.reviewEvidence, filePath),
@@ -1502,10 +1574,89 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
     createdAt: requiredString(value.createdAt, filePath, "createdAt"),
     updatedAt: requiredString(value.updatedAt, filePath, "updatedAt"),
   };
-  return {
+  const record: IssueLifecycleRecord = {
     ...normalized,
     handoff: normalizeHandoffState(value.handoff, normalized, filePath),
   };
+  validateBlockerProvenanceRelations(record, filePath);
+  return record;
+}
+
+function validateBlockerProvenanceRelations(
+  record: IssueLifecycleRecord,
+  filePath: string,
+): void {
+  const provenances = record.blockerProvenances ?? [];
+  const byId = new Map<string, IssueBlockerProvenanceRecord>();
+  for (const provenance of provenances) {
+    if (byId.has(provenance.id)) {
+      throw corruptLifecycle(filePath, `blockerProvenances contains duplicate id ${provenance.id}`);
+    }
+    if (provenance.issueId !== record.issueId) {
+      throw corruptLifecycle(
+        filePath,
+        `blocker provenance ${provenance.id} belongs to a different issue`,
+      );
+    }
+    if ((provenance.resolvedAt === null) !== (provenance.resolution === null)) {
+      throw corruptLifecycle(
+        filePath,
+        `blocker provenance ${provenance.id} has inconsistent resolution fields`,
+      );
+    }
+    byId.set(provenance.id, provenance);
+  }
+
+  const activeId = record.activeBlockerProvenanceId ?? null;
+  if (activeId !== null) {
+    const active = byId.get(activeId);
+    if (active === undefined) {
+      throw corruptLifecycle(filePath, `activeBlockerProvenanceId ${activeId} does not exist`);
+    }
+    if (active.resolvedAt !== null || active.resolution !== null) {
+      throw corruptLifecycle(filePath, `active blocker provenance ${activeId} is already resolved`);
+    }
+  }
+
+  const conflict = record.mergeConflict;
+  const carriedId = conflict?.blockerProvenanceId ?? null;
+  if (conflict === null || carriedId === null) return;
+  const carried = byId.get(carriedId);
+  if (carried === undefined) {
+    throw corruptLifecycle(filePath, `merge conflict blocker provenance ${carriedId} does not exist`);
+  }
+
+  const conflictIsResolved =
+    conflict.status === "resolved" || conflict.resolutionStatus === "resolved";
+  if (conflictIsResolved) {
+    if (
+      conflict.status !== "resolved" ||
+      conflict.resolutionStatus !== "resolved" ||
+      carried.resolvedAt === null ||
+      carried.resolution !== "base_ref_repair" ||
+      conflict.servicePreparation?.status !== "finalized" ||
+      conflict.resolvedHeadSha === null ||
+      conflict.servicePreparation.finalizedHeadSha !== conflict.resolvedHeadSha
+    ) {
+      throw corruptLifecycle(
+        filePath,
+        `resolved merge conflict has inconsistent blocker provenance ${carriedId}`,
+      );
+    }
+    return;
+  }
+
+  if (
+    activeId !== carriedId ||
+    carried.resolvedAt !== null ||
+    carried.resolution !== null ||
+    conflict.servicePreparation?.status !== "conflicted"
+  ) {
+    throw corruptLifecycle(
+      filePath,
+      `unfinished merge conflict has inconsistent blocker provenance ${carriedId}`,
+    );
+  }
 }
 
 function normalizeSummaryPointers(value: unknown, filePath: string): IssueLifecycleSummaryPointers {
@@ -1601,6 +1752,11 @@ function normalizeIssueBreakdownPlan(value: unknown, filePath: string, index: nu
     runId: requiredString(value.runId, filePath, `issueBreakdownPlans[${index}].runId`),
     issueId: requiredString(value.issueId, filePath, `issueBreakdownPlans[${index}].issueId`),
     issueIdentifier: requiredString(value.issueIdentifier, filePath, `issueBreakdownPlans[${index}].issueIdentifier`),
+    ...optionalFinalDispositionPatch(
+      value.finalDisposition,
+      filePath,
+      `issueBreakdownPlans[${index}].finalDisposition`,
+    ),
     summary: requiredString(value.summary, filePath, `issueBreakdownPlans[${index}].summary`),
     proposedIssues: normalizeProposedIssues(value.proposedIssues, filePath, index),
     transcriptPointers: requiredStringArray(value.transcriptPointers, filePath, `issueBreakdownPlans[${index}].transcriptPointers`),
@@ -1750,6 +1906,12 @@ function normalizeReviewFeedback(value: unknown, filePath: string): IssueReviewF
   return value.map((item, index) => normalizeReviewFeedbackRecord(item, filePath, index));
 }
 
+function normalizeBlockerProvenances(value: unknown, filePath: string): IssueBlockerProvenanceRecord[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw corruptLifecycle(filePath, "blockerProvenances is invalid");
+  return value.map((item, index) => normalizeBlockerProvenance(item, filePath, index));
+}
+
 function normalizeIssueTriageReports(value: unknown, filePath: string): IssueTriageReportRecord[] {
   if (value === undefined) return [];
   if (!Array.isArray(value)) throw corruptLifecycle(filePath, "issueTriageReports is invalid");
@@ -1843,6 +2005,150 @@ function normalizeBaseRefObservation(value: unknown, filePath: string): IssueBas
     reason: optionalNullableString(value.reason, filePath, "baseRefObservation.reason"),
     error: optionalNullableString(value.error, filePath, "baseRefObservation.error"),
   };
+}
+
+function normalizeBlockerProvenance(
+  value: unknown,
+  filePath: string,
+  index: number,
+): IssueBlockerProvenanceRecord {
+  const field = `blockerProvenances[${index}]`;
+  if (!isRecord(value)) throw corruptLifecycle(filePath, `${field} is invalid`);
+  if (value.version !== 1) {
+    throw corruptLifecycle(filePath, `${field}.version is invalid`);
+  }
+  if (
+    value.code !== "base_ref_drift" &&
+    value.code !== "base_ref_verification_failure"
+  ) {
+    throw corruptLifecycle(filePath, `${field}.code is invalid`);
+  }
+  if (value.sourceKind !== "base_ref_observation") {
+    throw corruptLifecycle(filePath, `${field}.sourceKind is invalid`);
+  }
+  if (!isBaseRefObservationClassification(value.classification)) {
+    throw corruptLifecycle(filePath, `${field}.classification is invalid`);
+  }
+  const recoveryKind = normalizeBlockerProvenanceRecoveryKind(
+    value.recoveryKind,
+    filePath,
+    field,
+  );
+  if (
+    value.resolution !== undefined &&
+    value.resolution !== null &&
+    value.resolution !== "base_ref_repair" &&
+    value.resolution !== "base_ref_recheck" &&
+    value.resolution !== "superseded"
+  ) {
+    throw corruptLifecycle(filePath, `${field}.resolution is invalid`);
+  }
+  return {
+    version: 1,
+    id: requiredString(value.id, filePath, `${field}.id`),
+    code: value.code,
+    recoveryKind,
+    sourceKind: "base_ref_observation",
+    initialObservationFingerprint: requiredString(
+      value.initialObservationFingerprint,
+      filePath,
+      `${field}.initialObservationFingerprint`,
+    ),
+    initialClassification: isBaseRefObservationClassification(
+      value.initialClassification,
+    )
+      ? value.initialClassification
+      : (() => {
+          throw corruptLifecycle(
+            filePath,
+            `${field}.initialClassification is invalid`,
+          );
+        })(),
+    initialLiveBaseHeadSha: nullableString(
+      value.initialLiveBaseHeadSha,
+      filePath,
+      `${field}.initialLiveBaseHeadSha`,
+    ),
+    initialWorktreeHeadSha: nullableString(
+      value.initialWorktreeHeadSha,
+      filePath,
+      `${field}.initialWorktreeHeadSha`,
+    ),
+    sourceObservationFingerprint: requiredString(
+      value.sourceObservationFingerprint,
+      filePath,
+      `${field}.sourceObservationFingerprint`,
+    ),
+    classification: value.classification,
+    operation: requiredString(value.operation, filePath, `${field}.operation`),
+    runId: requiredString(value.runId, filePath, `${field}.runId`),
+    issueId: requiredString(value.issueId, filePath, `${field}.issueId`),
+    issueIdentifier: requiredString(
+      value.issueIdentifier,
+      filePath,
+      `${field}.issueIdentifier`,
+    ),
+    pullRequestNumber: optionalNullablePositiveInteger(
+      value.pullRequestNumber,
+      filePath,
+      `${field}.pullRequestNumber`,
+    ),
+    pullRequestHeadSha: optionalNullableString(
+      value.pullRequestHeadSha,
+      filePath,
+      `${field}.pullRequestHeadSha`,
+    ),
+    baseRef: optionalNullableString(value.baseRef, filePath, `${field}.baseRef`),
+    liveBaseHeadSha: optionalNullableString(
+      value.liveBaseHeadSha,
+      filePath,
+      `${field}.liveBaseHeadSha`,
+    ),
+    worktreeHeadSha: optionalNullableString(
+      value.worktreeHeadSha,
+      filePath,
+      `${field}.worktreeHeadSha`,
+    ),
+    observationAttempt:
+      value.observationAttempt === undefined
+        ? 1
+        : positiveInteger(
+            value.observationAttempt,
+            filePath,
+            `${field}.observationAttempt`,
+          ),
+    lastObservedAt:
+      value.lastObservedAt === undefined
+        ? requiredString(value.createdAt, filePath, `${field}.createdAt`)
+        : requiredString(
+            value.lastObservedAt,
+            filePath,
+            `${field}.lastObservedAt`,
+          ),
+    reviewVerdictId: optionalNullableString(
+      value.reviewVerdictId,
+      filePath,
+      `${field}.reviewVerdictId`,
+    ),
+    createdAt: requiredString(value.createdAt, filePath, `${field}.createdAt`),
+    resolvedAt: optionalNullableString(value.resolvedAt, filePath, `${field}.resolvedAt`),
+    resolution: value.resolution ?? null,
+  };
+}
+
+function normalizeBlockerProvenanceRecoveryKind(
+  value: unknown,
+  filePath: string,
+  field: string,
+): IssueBlockerProvenanceRecoveryKind {
+  if (
+    value === "automatic_rebase" ||
+    value === "automatic_recheck" ||
+    value === "operator_triage"
+  ) {
+    return value;
+  }
+  throw corruptLifecycle(filePath, `${field}.recoveryKind is invalid`);
 }
 
 function normalizeHandoffState(
@@ -1978,6 +2284,11 @@ function normalizeCompletionReport(value: unknown, filePath: string, index: numb
     runId: requiredString(value.runId, filePath, `completionReports[${index}].runId`),
     issueId: requiredString(value.issueId, filePath, `completionReports[${index}].issueId`),
     issueIdentifier: requiredString(value.issueIdentifier, filePath, `completionReports[${index}].issueIdentifier`),
+    ...optionalFinalDispositionPatch(
+      value.finalDisposition,
+      filePath,
+      `completionReports[${index}].finalDisposition`,
+    ),
     summary: requiredString(value.summary, filePath, `completionReports[${index}].summary`),
     validationEvidence: requiredStringArray(value.validationEvidence, filePath, `completionReports[${index}].validationEvidence`),
     acceptanceChecklist: normalizeChecklist(value.acceptanceChecklist, filePath, index),
@@ -2025,6 +2336,11 @@ function normalizeCompletionReportRejection(
     issueIdentifier: requiredString(value.issueIdentifier, filePath, `completionReportRejections[${index}].issueIdentifier`),
     reasonCode: value.reasonCode,
     reason: requiredString(value.reason, filePath, `completionReportRejections[${index}].reason`),
+    ...optionalFinalDispositionPatch(
+      value.finalDisposition,
+      filePath,
+      `completionReportRejections[${index}].finalDisposition`,
+    ),
     summary: requiredString(value.summary, filePath, `completionReportRejections[${index}].summary`),
     validationEvidence: requiredStringArray(
       value.validationEvidence,
@@ -2087,12 +2403,22 @@ function normalizeReviewVerdict(value: unknown, filePath: string, index: number)
     issueIdentifier: requiredString(value.issueIdentifier, filePath, `reviewVerdicts[${index}].issueIdentifier`),
     verdict: value.verdict,
     passDisposition: normalizePassDisposition(value.passDisposition, filePath, `reviewVerdicts[${index}].passDisposition`),
+    ...optionalFinalDispositionPatch(
+      value.finalDisposition,
+      filePath,
+      `reviewVerdicts[${index}].finalDisposition`,
+    ),
     acceptanceResults: normalizeReviewVerdictAcceptanceResults(value.acceptanceResults, filePath, index),
     findings,
     gateFindings,
     discoveryFindings,
     evidence,
     reviewer: nullableString(value.reviewer, filePath, `reviewVerdicts[${index}].reviewer`),
+    blockerProvenanceId: optionalNullableString(
+      value.blockerProvenanceId,
+      filePath,
+      `reviewVerdicts[${index}].blockerProvenanceId`,
+    ),
     submittedAt: requiredString(value.submittedAt, filePath, `reviewVerdicts[${index}].submittedAt`),
     writebackOperationKeys: requiredStringArray(value.writebackOperationKeys, filePath, `reviewVerdicts[${index}].writebackOperationKeys`),
     ...normalizeSupersessionFields(value, filePath, `reviewVerdicts[${index}]`),
@@ -2144,12 +2470,22 @@ function normalizeReviewVerdictSubmission(
       filePath,
       `reviewVerdictSubmissions[${index}].passDisposition`,
     ),
+    ...optionalFinalDispositionPatch(
+      value.finalDisposition,
+      filePath,
+      `reviewVerdictSubmissions[${index}].finalDisposition`,
+    ),
     acceptanceResults: normalizeReviewVerdictAcceptanceResults(value.acceptanceResults, filePath, index),
     findings,
     gateFindings,
     discoveryFindings,
     evidence,
     reviewer: nullableString(value.reviewer, filePath, `reviewVerdictSubmissions[${index}].reviewer`),
+    blockerProvenanceId: optionalNullableString(
+      value.blockerProvenanceId,
+      filePath,
+      `reviewVerdictSubmissions[${index}].blockerProvenanceId`,
+    ),
     submittedAt: requiredString(value.submittedAt, filePath, `reviewVerdictSubmissions[${index}].submittedAt`),
     status,
     ignoreStateGate: value.ignoreStateGate === true,
@@ -2264,6 +2600,11 @@ function normalizeIssueTriageReport(value: unknown, filePath: string, index: num
     issueId: requiredString(value.issueId, filePath, `issueTriageReports[${index}].issueId`),
     issueIdentifier: requiredString(value.issueIdentifier, filePath, `issueTriageReports[${index}].issueIdentifier`),
     triggerFingerprint: requiredString(value.triggerFingerprint, filePath, `issueTriageReports[${index}].triggerFingerprint`),
+    ...optionalFinalDispositionPatch(
+      value.finalDisposition,
+      filePath,
+      `issueTriageReports[${index}].finalDisposition`,
+    ),
     disposition,
     confidence,
     summary,
@@ -2302,6 +2643,11 @@ function normalizePostMortemReport(value: unknown, filePath: string, index: numb
     issueId: requiredString(value.issueId, filePath, `postMortemReports[${index}].issueId`),
     issueIdentifier: requiredString(value.issueIdentifier, filePath, `postMortemReports[${index}].issueIdentifier`),
     triggerFingerprint: requiredString(value.triggerFingerprint, filePath, `postMortemReports[${index}].triggerFingerprint`),
+    ...optionalFinalDispositionPatch(
+      value.finalDisposition,
+      filePath,
+      `postMortemReports[${index}].finalDisposition`,
+    ),
     summary: requiredString(value.summary, filePath, `postMortemReports[${index}].summary`),
     completionJudgment: normalizePostMortemCompletionJudgment(value.completionJudgment, filePath, index),
     specificationAssessment: normalizePostMortemSpecificationAssessment(value.specificationAssessment, filePath, index),
@@ -2947,10 +3293,21 @@ function normalizeArtifactFileManifest(value: unknown, filePath: string): Artifa
     ) {
       throw corruptLifecycle(filePath, `acceptedArtifact.fileManifest[${index}].status is invalid`);
     }
+    const mode = item.mode;
+    if (
+      mode !== undefined &&
+      mode !== null &&
+      mode !== "100644" &&
+      mode !== "100755" &&
+      mode !== "120000"
+    ) {
+      throw corruptLifecycle(filePath, `acceptedArtifact.fileManifest[${index}].mode is invalid`);
+    }
     return {
       path: requiredString(item.path, filePath, `acceptedArtifact.fileManifest[${index}].path`),
       status: item.status,
       blobSha: nullableString(item.blobSha, filePath, `acceptedArtifact.fileManifest[${index}].blobSha`),
+      ...(mode === undefined ? {} : { mode }),
     };
   });
 }
@@ -3003,6 +3360,11 @@ function normalizeMergeConflictMetadata(value: unknown, filePath: string): Issue
     conflictsState: requiredString(value.conflictsState, filePath, "mergeConflict.conflictsState"),
     reason: requiredString(value.reason, filePath, "mergeConflict.reason"),
     mergeableState: optionalNullableString(value.mergeableState, filePath, "mergeConflict.mergeableState"),
+    blockerProvenanceId: optionalNullableString(
+      value.blockerProvenanceId,
+      filePath,
+      "mergeConflict.blockerProvenanceId",
+    ),
     servicePreparation: normalizeMergeConflictServicePreparation(value.servicePreparation, filePath),
     detectedAt: requiredString(value.detectedAt, filePath, "mergeConflict.detectedAt"),
     updatedAt: requiredString(value.updatedAt, filePath, "mergeConflict.updatedAt"),
@@ -3204,6 +3566,11 @@ function normalizeMergeConflictResolutionReport(
     runId: requiredString(value.runId, filePath, `mergeConflictResolutionReports[${index}].runId`),
     issueId: requiredString(value.issueId, filePath, `mergeConflictResolutionReports[${index}].issueId`),
     issueIdentifier: requiredString(value.issueIdentifier, filePath, `mergeConflictResolutionReports[${index}].issueIdentifier`),
+    ...optionalFinalDispositionPatch(
+      value.finalDisposition,
+      filePath,
+      `mergeConflictResolutionReports[${index}].finalDisposition`,
+    ),
     resolutionStatus,
     summary: requiredString(value.summary, filePath, `mergeConflictResolutionReports[${index}].summary`),
     validationEvidence: requiredStringArray(value.validationEvidence, filePath, `mergeConflictResolutionReports[${index}].validationEvidence`),
@@ -3235,6 +3602,14 @@ function normalizeMergeConflictResolutionReport(
     ),
     risks: requiredStringArray(value.risks, filePath, `mergeConflictResolutionReports[${index}].risks`),
     submittedAt: requiredString(value.submittedAt, filePath, `mergeConflictResolutionReports[${index}].submittedAt`),
+    writebackOperationKeys:
+      value.writebackOperationKeys === undefined
+        ? []
+        : requiredStringArray(
+            value.writebackOperationKeys,
+            filePath,
+            `mergeConflictResolutionReports[${index}].writebackOperationKeys`,
+          ),
   };
 }
 
@@ -3615,6 +3990,15 @@ function positiveInteger(value: unknown, filePath: string, field: string): numbe
   throw corruptLifecycle(filePath, `${field} is invalid`);
 }
 
+function optionalNullablePositiveInteger(
+  value: unknown,
+  filePath: string,
+  field: string,
+): number | null {
+  if (value === undefined || value === null) return null;
+  return positiveInteger(value, filePath, field);
+}
+
 function nullableString(value: unknown, filePath: string, field: string): string | null {
   if (value === null) return null;
   if (typeof value === "string") return value;
@@ -3673,6 +4057,15 @@ function requiredStringArray(value: unknown, filePath: string, field: string): s
 function requiredString(value: unknown, filePath: string, field: string): string {
   if (typeof value === "string" && value.length > 0) return value;
   throw corruptLifecycle(filePath, `${field} is missing`);
+}
+
+function optionalFinalDispositionPatch(
+  value: unknown,
+  filePath: string,
+  field: string,
+): { finalDisposition?: string } {
+  if (value === undefined) return {};
+  return { finalDisposition: requiredString(value, filePath, field) };
 }
 
 function corruptLifecycle(filePath: string, reason: string): SymphonyError {

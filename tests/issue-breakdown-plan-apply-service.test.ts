@@ -6,6 +6,7 @@ import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import {
   IssueBreakdownPlanApplyService,
   planIssueBreakdownApplicationWritebacks,
+  planIssueBreakdownDispositionWriteback,
   planIssueBreakdownFinalizationWritebacks,
 } from "../src/core/IssueBreakdownPlanApplyService.js";
 import { IssueBreakdownPlanService, issueBreakdownPlanRequestHash } from "../src/core/IssueBreakdownPlanService.js";
@@ -28,6 +29,17 @@ import type { ServiceConfig } from "../src/core/config/Config.js";
 import { agentEligibleIssueContract, issue, testConfig } from "./helpers.js";
 
 type IssueCreateWriteback = Extract<NewWritebackOperation, { kind: "issue_create" }>;
+
+const FINAL_DISPOSITION =
+  "Created a bounded implementation child with an explicit contract and validation plan.\n\nNo proposed issue, dependency, or planning caveat has been omitted.";
+const FULL_FINAL_DISPOSITION = [
+  FINAL_DISPOSITION,
+  "",
+  ...Array.from(
+    { length: 300 },
+    (_, index) => `Evidence ${index + 1}: the complete proposed scope and dependency analysis is preserved verbatim.`,
+  ),
+].join("\n");
 
 describe("IssueBreakdownPlanApplyService", () => {
   let root: string;
@@ -71,7 +83,9 @@ describe("IssueBreakdownPlanApplyService", () => {
       status: "no_fresh_plan",
       reason: "accepted_artifact_contract_cannot_be_decomposed",
     });
-    expect(writeback.operations).toHaveLength(0);
+    expect(writeback.operations).toHaveLength(1);
+    expect(writeback.operations[0]?.kind).toBe("comment");
+    expectExactDisposition(commentBody(writeback.operations[0]!), FINAL_DISPOSITION);
     await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
       issueBreakdownPlans: [
         expect.objectContaining({ applicationStatus: "not_requested" }),
@@ -90,6 +104,7 @@ describe("IssueBreakdownPlanApplyService", () => {
       {
         runId: "run-plan-1",
         issueId: candidate.id,
+        finalDisposition: FINAL_DISPOSITION,
         summary: "Split into child issues.",
         proposedIssues: [
           {
@@ -111,11 +126,17 @@ describe("IssueBreakdownPlanApplyService", () => {
 
     expect(result.status).toBe("applied");
     expect(writeback.operations[0]).toMatchObject({
+      kind: "comment",
+      issueId: candidate.id,
+      payload: { issueBreakdownPlanId: expect.any(String) },
+    });
+    expectExactDisposition(commentBody(writeback.operations[0]!), FINAL_DISPOSITION);
+    expect(writeback.operations[1]).toMatchObject({
       kind: "issue_create",
       issueId: candidate.id,
       payload: { title: "Build child", parentIssueId: candidate.id, planId: expect.any(String) },
     });
-    expect(writeback.operations[1]).toMatchObject({
+    expect(writeback.operations.find((operation) => operation.kind === "issue_relation")).toMatchObject({
       kind: "issue_relation",
       issueId: candidate.id,
       payload: { sourceIssueId: "child-1", targetIssueId: candidate.id, type: "blocks" },
@@ -123,8 +144,15 @@ describe("IssueBreakdownPlanApplyService", () => {
     expect(writeback.operations.find((operation) => operation.kind === "comment")).toMatchObject({
       kind: "comment",
       issueId: candidate.id,
-      payload: { body: expect.stringContaining("TEST-2"), issueBreakdownPlanId: expect.any(String) },
+      payload: {
+        body: expect.stringContaining(FINAL_DISPOSITION),
+        issueBreakdownPlanId: expect.any(String),
+      },
     });
+    const finalComment = writeback.operations
+      .filter((operation) => operation.kind === "comment")
+      .find((operation) => operation.payload.dedupeKey.includes("issue-breakdown-children"));
+    expect(finalComment?.kind === "comment" ? finalComment.payload.body : "").not.toContain("Agent final disposition:");
     expect(writeback.operations.find((operation) => operation.kind === "transition")).toMatchObject({
       kind: "transition",
       issueId: candidate.id,
@@ -179,7 +207,7 @@ describe("IssueBreakdownPlanApplyService", () => {
     expect(lifecycle?.issueBreakdownPlans[0]?.applicationStatus).toBe("applied");
     expect(writer.issueCreates).toHaveLength(2);
     expect(writer.issueRelations).toHaveLength(3);
-    expect(writer.comments).toHaveLength(1);
+    expect(writer.comments).toHaveLength(2);
     expect(writer.transitions).toHaveLength(1);
     expect(records.every((record) => record.status === "succeeded")).toBe(true);
   });
@@ -224,7 +252,8 @@ describe("IssueBreakdownPlanApplyService", () => {
 
     expect(result).toMatchObject({ status: "blocked", reason: ISSUE_BREAKDOWN_PLAN_STALE_REASON });
     expect(writer.issueRelations).toHaveLength(1);
-    expect(writer.comments).toHaveLength(0);
+    expect(writer.comments).toHaveLength(1);
+    expectExactDisposition(writer.comments[0]?.body ?? "", FINAL_DISPOSITION);
     expect(writer.transitions).toHaveLength(0);
     expect(records.find((record) => record.kind === "transition")).toMatchObject({
       status: "skipped",
@@ -251,6 +280,7 @@ describe("IssueBreakdownPlanApplyService", () => {
       {
         runId: "run-plan-1",
         issueId: candidate.id,
+        finalDisposition: FINAL_DISPOSITION,
         summary: "Split into child issues.",
         proposedIssues: [
           { title: "Build child", description: agentEligibleIssueContract(), acceptanceCriteria: ["Done"], dependencies: [], labels: [] },
@@ -296,7 +326,9 @@ describe("IssueBreakdownPlanApplyService", () => {
     const lifecycle = await lifecycleStore.get(original.id);
 
     expect(result).toMatchObject({ status: "no_fresh_plan", reason: "no_fresh_plan" });
-    expect(writeback.operations).toEqual([]);
+    expect(writeback.operations).toHaveLength(1);
+    expect(writeback.operations[0]?.kind).toBe("comment");
+    expectExactDisposition(commentBody(writeback.operations[0]!), FINAL_DISPOSITION);
     expect(lifecycle?.lastIssueBreakdownPlanId).toBe(planB.id);
     expect(lifecycle?.issueBreakdownPlans.find((plan) => plan.id === planA.id)?.applicationStatus).toBe("pending");
   });
@@ -331,7 +363,7 @@ describe("IssueBreakdownPlanApplyService", () => {
     expect(after?.lastIssueBreakdownPlanId).toBe(planB.id);
   });
 
-  it("durably blocks unresolved dependency references before enqueueing writebacks", async () => {
+  it("writes the full disposition before unresolved dependency validation blocks application", async () => {
     const config = testConfig(root);
     config.issueBreakdown.applyToLinear.enabled = true;
     config.writeback.enabled = true;
@@ -341,6 +373,7 @@ describe("IssueBreakdownPlanApplyService", () => {
       {
         runId: "run-plan-1",
         issueId: candidate.id,
+        finalDisposition: FULL_FINAL_DISPOSITION,
         summary: "Split into child issues.",
         proposedIssues: [
           { title: "Build child", description: agentEligibleIssueContract(), acceptanceCriteria: ["Done"], dependencies: ["Missing"], labels: [] },
@@ -354,10 +387,41 @@ describe("IssueBreakdownPlanApplyService", () => {
     const result = await new IssueBreakdownPlanApplyService({ config, lifecycleStore, writeback }).applyLatestFreshPlan(candidate);
     const lifecycle = await lifecycleStore.get(candidate.id);
 
+    expect(FULL_FINAL_DISPOSITION.length).toBeGreaterThan(10_000);
     expect(result.status).toBe("blocked");
-    expect(writeback.operations).toEqual([]);
+    expect(writeback.operations).toHaveLength(1);
+    expect(writeback.operations[0]?.kind).toBe("comment");
+    expectExactDisposition(commentBody(writeback.operations[0]!), FULL_FINAL_DISPOSITION);
+    expect(writeback.operations.some((operation) => operation.kind === "issue_create")).toBe(false);
     expect(lifecycle?.issueBreakdownPlans[0]?.applicationStatus).toBe("blocked");
     expect(lifecycle?.issueBreakdownPlans[0]?.applicationBlockedReason).toContain("Missing");
+  });
+
+  it("keeps the full disposition durable when partial child creation blocks application", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.writeback.enabled = true;
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue({ labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
+    await submitTwoChildPlan(config, lifecycleStore, candidate, {
+      finalDisposition: FULL_FINAL_DISPOSITION,
+    });
+    const writeback = new CapturingWriteback({ failIssueCreateIndex: 1 });
+
+    const result = await new IssueBreakdownPlanApplyService({ config, lifecycleStore, writeback }).applyLatestFreshPlan(candidate);
+    const lifecycle = await lifecycleStore.get(candidate.id);
+    const comments = writeback.operations.filter((operation) => operation.kind === "comment");
+    const issueCreates = writeback.operations.filter((operation) => operation.kind === "issue_create");
+
+    expect(result.status).toBe("blocked");
+    expect(writeback.operations[0]?.kind).toBe("comment");
+    expectExactDisposition(commentBody(writeback.operations[0]!), FULL_FINAL_DISPOSITION);
+    expect(comments).toHaveLength(1);
+    expect(issueCreates).toHaveLength(2);
+    expect(lifecycle?.issueBreakdownPlans[0]).toMatchObject({
+      applicationStatus: "blocked",
+      createdIssueRefs: [expect.objectContaining({ proposedIssueIndex: 0 })],
+    });
   });
 
   it("re-applies blocked dry_run writebacks live without duplicating issue creation", async () => {
@@ -370,6 +434,7 @@ describe("IssueBreakdownPlanApplyService", () => {
       {
         runId: "run-plan-1",
         issueId: candidate.id,
+        finalDisposition: FINAL_DISPOSITION,
         summary: "Split into child issues.",
         proposedIssues: [
           {
@@ -405,17 +470,17 @@ describe("IssueBreakdownPlanApplyService", () => {
     const lifecycleAfterDryRun = await lifecycleStore.get(candidate.id);
     const dryRunPlan = lifecycleAfterDryRun?.issueBreakdownPlans[0];
     const dryRunRecords = await store.list();
-    const childRecord = dryRunRecords.find((record) => record.kind === "issue_create");
+    const dispositionRecord = dryRunRecords.find((record) => record.kind === "comment");
 
     expect(dryResult).toMatchObject({ status: "blocked", reason: "Writeback dry_run" });
     expect(dryRunPlan?.applicationStatus).toBe("blocked");
     expect(dryRunPlan?.applicationBlockedReason).toBe("Writeback dry_run");
     expect(dryRunPlan?.applicationOperationKeys).toHaveLength(1);
-    expect(dryRunPlan?.applicationOperationKeys[0]).toBe(childRecord?.idempotencyKey);
+    expect(dryRunPlan?.applicationOperationKeys[0]).toBe(dispositionRecord?.idempotencyKey);
     expect(dryRunPlan?.createdIssueRefs).toEqual([]);
-    expect(childRecord?.status).toBe("skipped");
-    expect(childRecord?.lastError).toBe("Writeback dry_run");
-    expect(dryRunRecords.filter((record) => record.kind === "issue_create")).toHaveLength(1);
+    expect(dispositionRecord?.status).toBe("skipped");
+    expect(dispositionRecord?.lastError).toBe("Writeback dry_run");
+    expect(dryRunRecords.filter((record) => record.kind === "issue_create")).toHaveLength(0);
     expect(dryRunWriter.issueCreates).toHaveLength(0);
 
     const writer = new FakeWriter();
@@ -436,16 +501,17 @@ describe("IssueBreakdownPlanApplyService", () => {
     const lifecycleAfterLive = await lifecycleStore.get(candidate.id);
     const liveRecords = await store.list();
     const liveChildRecord = liveRecords.find((record) => record.kind === "issue_create");
-    const parentComment = liveRecords.find((record) => record.kind === "comment");
+    const parentComment = liveRecords.find(
+      (record) => record.kind === "comment" && record.payload.dedupeKey.includes("issue-breakdown-children"),
+    );
 
     expect(liveResult.status).toBe("applied");
-    expect(liveChildRecord?.idempotencyKey).toBe(childRecord?.idempotencyKey);
     expect(liveChildRecord?.status).toBe("succeeded");
     expect(liveRecords.filter((record) => record.kind === "issue_create")).toHaveLength(1);
     expect(writer.issueCreates).toHaveLength(1);
     expect(parentComment?.status).toBe("succeeded");
-    expect(writer.comments).toHaveLength(1);
-    expect(writer.comments[0]?.body).toContain("TEST-2");
+    expect(writer.comments).toHaveLength(2);
+    expect(writer.comments.some((comment) => comment.body.includes("TEST-2"))).toBe(true);
     expect(lifecycleAfterLive?.issueBreakdownPlans[0]?.applicationStatus).toBe("applied");
     expect(lifecycleAfterLive?.issueBreakdownPlans[0]?.createdIssueRefs[0]).toMatchObject({
       id: "child-1",
@@ -551,13 +617,15 @@ describe("IssueBreakdownPlanApplyService", () => {
     });
   });
 
-  it("blocks stale pending outbox work after parent drift without tracker writes", async () => {
+  it("writes the full disposition but blocks stale child work after parent drift", async () => {
     const config = testConfig(root);
     config.issueBreakdown.applyToLinear.enabled = true;
     config.writeback.enabled = true;
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
     const candidate = issue({ labels: ["planning"], title: "Original title", updatedAt: "2026-01-02T00:00:00Z" });
-    const plan = await submitSingleChildPlan(config, lifecycleStore, candidate);
+    const plan = await submitSingleChildPlan(config, lifecycleStore, candidate, {
+      finalDisposition: FULL_FINAL_DISPOSITION,
+    });
     const operation = planIssueBreakdownApplicationWritebacks(candidate, plan)[0]!;
     await lifecycleStore.updateIssue(candidate, {
       issueBreakdownPlans: [{ ...plan, applicationStatus: "pending", applicationOperationKeys: [operation.idempotencyKey] }],
@@ -566,10 +634,8 @@ describe("IssueBreakdownPlanApplyService", () => {
     const store = new FileWritebackOutboxStore(config.workspace.stateDir);
     await store.enqueueOnce(operation);
     const drifted = { ...candidate, title: "Changed title", updatedAt: "2026-01-03T00:00:00Z" };
-
-    const applyResult = await new IssueBreakdownPlanApplyService({ config, lifecycleStore }).applyLatestFreshPlan(drifted);
     const writer = new FakeWriter();
-    await new WritebackProcessor(
+    const processor = new WritebackProcessor(
       store,
       writer,
       new StructuredLogger(() => undefined),
@@ -577,18 +643,31 @@ describe("IssueBreakdownPlanApplyService", () => {
       lifecycleStore,
       false,
       freshnessGuard(drifted, config),
-    ).processDue();
+    );
+
+    const applyResult = await new IssueBreakdownPlanApplyService({
+      config,
+      lifecycleStore,
+      writeback: processor,
+    }).applyLatestFreshPlan(drifted);
+    await processor.processDue();
     const lifecycle = await lifecycleStore.get(candidate.id);
     const records = await store.list();
+    const childRecord = records.find((record) => record.kind === "issue_create");
+    const dispositionRecord = records.find(
+      (record) => record.kind === "comment" && record.payload.dedupeKey.includes("issue-breakdown-disposition"),
+    );
 
     expect(applyResult).toMatchObject({ status: "no_fresh_plan", reason: ISSUE_BREAKDOWN_PLAN_STALE_REASON });
     expect(writer.issueCreates).toEqual([]);
-    expect(writer.comments).toEqual([]);
-    expect(records[0]).toMatchObject({ status: "skipped", lastError: ISSUE_BREAKDOWN_PLAN_STALE_REASON });
+    expect(writer.comments).toHaveLength(1);
+    expectExactDisposition(writer.comments[0]?.body ?? "", FULL_FINAL_DISPOSITION);
+    expect(childRecord).toMatchObject({ status: "skipped", lastError: ISSUE_BREAKDOWN_PLAN_STALE_REASON });
+    expect(dispositionRecord).toMatchObject({ status: "succeeded" });
     expect(lifecycle?.issueBreakdownPlans[0]).toMatchObject({
       applicationStatus: "stale",
       applicationBlockedReason: ISSUE_BREAKDOWN_PLAN_STALE_REASON,
-      applicationOperationKeys: [operation.idempotencyKey],
+      applicationOperationKeys: expect.arrayContaining([operation.idempotencyKey, dispositionRecord?.idempotencyKey]),
       createdIssueRefs: [],
     });
   });
@@ -640,7 +719,7 @@ describe("IssueBreakdownPlanApplyService", () => {
     expect(writer.issueRelations).toHaveLength(3);
     expect(writer.issueRelations.filter((relation) => relation.targetIssueId === candidate.id)).toHaveLength(2);
     expect(writer.issueRelations.some((relation) => relation.targetIssueId !== candidate.id)).toBe(true);
-    expect(writer.comments).toHaveLength(1);
+    expect(writer.comments).toHaveLength(2);
     expect(records.filter((record) => record.kind === "issue_create")).toHaveLength(2);
     await expect(store.get(firstChild.idempotencyKey)).resolves.toMatchObject({ status: "succeeded" });
     await expect(store.get(secondChild.idempotencyKey)).resolves.toMatchObject({ status: "succeeded" });
@@ -660,14 +739,22 @@ describe("IssueBreakdownPlanApplyService", () => {
       ...plan,
       createdIssueRefs: childOperations.map((operation) => createdIssueRef(operation)),
     };
-    const finalOperations = planIssueBreakdownFinalizationWritebacks(candidate, planWithRefs);
+    const dispositionOperation = planIssueBreakdownDispositionWriteback(candidate, planWithRefs);
+    const planWithDisposition = {
+      ...planWithRefs,
+      applicationOperationKeys: [
+        ...childOperations.map((operation) => operation.idempotencyKey),
+        dispositionOperation.idempotencyKey,
+      ],
+    };
+    const finalOperations = planIssueBreakdownFinalizationWritebacks(candidate, planWithDisposition);
     await lifecycleStore.updateIssue(candidate, {
       issueBreakdownPlans: [
         {
-          ...planWithRefs,
+          ...planWithDisposition,
           applicationStatus: "pending",
           applicationOperationKeys: [
-            ...childOperations.map((operation) => operation.idempotencyKey),
+            ...planWithDisposition.applicationOperationKeys,
             ...finalOperations.map((operation) => operation.idempotencyKey),
           ],
         },
@@ -678,6 +765,10 @@ describe("IssueBreakdownPlanApplyService", () => {
     for (const operation of childOperations) {
       await store.markSucceeded(await store.enqueueOnce(operation), issueCreateResult(operation));
     }
+    await store.markSucceeded(await store.enqueueOnce(dispositionOperation), {
+      status: "applied",
+      message: "Comment written",
+    });
     for (const operation of finalOperations) {
       await store.markSkipped(await store.enqueueOnce(operation), ISSUE_BREAKDOWN_PLAN_STALE_REASON);
     }
@@ -712,6 +803,9 @@ describe("IssueBreakdownPlanApplyService", () => {
 
 class CapturingWriteback implements Pick<WritebackProcessorType, "enqueueAndProcess"> {
   readonly operations: NewWritebackOperation[] = [];
+  private issueCreateIndex = 0;
+
+  constructor(private readonly options: { failIssueCreateIndex?: number } = {}) {}
 
   async enqueueAndProcess(operation: NewWritebackOperation): Promise<WritebackOperation> {
     this.operations.push(operation);
@@ -725,6 +819,21 @@ class CapturingWriteback implements Pick<WritebackProcessorType, "enqueueAndProc
         nextAttemptAt: "2026-01-02T00:00:00.000Z",
         lastError: null,
         resultStatus: "applied",
+        resultMessage: null,
+        resultEvidence: null,
+      };
+    }
+    const issueCreateIndex = this.issueCreateIndex++;
+    if (issueCreateIndex === this.options.failIssueCreateIndex) {
+      return {
+        ...operation,
+        status: "dead_letter",
+        attempt: 1,
+        createdAt: "2026-01-02T00:00:00.000Z",
+        updatedAt: "2026-01-02T00:00:00.000Z",
+        nextAttemptAt: "2026-01-02T00:00:00.000Z",
+        lastError: "child creation failed",
+        resultStatus: null,
         resultMessage: null,
         resultEvidence: null,
       };
@@ -795,13 +904,14 @@ async function submitSingleChildPlan(
   config: ServiceConfig,
   lifecycleStore: FileIssueLifecycleStore,
   candidate: Issue,
-  options: { idempotencyKey?: string; runId?: string } = {},
+  options: { idempotencyKey?: string; runId?: string; finalDisposition?: string } = {},
 ) {
   const runId = options.runId ?? "run-plan-1";
   const result = await new IssueBreakdownPlanService({ config, lifecycleStore }).submit_issue_breakdown_plan(
     {
       runId,
       issueId: candidate.id,
+      finalDisposition: options.finalDisposition ?? FINAL_DISPOSITION,
       summary: "Split into child issues.",
       proposedIssues: [
         {
@@ -830,6 +940,7 @@ async function seedLegacyValidationDriftPlan(
   const legacyInput = {
     runId,
     issueId: candidate.id,
+    finalDisposition: "Split into child issues.",
     summary: "Split into child issues.",
     proposedIssues: [
       {
@@ -858,11 +969,17 @@ async function seedLegacyValidationDriftPlan(
   return { plan: updatedPlan, legacyInput };
 }
 
-async function submitTwoChildPlan(config: ServiceConfig, lifecycleStore: FileIssueLifecycleStore, candidate: Issue) {
+async function submitTwoChildPlan(
+  config: ServiceConfig,
+  lifecycleStore: FileIssueLifecycleStore,
+  candidate: Issue,
+  options: { finalDisposition?: string } = {},
+) {
   const result = await new IssueBreakdownPlanService({ config, lifecycleStore }).submit_issue_breakdown_plan(
     {
       runId: "run-plan-1",
       issueId: candidate.id,
+      finalDisposition: options.finalDisposition ?? FINAL_DISPOSITION,
       summary: "Split into child issues.",
       proposedIssues: [
         {
@@ -885,6 +1002,18 @@ async function submitTwoChildPlan(config: ServiceConfig, lifecycleStore: FileIss
     { issue: candidate, activeRunId: "run-plan-1", role: "worker", phase: "issue_breakdown" },
   );
   return result.plan;
+}
+
+function commentBody(operation: NewWritebackOperation): string {
+  if (operation.kind !== "comment") throw new Error("Expected comment operation");
+  return operation.payload.body;
+}
+
+function expectExactDisposition(body: string, expected: string): void {
+  const marker = "Agent final disposition:\n";
+  const markerIndex = body.indexOf(marker);
+  expect(markerIndex).toBeGreaterThanOrEqual(0);
+  expect(body.slice(markerIndex + marker.length)).toBe(expected);
 }
 
 function createdIssueRef(operation: IssueCreateWriteback): IssueBreakdownCreatedIssueRef {

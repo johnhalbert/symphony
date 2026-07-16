@@ -1,6 +1,7 @@
 import { promises as fs } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { setTimeout as delay } from "node:timers/promises";
 import sqlite3 from "sqlite3";
 import type { Logger } from "../logging/StructuredLogger.js";
@@ -15,9 +16,48 @@ import {
 import { ProjectionRevisionNotifier, type ProjectionChangeListener, type ProjectionChangeUnsubscribe } from "../persistence/ProjectionRevision.js";
 import type { TrackerWriteEvidence, TrackerWriteResult, TrackerWriter } from "../tracker/TrackerWriter.js";
 import type { Issue } from "../types.js";
-import { errorMessage } from "../errors.js";
+import { errorMessage, SymphonyError } from "../errors.js";
 
 export type WritebackStatus = "pending" | "in_flight" | "succeeded" | "skipped" | "retrying" | "dead_letter";
+
+export type WritebackLifecycleBinding =
+  | {
+      kind:
+        | "completion_report"
+        | "completion_report_rejection"
+        | "issue_triage_report"
+        | "issue_post_mortem_report"
+        | "merge_conflict_resolution_report";
+      recordId: string;
+    }
+  | {
+      kind: "merge_conflict";
+      recordId: string;
+    }
+  | {
+      kind: "review_verdict";
+      recordId: string;
+    }
+  | {
+      kind: "merge_gate_result";
+      recordId: string;
+      resultIdempotencyKey: string;
+    }
+  | {
+      kind: "merge_gate";
+      recordId: string;
+      status: "superseded";
+      headSha: string;
+      supersededByHeadSha: string;
+    }
+  | {
+      kind: "issue_checkpoint";
+      phase: string;
+      prHeadSha: string | null;
+      gitBranchName: string | null;
+      baseRef: string | null;
+      resolvedBlockerProvenanceId: string | null;
+    };
 
 export type WritebackOperation =
   | {
@@ -25,6 +65,7 @@ export type WritebackOperation =
       kind: "transition";
       issueId: string;
       runId?: string;
+      lifecycleBinding?: WritebackLifecycleBinding;
       status: WritebackStatus;
       attempt: number;
       createdAt: string;
@@ -47,6 +88,7 @@ export type WritebackOperation =
       kind: "comment";
       issueId: string;
       runId?: string;
+      lifecycleBinding?: WritebackLifecycleBinding;
       status: WritebackStatus;
       attempt: number;
       createdAt: string;
@@ -63,6 +105,7 @@ export type WritebackOperation =
       kind: "issue_create";
       issueId: string;
       runId?: string;
+      lifecycleBinding?: WritebackLifecycleBinding;
       status: WritebackStatus;
       attempt: number;
       createdAt: string;
@@ -90,6 +133,7 @@ export type WritebackOperation =
       kind: "issue_relation";
       issueId: string;
       runId?: string;
+      lifecycleBinding?: WritebackLifecycleBinding;
       status: WritebackStatus;
       attempt: number;
       createdAt: string;
@@ -129,6 +173,12 @@ export type NewWritebackOperation =
   | Omit<Extract<WritebackOperation, { kind: "comment" }>, PersistedWritebackFields>
   | Omit<Extract<WritebackOperation, { kind: "issue_create" }>, PersistedWritebackFields>
   | Omit<Extract<WritebackOperation, { kind: "issue_relation" }>, PersistedWritebackFields>;
+
+export function bindWritebackOperationToLifecycle<
+  T extends NewWritebackOperation,
+>(operation: T, binding: WritebackLifecycleBinding): T {
+  return { ...operation, lifecycleBinding: binding } as T;
+}
 
 export const ISSUE_BREAKDOWN_PLAN_STALE_REASON = "issue breakdown plan is no longer fresh";
 export const ISSUE_BREAKDOWN_WRITEBACK_NOT_CURRENT_REASON = "issue breakdown writeback is not bound to the current plan";
@@ -189,7 +239,13 @@ export class FileWritebackOutboxStore implements WritebackOutboxStore {
 
   async enqueueOnce(operation: NewWritebackOperation): Promise<WritebackOperation> {
     const existing = await this.get(operation.idempotencyKey);
-    if (existing) return existing;
+    if (existing) {
+      const upgraded = compatibleExistingWriteback(existing, operation);
+      if (upgraded === existing) return existing;
+      await this.write(upgraded);
+      this.notifyProjectionChanged();
+      return upgraded;
+    }
     const now = new Date().toISOString();
     const record = {
       ...operation,
@@ -368,6 +424,7 @@ interface WritebackOperationRow {
   result_status: TrackerWriteResult["status"] | null;
   result_message: string | null;
   result_evidence_json: string | null;
+  lifecycle_binding_json: string | null;
   payload_json: string;
 }
 
@@ -405,7 +462,13 @@ export class SqliteWritebackOutboxStore implements WritebackOutboxStore {
     let changed = false;
     const record = await this.withWrite(async (database) => {
       const existing = await this.getUnlocked(database, operation.idempotencyKey);
-      if (existing) return existing;
+      if (existing) {
+        const upgraded = compatibleExistingWriteback(existing, operation);
+        if (upgraded === existing) return existing;
+        await this.upsertRecordUnlocked(database, upgraded);
+        changed = true;
+        return upgraded;
+      }
       const now = new Date().toISOString();
       const next = {
         ...operation,
@@ -592,6 +655,7 @@ export class SqliteWritebackOutboxStore implements WritebackOutboxStore {
             result_status TEXT NULL,
             result_message TEXT NULL,
             result_evidence_json TEXT NULL,
+            lifecycle_binding_json TEXT NULL,
             payload_json TEXT NOT NULL
           );
 
@@ -605,6 +669,16 @@ export class SqliteWritebackOutboxStore implements WritebackOutboxStore {
             ON writeback_operations(run_id);
         `,
       );
+      const columns = await this.allRows<{ name: string }>(
+        database,
+        "PRAGMA table_info(writeback_operations)",
+      );
+      if (!columns.some((column) => column.name === "lifecycle_binding_json")) {
+        await this.exec(
+          database,
+          "ALTER TABLE writeback_operations ADD COLUMN lifecycle_binding_json TEXT NULL",
+        );
+      }
       await this.importLegacyRecords(database);
     } catch (error) {
       await this.closeDatabase(database).catch(() => undefined);
@@ -687,9 +761,10 @@ export class SqliteWritebackOutboxStore implements WritebackOutboxStore {
           result_status,
           result_message,
           result_evidence_json,
+          lifecycle_binding_json,
           payload_json
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(idempotency_key) DO UPDATE SET
           kind = excluded.kind,
           issue_id = excluded.issue_id,
@@ -703,6 +778,7 @@ export class SqliteWritebackOutboxStore implements WritebackOutboxStore {
           result_status = excluded.result_status,
           result_message = excluded.result_message,
           result_evidence_json = excluded.result_evidence_json,
+          lifecycle_binding_json = excluded.lifecycle_binding_json,
           payload_json = excluded.payload_json
       `,
       this.paramsForRecord(record),
@@ -724,6 +800,9 @@ export class SqliteWritebackOutboxStore implements WritebackOutboxStore {
       record.resultStatus,
       record.resultMessage,
       record.resultEvidence === null ? null : JSON.stringify(record.resultEvidence),
+      record.lifecycleBinding === undefined
+        ? null
+        : JSON.stringify(record.lifecycleBinding),
       JSON.stringify(record.payload),
     ];
   }
@@ -734,6 +813,13 @@ export class SqliteWritebackOutboxStore implements WritebackOutboxStore {
       kind: row.kind,
       issueId: row.issue_id,
       ...(row.run_id === null ? {} : { runId: row.run_id }),
+      ...(row.lifecycle_binding_json === null
+        ? {}
+        : {
+            lifecycleBinding: JSON.parse(
+              row.lifecycle_binding_json,
+            ) as WritebackLifecycleBinding,
+          }),
       status: row.status,
       attempt: row.attempt,
       createdAt: row.created_at,
@@ -805,13 +891,21 @@ export class WritebackProcessor {
     private readonly writer: TrackerWriter,
     private readonly logger: Logger,
     private readonly maxBackoffMs: number,
-    private readonly lifecycleStore?: Pick<IssueLifecycleStore, "get">,
+    private lifecycleStore?: Pick<IssueLifecycleStore, "get">,
     private readonly dryRun = false,
     private readonly issueBreakdownFreshnessGuard?: IssueBreakdownFreshnessGuard,
   ) {}
 
+  bindLifecycleStore(lifecycleStore: Pick<IssueLifecycleStore, "get">): void {
+    this.lifecycleStore ??= lifecycleStore;
+  }
+
   async close(): Promise<void> {
     await this.store.close?.();
+  }
+
+  async enqueue(operation: NewWritebackOperation): Promise<WritebackOperation> {
+    return this.store.enqueueOnce(operation);
   }
 
   async enqueueAndProcess(operation: NewWritebackOperation, options: EnqueueWritebackOptions = {}): Promise<WritebackOperation> {
@@ -824,6 +918,41 @@ export class WritebackProcessor {
     return (await this.store.get(record.idempotencyKey)) ?? record;
   }
 
+  async retryRegistered(
+    idempotencyKeys: readonly string[],
+    options: EnqueueWritebackOptions = {},
+  ): Promise<WritebackOperation[]> {
+    const records = await Promise.all(
+      idempotencyKeys.map((idempotencyKey) => this.store.get(idempotencyKey)),
+    );
+    const missingIndex = records.findIndex((record) => record === null);
+    if (missingIndex >= 0) {
+      throw new SymphonyError(
+        "invalid_request",
+        `Registered writeback does not exist: ${idempotencyKeys[missingIndex]}`,
+      );
+    }
+    for (const record of records) {
+      if (
+        record?.status === "skipped" &&
+        options.retrySkipped === true &&
+        (options.retrySkippedMessages === undefined ||
+          options.retrySkippedMessages.some(
+            (message) =>
+              record.lastError === message || record.resultMessage === message,
+          ))
+      ) {
+        await this.store.requeueSkipped(record);
+      }
+    }
+    await this.processDue({ idempotencyKeys });
+    return Promise.all(
+      idempotencyKeys.map(async (idempotencyKey, index) =>
+        (await this.store.get(idempotencyKey)) ?? records[index]!,
+      ),
+    );
+  }
+
   async processDue(options: ProcessDueOptions = {}): Promise<void> {
     const claimOptions = options.idempotencyKeys === undefined ? {} : { idempotencyKeys: options.idempotencyKeys };
     for (const record of await this.store.claimDue(new Date(), claimOptions)) {
@@ -834,7 +963,16 @@ export class WritebackProcessor {
           continue;
         }
         if (guard.status === "retry") {
-          const nextAttemptAt = new Date(Date.now() + computeWritebackBackoffMs(record.attempt + 1, this.maxBackoffMs)).toISOString();
+          const nextAttemptAt =
+            record.lifecycleBinding === undefined
+              ? new Date(
+                  Date.now() +
+                    computeWritebackBackoffMs(
+                      record.attempt + 1,
+                      this.maxBackoffMs,
+                    ),
+                ).toISOString()
+              : new Date().toISOString();
           await this.store.markRetry(record, guard.message, nextAttemptAt);
           continue;
         }
@@ -859,6 +997,8 @@ export class WritebackProcessor {
   }
 
   private async verifyLifecycleBoundOperation(record: WritebackOperation): Promise<LifecycleGuardResult> {
+    const explicitBindingGuard = await this.verifyExplicitLifecycleBinding(record);
+    if (explicitBindingGuard.status !== "ready") return explicitBindingGuard;
     const acceptedArtifactBinding = acceptedArtifactBindingForOperation(record);
     if (acceptedArtifactBinding.status === "blocked") {
       return { status: "blocked", message: acceptedArtifactBinding.message };
@@ -902,12 +1042,14 @@ export class WritebackProcessor {
       if (!lifecycle || !plan || lifecycle.lastIssueBreakdownPlanId !== issueBreakdownPlanId) {
         return { status: "blocked", message: ISSUE_BREAKDOWN_WRITEBACK_NOT_CURRENT_REASON };
       }
-      if (plan.applicationStatus === "stale") {
+      const dispositionComment = isIssueBreakdownDispositionComment(record);
+      if (plan.applicationStatus === "stale" && !dispositionComment) {
         return { status: "blocked", message: ISSUE_BREAKDOWN_PLAN_STALE_REASON };
       }
       if (!plan.applicationOperationKeys.includes(record.idempotencyKey)) {
         return { status: "blocked", message: "issue breakdown writeback is not registered on the current plan" };
       }
+      if (dispositionComment) return { status: "ready" };
       if (
         (record.kind === "comment" || record.kind === "issue_relation" || record.kind === "transition") &&
         plan.createdIssueRefs.length < plan.proposedIssues.length
@@ -943,6 +1085,165 @@ export class WritebackProcessor {
       };
     }
     return { status: "ready" };
+  }
+
+  private async verifyExplicitLifecycleBinding(
+    record: WritebackOperation,
+  ): Promise<LifecycleGuardResult> {
+    const binding = record.lifecycleBinding;
+    if (binding === undefined) return { status: "ready" };
+    if (!this.lifecycleStore) {
+      return {
+        status: "blocked",
+        message: "lifecycle-bound writeback requires a lifecycle guard",
+      };
+    }
+    const lifecycle = await this.lifecycleStore.get(record.issueId);
+    if (lifecycle === null) {
+      return {
+        status: "retry",
+        message: "lifecycle-bound writeback is waiting for its durable record",
+      };
+    }
+    if (binding.kind === "merge_conflict") {
+      const conflict = lifecycle.mergeConflict;
+      if (conflict === null || conflict.id !== binding.recordId) {
+        return {
+          status: "retry",
+          message: "merge-conflict writeback is waiting for its durable conflict record",
+        };
+      }
+      return conflict.writebackOperationKeys.includes(record.idempotencyKey)
+        ? { status: "ready" }
+        : {
+            status: "retry",
+            message: "merge-conflict writeback is waiting for operation registration",
+          };
+    }
+    if (binding.kind === "merge_gate") {
+      const gate = lifecycle.mergeGate;
+      if (gate == null) {
+        return {
+          status: "retry",
+          message: "merge-gate writeback is waiting for its durable gate record",
+        };
+      }
+      if (gate.id !== binding.recordId) {
+        return {
+          status: "blocked",
+          message: "merge-gate writeback is no longer bound to the current gate",
+        };
+      }
+      if (
+        gate.status !== binding.status ||
+        gate.headSha !== binding.headSha ||
+        gate.supersededByHeadSha !== binding.supersededByHeadSha
+      ) {
+        return {
+          status: "retry",
+          message: "merge-gate writeback is waiting for its durable supersession state",
+        };
+      }
+      return gate.writebackOperationKeys.includes(record.idempotencyKey)
+        ? { status: "ready" }
+        : {
+            status: "retry",
+            message: "merge-gate writeback is waiting for operation registration",
+          };
+    }
+    if (binding.kind === "issue_checkpoint") {
+      const pointers = lifecycle.summaryPointers;
+      const provenanceResolved =
+        binding.resolvedBlockerProvenanceId === null ||
+        (lifecycle.blockerProvenances ?? []).some(
+          (candidate) =>
+            candidate.id === binding.resolvedBlockerProvenanceId &&
+            candidate.resolvedAt !== null,
+        );
+      if (
+        lifecycle.phase !== binding.phase ||
+        (pointers.prHeadSha ?? null) !== binding.prHeadSha ||
+        (pointers.gitBranchName ?? null) !== binding.gitBranchName ||
+        (pointers.baseRef ?? null) !== binding.baseRef ||
+        !provenanceResolved
+      ) {
+        return {
+          status: "retry",
+          message: "writeback is waiting for its durable lifecycle checkpoint",
+        };
+      }
+      return { status: "ready" };
+    }
+    if (binding.kind === "merge_gate_result") {
+      const owner = (lifecycle.mergeGateResults ?? []).find(
+        (candidate) => candidate.id === binding.recordId,
+      );
+      if (owner === undefined) {
+        return {
+          status: "retry",
+          message: "merge-gate-result writeback is waiting for its durable result",
+        };
+      }
+      if (isSupersededLifecycleRecord(owner)) {
+        return {
+          status: "blocked",
+          message: "merge-gate-result writeback owner has been superseded",
+        };
+      }
+      if (owner.idempotencyKey !== binding.resultIdempotencyKey) {
+        return {
+          status: "blocked",
+          message: "merge-gate-result writeback is bound to a different durable result",
+        };
+      }
+      return owner.writebackOperationKeys.includes(record.idempotencyKey)
+        ? { status: "ready" }
+        : {
+            status: "retry",
+            message: "merge-gate-result writeback is waiting for operation registration",
+          };
+    }
+
+    const collection =
+      binding.kind === "completion_report"
+        ? lifecycle.completionReports
+        : binding.kind === "completion_report_rejection"
+          ? lifecycle.completionReportRejections
+          : binding.kind === "issue_triage_report"
+            ? lifecycle.issueTriageReports
+          : binding.kind === "issue_post_mortem_report"
+            ? lifecycle.postMortemReports
+            : binding.kind === "review_verdict"
+              ? lifecycle.reviewVerdicts
+              : lifecycle.mergeConflictResolutionReports;
+    const owner = collection.find((candidate) => candidate.id === binding.recordId);
+    if (owner === undefined) {
+      return {
+        status: "retry",
+        message: `${binding.kind.replaceAll("_", "-")} writeback is waiting for its durable report`,
+      };
+    }
+    if ("supersededAt" in owner && isSupersededLifecycleRecord(owner)) {
+      return {
+        status: "blocked",
+        message: `${binding.kind.replaceAll("_", "-")} writeback owner has been superseded`,
+      };
+    }
+    if (
+      binding.kind === "review_verdict" &&
+      lifecycle.lastReviewVerdictId !== owner.id
+    ) {
+      return {
+        status: "blocked",
+        message: "review-verdict writeback is no longer bound to the current verdict",
+      };
+    }
+    return owner.writebackOperationKeys.includes(record.idempotencyKey)
+      ? { status: "ready" }
+      : {
+          status: "retry",
+          message: `${binding.kind.replaceAll("_", "-")} writeback is waiting for operation registration`,
+        };
   }
 
   private async execute(record: WritebackOperation) {
@@ -1046,6 +1347,48 @@ function isPullRequestHandoffOperation(record: WritebackOperation): boolean {
   return record.kind === "comment" && record.payload.dedupeKey.startsWith("pull-request-handoff:");
 }
 
+function compatibleExistingWriteback(
+  existing: WritebackOperation,
+  operation: NewWritebackOperation,
+): WritebackOperation {
+  const sameCoreIntent =
+    existing.idempotencyKey === operation.idempotencyKey &&
+    existing.kind === operation.kind &&
+    existing.issueId === operation.issueId &&
+    (existing.runId ?? null) === (operation.runId ?? null) &&
+    isDeepStrictEqual(existing.payload, operation.payload);
+  if (!sameCoreIntent) {
+    throw new SymphonyError(
+      "conflict",
+      "Writeback idempotency key was reused with different intent",
+      {
+        idempotencyKey: operation.idempotencyKey,
+        existingKind: existing.kind,
+        incomingKind: operation.kind,
+        existingIssueId: existing.issueId,
+        incomingIssueId: operation.issueId,
+      },
+    );
+  }
+  const existingBinding = existing.lifecycleBinding;
+  const incomingBinding = operation.lifecycleBinding;
+  if (existingBinding === undefined && incomingBinding !== undefined) {
+    return { ...existing, lifecycleBinding: incomingBinding };
+  }
+  if (
+    existingBinding !== undefined &&
+    incomingBinding !== undefined &&
+    !isDeepStrictEqual(existingBinding, incomingBinding)
+  ) {
+    throw new SymphonyError(
+      "conflict",
+      "Writeback idempotency key was reused with a different lifecycle binding",
+      { idempotencyKey: operation.idempotencyKey },
+    );
+  }
+  return existing;
+}
+
 export function issueBreakdownPlanIdForOperation(record: WritebackOperation): string | null {
   const binding = issueBreakdownPlanBindingForOperation(record);
   return binding.status === "bound" ? binding.planId : null;
@@ -1078,6 +1421,16 @@ function issueBreakdownPlanBindingForComment(record: Extract<WritebackOperation,
   }
   const planId = dedupePlanId ?? idempotencyPlanId;
   return planId ? { status: "bound", planId } : { status: "none" };
+}
+
+function isIssueBreakdownDispositionComment(record: WritebackOperation): boolean {
+  if (record.kind !== "comment") return false;
+  const planId = record.payload.issueBreakdownPlanId?.trim();
+  if (!planId) return false;
+  return (
+    record.payload.dedupeKey === `issue-breakdown-disposition:${planId}` &&
+    record.idempotencyKey.endsWith(`:issue-breakdown:${planId}:disposition`)
+  );
 }
 
 function parseIssueBreakdownChildrenDedupeKey(dedupeKey: string): string | null {

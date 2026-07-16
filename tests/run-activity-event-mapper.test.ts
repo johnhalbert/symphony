@@ -72,13 +72,71 @@ describe("mapAgentEventToRunActivityEvent", () => {
     });
     expect(mapped[9]).toMatchObject({
       message: "final assistant answer",
-      payload: { kind: "terminal", status: "succeeded", textPreview: "final assistant answer" },
+      payload: {
+        kind: "terminal",
+        status: "succeeded",
+        finalResponseText: "final assistant answer",
+        textPreview: "final assistant answer",
+      },
     });
     expect(mapped[10]).toMatchObject({
       message: "Hermes run failed: token=[redacted]",
       payload: { kind: "terminal", status: "failed", errorPreview: "Hermes run failed: token=[redacted]", redacted: true },
     });
     expect(mapped[11]).toMatchObject({ message: "Run cancelled", payload: { kind: "terminal", status: "cancelled" } });
+  });
+
+  it("keeps the durable terminal response complete while bounding its activity preview", () => {
+    const response = `Disposition\n\n${"full finding\n".repeat(1_000)}Bearer SECRET_FINAL_RESPONSE`;
+    const expectedResponse = response.replace("Bearer SECRET_FINAL_RESPONSE", "Bearer [redacted]");
+
+    const mapped = mapAgentEventToRunActivityEvent({ type: "completed", message: response });
+
+    expect(mapped.message).not.toBe(expectedResponse);
+    expect(mapped.message?.length).toBeLessThanOrEqual(500);
+    expect(mapped.message).toContain("...[truncated]");
+    expect(mapped.payload).toMatchObject({
+      kind: "terminal",
+      status: "succeeded",
+      finalResponseText: expectedResponse,
+      textPreview: mapped.message,
+      truncated: true,
+      redacted: true,
+    });
+    expect((mapped.payload as Record<string, unknown>).finalResponseText).toHaveLength(expectedResponse.length);
+    expect(expectedResponse.length).toBeGreaterThan(10_000);
+  });
+
+  it("keeps the complete terminal response separate from bounded harness activity metadata", () => {
+    const response = `Disposition\n${"complete evidence\n".repeat(1_000)}SECRET_ACTIVITY_FINAL`;
+    const expectedResponse = response.replace("SECRET_ACTIVITY_FINAL", "[redacted]");
+    const mapped = mapAgentEventToRunActivityEvent({
+      type: "completed",
+      message: response,
+      runActivity: acpRunActivity({
+        actor: "runtime",
+        channel: "terminal",
+        kind: "run_succeeded",
+        text: "bounded activity preview",
+      }),
+    });
+
+    expect(mapped.eventType).toBe("run_succeeded");
+    expect(mapped.message).not.toBe(expectedResponse);
+    expect(mapped.message?.length).toBeLessThanOrEqual(500);
+    expect(mapped.payload).toMatchObject({
+      finalResponseText: expectedResponse,
+      textPreview: mapped.message,
+      textTruncated: true,
+      truncated: true,
+    });
+  });
+
+  it("does not invent durable response provenance for a completion without assistant text", () => {
+    const mapped = mapAgentEventToRunActivityEvent({ type: "completed" });
+
+    expect(mapped.message).toBe("Run completed");
+    expect(mapped.payload).not.toHaveProperty("finalResponseText");
   });
 
   it("documents ambiguous progress mapping: explicit deltas are assistant_delta, tool activity is tool, and stream/missing source stays generic progress", () => {

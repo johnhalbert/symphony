@@ -6,6 +6,7 @@ import type { MergePolicyObservation } from "../merge/MergePolicyService.js";
 import type {
   IssueBreakdownPlanRecord,
   IssueAcceptedArtifactRecord,
+  IssueBlockerProvenanceRecord,
   IssueCompletionReportRecord,
   IssueLifecyclePatch,
   IssueMergeConflictMetadata,
@@ -218,6 +219,7 @@ export interface IssueCurrentFields {
   currentIssueTriageTriggerFingerprint: string | null;
   issueTriageCurrentTriggerReportIds: string[];
   latestIssueTriageReportBlockers: IssueTriageBlockerRecord[];
+  latestPersistedIssueTriageReportBlockers?: IssueTriageBlockerRecord[];
   lastPostMortemReportId: string | null;
   lastPostMortemReportTriggerFingerprint: string | null;
   lastPostMortemReportWritebackOperationKeys: string[] | null;
@@ -250,6 +252,7 @@ export interface IssueCurrentFields {
   lastBaseRefObservationFingerprint?: string | null;
   lastBaseRefObservationClassification?: IssueBaseRefObservation["classification"] | null;
   lastBaseRefObservation?: IssueBaseRefObservation | null;
+  activeBlockerProvenance?: IssueBlockerProvenanceRecord | null;
   activePreservedWorktreeStashes: IssuePreservedWorktreeStash[];
   mergePolicyMerge: IssueMergeMetadata | null;
   mergePolicyMergeGate: IssueMergeGateState | null;
@@ -491,6 +494,8 @@ export interface LifecycleMutationEvidenceSnapshot extends IssueEvidenceHistoryS
   lifecycleMergeConflict: IssueMergeConflictMetadata | null;
   lifecycleReviewFeedback: IssueReviewFeedbackRecord[] | null;
   lifecycleBaseRefObservation: IssueBaseRefObservation | null;
+  lifecycleBlockerProvenances?: IssueBlockerProvenanceRecord[] | null;
+  lifecycleActiveBlockerProvenanceId?: string | null;
   lifecyclePreservedWorktreeStashes: IssuePreservedWorktreeStash[] | null;
   lifecycleSummaryCiStatus: string | null;
   lifecycleSummaryPointers: unknown;
@@ -784,6 +789,15 @@ export function normalizeIssueHistorySnapshotEvidenceFields(
         lifecycleBaseRefObservation: recordField<IssueBaseRefObservation>(
           payload,
           "baseRefObservation",
+        ),
+        lifecycleBlockerProvenances:
+          recordArrayField<IssueBlockerProvenanceRecord>(
+            payload,
+            "blockerProvenances",
+          ),
+        lifecycleActiveBlockerProvenanceId: stringField(
+          payload,
+          "activeBlockerProvenanceId",
         ),
         lifecyclePreservedWorktreeStashes:
           recordArrayField<IssuePreservedWorktreeStash>(

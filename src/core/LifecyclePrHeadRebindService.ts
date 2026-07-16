@@ -3,6 +3,7 @@ import { access } from "node:fs/promises";
 
 import type { ServiceConfig } from "./config/Config.js";
 import { errorMessage } from "./errors.js";
+import { resolveActiveBlockerProvenancePatch } from "./BlockerProvenance.js";
 import type { Logger } from "./logging/StructuredLogger.js";
 import { IssueLifecycleEvidenceRecorder } from "./orchestration/IssueLifecycleEvidenceRecorder.js";
 import type { IssueStateStore } from "./orchestration/IssueOrchestrationState.js";
@@ -319,6 +320,21 @@ function buildPatch(
 
   if ((lifecycle.baseRefObservation ?? null) !== null) {
     patch.baseRefObservation = null;
+    const activeBlockerProvenanceId = lifecycle.activeBlockerProvenanceId ?? null;
+    const blockerPatch = resolveActiveBlockerProvenancePatch(lifecycle, {
+      resolution: "superseded",
+    });
+    Object.assign(patch, blockerPatch);
+    if (
+      activeBlockerProvenanceId !== null &&
+      blockerPatch.activeBlockerProvenanceId === null &&
+      lifecycle.mergeConflict?.blockerProvenanceId === activeBlockerProvenanceId
+    ) {
+      patch.mergeConflict = {
+        ...lifecycle.mergeConflict,
+        blockerProvenanceId: null,
+      };
+    }
   }
 
   return {

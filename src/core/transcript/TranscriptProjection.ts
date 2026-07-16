@@ -252,11 +252,9 @@ export function sanitizeAgentEventForPublicOutput(event: AgentEvent): AgentEvent
         ...(event.payload === undefined ? {} : { payload: sanitizePublicJson(event.payload) }),
       });
     case "completed":
-      return withSanitizedAgentEventExtras({
-        ...event,
-        ...(event.message === undefined ? {} : { message: sanitizedPreviewValue(event.message).preview ?? "" }),
-        ...(event.payload === undefined ? {} : { payload: sanitizePublicJson(event.payload) }),
-      });
+      return withSanitizedAgentEventExtras(
+        sanitizeCompletedAgentEvent(event),
+      );
     case "failed":
       return withSanitizedAgentEventExtras({ ...event, error: sanitizedPreviewValue(event.error).preview ?? "" });
     case "rate_limits":
@@ -266,6 +264,42 @@ export function sanitizeAgentEventForPublicOutput(event: AgentEvent): AgentEvent
     default:
       return withSanitizedAgentEventExtras(event);
   }
+}
+
+function sanitizeCompletedAgentEvent(
+  event: Extract<AgentEvent, { type: "completed" }>,
+): Extract<AgentEvent, { type: "completed" }> {
+  const existingPayload = isRecord(event.payload) ? event.payload : null;
+  const responseSource =
+    typeof existingPayload?.finalResponseText === "string"
+      ? existingPayload.finalResponseText
+      : event.message;
+  const response =
+    responseSource === undefined
+      ? null
+      : redactTextPreserveFormatting(
+          responseSource,
+          Number.MAX_SAFE_INTEGER,
+        ).text ?? "";
+  const sanitizedPayload =
+    event.payload === undefined ? undefined : sanitizePublicJson(event.payload);
+  if (response === null) {
+    return {
+      ...event,
+      ...(sanitizedPayload === undefined
+        ? {}
+        : { payload: sanitizedPayload }),
+    };
+  }
+  const message = redactTextPreserveFormatting(response, 500).text ?? "";
+  return {
+    ...event,
+    message,
+    payload: {
+      ...(isRecord(sanitizedPayload) ? sanitizedPayload : {}),
+      finalResponseText: response,
+    },
+  };
 }
 
 function withSanitizedAgentEventExtras<T extends AgentEvent>(event: T): T {

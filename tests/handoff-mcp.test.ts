@@ -10,6 +10,29 @@ import {
 import { issue } from "./helpers.js";
 
 describe("MCP handoff prompt rendering", () => {
+  it("requires every agent role to submit and echo a complete unexcerpted finalDisposition", () => {
+    const input = { issue: issue({ identifier: "ENG-1" }) };
+    const terminalHandoffs = [
+      renderCompletionMcpHandoffPrompt(input),
+      renderReviewMcpHandoffPrompt(input),
+      renderIssueBreakdownMcpHandoffPrompt(input),
+      renderIssueTriageMcpHandoffPrompt(input),
+      renderIssuePostMortemMcpHandoffPrompt(input),
+    ];
+    const conflictHandoff = renderMergeConflictResolutionMcpHandoffPrompt(input);
+
+    for (const prompt of terminalHandoffs) {
+      expect(prompt).toContain("finalDisposition");
+      expect(prompt).toContain("complete standalone final response");
+      expect(prompt).toContain("no excerpting");
+      expect(prompt).toContain("exact text as your terminal assistant response");
+    }
+    expect(conflictHandoff).toContain("finalDisposition");
+    expect(conflictHandoff).toContain("complete standalone disposition");
+    expect(conflictHandoff).toContain("no excerpting");
+    expect(conflictHandoff).toContain("exact text as your terminal assistant response");
+  });
+
   it("requires issue-breakdown proposals to include the agent-eligible issue contract", () => {
     const prompt = renderIssueBreakdownMcpHandoffPrompt({ issue: issue({ identifier: "ENG-1" }) });
 

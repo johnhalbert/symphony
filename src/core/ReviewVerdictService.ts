@@ -1,6 +1,10 @@
 import { z } from "zod";
 import type { ServiceConfig } from "./config/Config.js";
 import { SymphonyError } from "./errors.js";
+import {
+  linkBlockerProvenanceToVerdictPatch,
+  matchingReviewFeedbackBaseRefProvenance,
+} from "./BlockerProvenance.js";
 import type {
   CompletionReportPullRequestRef,
   IssueLifecyclePatch,
@@ -29,8 +33,10 @@ import {
   planReviewAcceptedArtifactPassWritebacks,
   planReviewFailWritebacks,
   planReviewPassWritebacks,
+  planReviewVerdictDispositionOnlyWriteback,
 } from "./writeback/TransitionPolicy.js";
 import type { NewWritebackOperation, WritebackOperation, WritebackOutboxStore } from "./writeback/WritebackOutbox.js";
+import { bindWritebackOperationToLifecycle } from "./writeback/WritebackOutbox.js";
 
 const PASS_REQUIRES_APPROVE_MESSAGE =
   'Pass review verdict requires prior submit_pull_request_review_feedback with kind="review" and event="APPROVE" for the active reviewer run and lifecycle-bound PR.';
@@ -86,6 +92,7 @@ const reviewDiscoveryFindingSchema = z.object({
 const reviewVerdictSchema = z.object({
   runId: z.string().trim().min(1),
   issueId: z.string().trim().min(1),
+  finalDisposition: z.string().min(1).refine((value) => value.trim().length > 0, "Final disposition cannot be blank"),
   verdict: z.enum(["pass", "fail", "blocked"]),
   acceptanceResults: z
     .array(
@@ -158,6 +165,7 @@ export class ReviewVerdictService {
       (item) => item.runId === context.activeRunId && item.idempotencyKey === verdict.idempotencyKey,
     );
     if (existingSubmission) {
+      assertReviewVerdictFinalDispositionReplayAllowed(existingSubmission, verdict);
       return {
         accepted: true,
         replayed: true,
@@ -170,6 +178,7 @@ export class ReviewVerdictService {
       (item) => item.runId === context.activeRunId && item.idempotencyKey === verdict.idempotencyKey,
     );
     if (existingAccepted) {
+      assertReviewVerdictFinalDispositionReplayAllowed(existingAccepted, verdict);
       return {
         accepted: true,
         replayed: true,
@@ -208,6 +217,14 @@ export class ReviewVerdictService {
       existingLifecycle ? {} : { phase: lifecyclePhase },
     );
     this.validateReviewFeedbackAlignment(verdict, lifecycle);
+    const currentPullRequest = currentPullRequestForReview(lifecycle);
+    const blockerProvenance =
+      verdict.verdict === "blocked" && currentPullRequest !== null
+        ? matchingReviewFeedbackBaseRefProvenance(lifecycle, {
+            runId: verdict.runId,
+            pullRequest: currentPullRequest,
+          })
+        : null;
     const submission: IssueReviewVerdictSubmissionRecord = {
       id: verdictIdFor(context.issue.id, verdict.idempotencyKey),
       idempotencyKey: verdict.idempotencyKey,
@@ -219,12 +236,14 @@ export class ReviewVerdictService {
         verdict.verdict === "pass"
           ? reviewPassDisposition(lifecycle)
           : null,
+      finalDisposition: verdict.finalDisposition,
       acceptanceResults: normalizeAcceptanceResults(verdict.acceptanceResults),
       findings: storedFindings,
       gateFindings,
       discoveryFindings,
       evidence: verdict.evidence,
       reviewer: context.reviewer ?? null,
+      blockerProvenanceId: blockerProvenance?.id ?? null,
       submittedAt: new Date().toISOString(),
       status: "pending",
       ignoreStateGate: context.ignoreStateGate === true,
@@ -235,6 +254,11 @@ export class ReviewVerdictService {
     };
     await this.options.lifecycleStore.updateIssue(context.issue, {
       reviewVerdictSubmissions: [...(lifecycle.reviewVerdictSubmissions ?? []), submission],
+      ...linkBlockerProvenanceToVerdictPatch(
+        lifecycle,
+        blockerProvenance?.id ?? null,
+        submission.id,
+      ),
     });
 
     return {
@@ -323,6 +347,27 @@ export class ReviewVerdictService {
   }
 }
 
+function assertReviewVerdictFinalDispositionReplayAllowed(
+  existing: Pick<IssueReviewVerdictSubmissionRecord, "id" | "runId" | "idempotencyKey" | "finalDisposition">,
+  verdict: ReviewVerdictInput,
+): void {
+  if (
+    existing.finalDisposition === undefined ||
+    existing.finalDisposition === verdict.finalDisposition
+  ) {
+    return;
+  }
+  throw new SymphonyError(
+    "conflict",
+    "Review verdict idempotency key was reused with a different final disposition",
+    {
+      verdictId: existing.id,
+      runId: existing.runId,
+      idempotencyKey: existing.idempotencyKey,
+    },
+  );
+}
+
 export function planReviewVerdictSubmissionApplication(input: {
   config: ServiceConfig;
   issue: Issue;
@@ -343,13 +388,22 @@ export function planReviewVerdictSubmissionApplication(input: {
   const maxReviewerFailures = input.config.reviewLoop.failureLimits.reviewerFailures;
   const ceilingReached = input.submission.verdict === "fail" && reviewRound >= maxReviewerFailures;
   const provisionalVerdict = acceptedVerdictFromSubmission(input.submission, []);
+  const finalDisposition = input.submission.finalDisposition;
   const writebackDetails = {
     idempotencyKey: input.submission.idempotencyKey,
+    ...(finalDisposition === undefined ? {} : { finalDisposition }),
     acceptanceResults: input.submission.acceptanceResults,
     findings: input.submission.findings,
     gateFindings: input.submission.gateFindings,
     discoveryFindings: input.submission.discoveryFindings,
     evidence: input.submission.evidence,
+    blockerProvenance:
+      input.submission.blockerProvenanceId === null ||
+      input.submission.blockerProvenanceId === undefined
+        ? null
+        : (input.lifecycle.blockerProvenances ?? []).find(
+            (record) => record.id === input.submission.blockerProvenanceId,
+          ) ?? null,
   };
   let operations: NewWritebackOperation[];
   if (ceilingReached) {
@@ -364,6 +418,7 @@ export function planReviewVerdictSubmissionApplication(input: {
         maxReviewRounds: maxReviewerFailures,
         lastCompletionReport: latestCurrentCompletionReport(input.lifecycle),
         lastReviewVerdict: provisionalVerdict,
+        ...(finalDisposition === undefined ? {} : { finalDisposition }),
         requiredAction:
           "Review the requested changes, decide whether the worker should continue, and move the issue out of Blocked when it is ready for another implementation pass.",
       },
@@ -382,13 +437,30 @@ export function planReviewVerdictSubmissionApplication(input: {
   } else {
     operations = planReviewPassWritebacks(reviewWritebackContextForSubmission(input.issue, input.submission), input.config, writebackDetails);
   }
+  if (operations.length === 0 && input.submission.ignoreStateGate === true) {
+    operations = planReviewVerdictDispositionOnlyWriteback(
+      reviewWritebackContextForSubmission(input.issue, input.submission),
+      input.config,
+      {
+        idempotencyKey: input.submission.idempotencyKey,
+        verdict: input.submission.verdict,
+        ...(finalDisposition === undefined ? {} : { finalDisposition }),
+      },
+    );
+  }
   if (operations.length === 0 && input.submission.ignoreStateGate !== true) {
     throw new SymphonyError("invalid_request", "Review verdict cannot be accepted for the current issue state");
   }
+  const boundOperations = operations.map((operation) =>
+    bindWritebackOperationToLifecycle(operation, {
+      kind: "review_verdict",
+      recordId: input.submission.id,
+    }),
+  );
 
   const storedVerdict = acceptedVerdictFromSubmission(
     input.submission,
-    operations.map((operation) => operation.idempotencyKey),
+    boundOperations.map((operation) => operation.idempotencyKey),
   );
   const appliedAt = input.appliedAt ?? new Date().toISOString();
   const reviewVerdictSubmissions = (input.lifecycle.reviewVerdictSubmissions ?? []).map((submission) =>
@@ -414,7 +486,7 @@ export function planReviewVerdictSubmissionApplication(input: {
     incompleteTurnCount: input.submission.verdict === "fail" ? 0 : input.lifecycle.incompleteTurnCount,
     blockedReason:
       input.submission.verdict === "blocked"
-        ? `review blocked: ${blockedReasonForVerdict(storedVerdict)}`
+        ? `review blocked: ${writebackDetails.blockerProvenance?.code ?? "non_worker_owned"}`
         : ceilingReached
           ? `max reviewer failures reached (${reviewRound}/${maxReviewerFailures})`
           : null,
@@ -422,7 +494,7 @@ export function planReviewVerdictSubmissionApplication(input: {
     reviewVerdicts: [...input.lifecycle.reviewVerdicts, storedVerdict],
     reviewVerdictSubmissions,
   };
-  return { verdict: storedVerdict, operations, patch };
+  return { verdict: storedVerdict, operations: boundOperations, patch };
 }
 
 function acceptedVerdictFromSubmission(
@@ -437,12 +509,14 @@ function acceptedVerdictFromSubmission(
     issueIdentifier: submission.issueIdentifier,
     verdict: submission.verdict,
     passDisposition: submission.passDisposition ?? null,
+    ...(submission.finalDisposition === undefined ? {} : { finalDisposition: submission.finalDisposition }),
     acceptanceResults: submission.acceptanceResults,
     findings: submission.findings,
     gateFindings: submission.gateFindings,
     discoveryFindings: submission.discoveryFindings,
     evidence: submission.evidence,
     reviewer: submission.reviewer,
+    blockerProvenanceId: submission.blockerProvenanceId ?? null,
     submittedAt: submission.submittedAt,
     writebackOperationKeys,
     supersededAt: null,
@@ -460,12 +534,14 @@ function submissionFromAcceptedVerdict(verdict: IssueReviewVerdictRecord): Issue
     issueIdentifier: verdict.issueIdentifier,
     verdict: verdict.verdict,
     passDisposition: verdict.passDisposition ?? null,
+    ...(verdict.finalDisposition === undefined ? {} : { finalDisposition: verdict.finalDisposition }),
     acceptanceResults: verdict.acceptanceResults,
     findings: verdict.findings,
     gateFindings: verdict.gateFindings,
     discoveryFindings: verdict.discoveryFindings,
     evidence: verdict.evidence,
     reviewer: verdict.reviewer,
+    blockerProvenanceId: verdict.blockerProvenanceId ?? null,
     submittedAt: verdict.submittedAt,
     status: "applied",
     ignoreStateGate: false,
@@ -555,14 +631,6 @@ export function formatWorkerReviewVerdictPrompt(lifecycle: IssueLifecycleRecord)
     "Evidence:",
     ...verdict.evidence.map((item) => `- ${item}`),
   ].join("\n");
-}
-
-function blockedReasonForVerdict(verdict: IssueReviewVerdictRecord): string {
-  const firstFinding = verdict.findings.find((finding) => finding.trim().length > 0);
-  if (firstFinding) return firstFinding.length <= 160 ? firstFinding : `${firstFinding.slice(0, 157)}...`;
-  const firstDiscovery = verdict.discoveryFindings.find((finding) => finding.summary.trim().length > 0)?.summary;
-  if (firstDiscovery) return firstDiscovery.length <= 160 ? firstDiscovery : `${firstDiscovery.slice(0, 157)}...`;
-  return "reviewer reported a non-worker-owned blocker";
 }
 
 export function formatWorkerMergeGatePrompt(lifecycle: IssueLifecycleRecord): string | null {

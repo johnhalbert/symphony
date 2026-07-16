@@ -23,6 +23,7 @@ export const ISSUE_CONTENT_FINGERPRINT_VERSION = 1;
 const issueBreakdownPlanSchema = z.object({
   runId: z.string().trim().min(1),
   issueId: z.string().trim().min(1),
+  finalDisposition: z.string().min(1).refine((value) => value.trim().length > 0, "Final disposition cannot be blank"),
   summary: z.string().trim().min(1),
   proposedIssues: z
     .array(
@@ -78,6 +79,7 @@ export class IssueBreakdownPlanService {
     const configFingerprint = issueBreakdownConfigFingerprint(this.options.config);
     const contentFingerprint = issueContentFingerprint(context.issue);
     const requestHash = issueBreakdownPlanRequestHash(parsed);
+    const preFinalDispositionRequestHash = preFinalDispositionIssueBreakdownPlanRequestHash(parsed);
     const existingScoped = existingLifecycle?.issueBreakdownPlans.find(
       (plan) => plan.runId === context.activeRunId && plan.idempotencyKey === parsed.idempotencyKey,
     );
@@ -86,6 +88,7 @@ export class IssueBreakdownPlanService {
         idempotencyKey: parsed.idempotencyKey,
         activeRunId: context.activeRunId,
         requestHash,
+        preFinalDispositionRequestHash,
       });
       return { accepted: true, replayed: true, plan: existingScoped };
     }
@@ -112,6 +115,7 @@ export class IssueBreakdownPlanService {
       runId: parsed.runId,
       issueId: context.issue.id,
       issueIdentifier: context.issue.identifier,
+      finalDisposition: parsed.finalDisposition,
       summary: parsed.summary,
       proposedIssues: parsed.proposedIssues,
       transcriptPointers: [`/api/v1/runs/${encodeURIComponent(parsed.runId)}/transcript`],
@@ -293,6 +297,31 @@ export function issueBreakdownPlanRequestHash(input: IssueBreakdownPlanInput): s
     .update(
       stableJson({
         issueId: input.issueId,
+        finalDisposition: input.finalDisposition,
+        summary: normalizeString(input.summary),
+        proposedIssues: input.proposedIssues
+          .map((item) => ({
+            title: normalizeString(item.title),
+            description: normalizeString(item.description),
+            acceptanceCriteria: normalizeStringList(item.acceptanceCriteria),
+            dependencies: normalizeStringList(item.dependencies),
+            labels: normalizeStringList(item.labels, { lowercase: true }),
+          }))
+          .sort((left, right) =>
+            `${left.title}\0${left.description}\0${left.labels.join(",")}`.localeCompare(
+              `${right.title}\0${right.description}\0${right.labels.join(",")}`,
+            ),
+          ),
+      }),
+    )
+    .digest("hex");
+}
+
+export function preFinalDispositionIssueBreakdownPlanRequestHash(input: IssueBreakdownPlanInput): string {
+  return createHash("sha256")
+    .update(
+      stableJson({
+        issueId: input.issueId,
         summary: normalizeString(input.summary),
         proposedIssues: input.proposedIssues
           .map((item) => ({
@@ -419,12 +448,19 @@ function assertIssueBreakdownPlanReplayAllowed(
     idempotencyKey: string;
     activeRunId: string;
     requestHash: string;
+    preFinalDispositionRequestHash: string;
   },
 ): void {
   if (existing.requestHash.length === 0 || existing.issueContentFingerprint.length === 0) {
     throw issueBreakdownPlanIdempotencyConflict("legacy_plan_not_replayable", existing, expected);
   }
-  if (existing.requestHash !== expected.requestHash) {
+  if (
+    existing.requestHash !== expected.requestHash &&
+    !(
+      existing.finalDisposition === undefined &&
+      existing.requestHash === expected.preFinalDispositionRequestHash
+    )
+  ) {
     throw issueBreakdownPlanIdempotencyConflict("payload_mismatch", existing, expected);
   }
 }
@@ -436,6 +472,7 @@ function issueBreakdownPlanIdempotencyConflict(
     idempotencyKey: string;
     activeRunId: string;
     requestHash: string;
+    preFinalDispositionRequestHash?: string;
     configFingerprint?: string;
     issueContentFingerprint?: string;
   },

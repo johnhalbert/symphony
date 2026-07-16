@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseServiceConfig } from "../src/core/config/Config.js";
 import { SymphonyError } from "../src/core/errors.js";
+import { createReviewFeedbackBaseRefProvenance } from "../src/core/BlockerProvenance.js";
 import type { IssueBaseRefObservation } from "../src/core/BaseRefVerification.js";
 import { MergePolicyService, type MergePolicyGitHubClient } from "../src/core/merge/MergePolicyService.js";
 import {
@@ -177,6 +178,145 @@ describe("MergePolicyService", () => {
     expect(lifecycle?.mergeGate?.status).toBe("superseded");
     expect(lifecycle?.mergeGate?.supersededByHeadSha).toBe("new-head-sha");
     expect(lifecycle?.summaryPointers.ciStatus).toBe("head_superseded");
+  });
+
+  it("does not execute head-supersession writebacks before the durable gate owner is committed", async () => {
+    const config = mergeConfig({ noCiEvidence: "Repository intentionally has no CI for this test." });
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const outbox = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const writer = new MemoryWriter(currentIssue);
+    const writeback = new WritebackProcessor(
+      outbox,
+      writer,
+      new StructuredLogger(() => undefined),
+      60_000,
+    );
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback,
+      client: new FakeMergeClient({ headSha: "new-head-sha" }),
+    });
+    const observation = await service.observeIssue(currentIssue, "head-supersession-fault");
+    const plan = await service.planHeadSupersession(currentIssue, observation);
+    const update = vi.spyOn(lifecycleStore, "updateIssue").mockImplementationOnce(async () => {
+      await writeback.processDue();
+      throw new Error("simulated lifecycle commit failure");
+    });
+
+    await expect(service.recordHeadSupersessionLifecycle(currentIssue, plan)).rejects.toThrow(
+      "simulated lifecycle commit failure",
+    );
+    expect(writer.comments).toEqual([]);
+    expect(writer.transitions).toEqual([]);
+    expect(await outbox.list()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          status: "retrying",
+          lifecycleBinding: expect.objectContaining({
+            kind: "merge_gate",
+            recordId: plan.supersededGate.id,
+            supersededByHeadSha: "new-head-sha",
+          }),
+        }),
+      ]),
+    );
+
+    update.mockRestore();
+    await service.recordHeadSupersessionLifecycle(currentIssue, plan);
+    expect(currentIssue.state).toBe("Ready to Merge");
+    await service.applyHeadSupersessionWritebacks(currentIssue, plan);
+
+    expect(currentIssue.state).toBe("In Progress");
+    await expect(lifecycleStore.get(currentIssue.id)).resolves.toMatchObject({
+      phase: "implementation",
+      mergeGate: {
+        id: plan.supersededGate.id,
+        status: "superseded",
+        supersededByHeadSha: "new-head-sha",
+        writebackOperationKeys: plan.operations.map((operation) => operation.idempotencyKey),
+      },
+    });
+  });
+
+  it("does not execute merge-gate failure writebacks before the durable result is committed", async () => {
+    const config = mergeConfig({ requiredChecks: ["test"] });
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const outbox = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const writer = new MemoryWriter(currentIssue);
+    const writeback = new WritebackProcessor(
+      outbox,
+      writer,
+      new StructuredLogger(() => undefined),
+      60_000,
+    );
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback,
+      client: new FakeMergeClient({
+        checkResults: [
+          {
+            name: "test",
+            status: "failure",
+            conclusion: "failure",
+            url: "https://ci.test/test",
+          },
+        ],
+      }),
+    });
+    const observation = await service.observeIssue(currentIssue, "merge-gate-fault");
+    const plan = await service.planMergeGateFailure(currentIssue, observation, "repair");
+    const update = vi.spyOn(lifecycleStore, "updateIssue").mockImplementationOnce(async () => {
+      await writeback.processDue();
+      throw new Error("simulated lifecycle commit failure");
+    });
+
+    await expect(service.recordMergeGateFailureLifecycle(currentIssue, plan)).rejects.toThrow(
+      "simulated lifecycle commit failure",
+    );
+    expect(writer.comments).toEqual([]);
+    expect(writer.transitions).toEqual([]);
+    expect(await outbox.list()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          status: "retrying",
+          lifecycleBinding: {
+            kind: "merge_gate_result",
+            recordId: plan.storedResult.id,
+            resultIdempotencyKey: plan.storedResult.idempotencyKey,
+          },
+        }),
+      ]),
+    );
+
+    update.mockRestore();
+    await service.recordMergeGateFailureLifecycle(currentIssue, plan);
+    expect(currentIssue.state).toBe("Ready to Merge");
+    await service.applyMergeGateFailureWritebacks(currentIssue, plan);
+
+    expect(currentIssue.state).toBe("In Progress");
+    await expect(lifecycleStore.get(currentIssue.id)).resolves.toMatchObject({
+      phase: "implementation",
+      lastMergeGateResultId: plan.storedResult.id,
+      mergeGateResults: [
+        expect.objectContaining({
+          id: plan.storedResult.id,
+          idempotencyKey: plan.storedResult.idempotencyKey,
+          writebackOperationKeys: plan.operations.map((operation) => operation.idempotencyKey),
+        }),
+      ],
+    });
   });
 
   it("silently retires an old-head merge gate when the latest report already matches the live head", async () => {
@@ -666,6 +806,19 @@ describe("MergePolicyService", () => {
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const observation = baseRefObservation({ operation: "review_feedback" });
+    const provenance = createReviewFeedbackBaseRefProvenance({
+      issue: currentIssue,
+      runId: "review-run-1",
+      pullRequestNumber: 42,
+      pullRequestHeadSha: "head-sha-1",
+      observation,
+    });
+    await lifecycleStore.updateIssue(currentIssue, {
+      baseRefObservation: observation,
+      blockerProvenances: [provenance],
+      activeBlockerProvenanceId: provenance.id,
+    });
     const conflictGit = new FakeConflictGit({
       status: "clean",
       originalHeadSha: "head-sha-1",
@@ -748,6 +901,19 @@ describe("MergePolicyService", () => {
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const observation = baseRefObservation({ operation: "review_feedback" });
+    const provenance = createReviewFeedbackBaseRefProvenance({
+      issue: currentIssue,
+      runId: "review-run-1",
+      pullRequestNumber: 42,
+      pullRequestHeadSha: "head-sha-1",
+      observation,
+    });
+    await lifecycleStore.updateIssue(currentIssue, {
+      baseRefObservation: observation,
+      blockerProvenances: [provenance],
+      activeBlockerProvenanceId: provenance.id,
+    });
     const conflictGit = new FakeConflictGit({
       status: "clean",
       originalHeadSha: "head-sha-1",
@@ -775,7 +941,7 @@ describe("MergePolicyService", () => {
       conflictGit,
     });
 
-    const result = await service.repairBaseRefDrift(currentIssue, baseRefObservation());
+    const result = await service.repairBaseRefDrift(currentIssue, observation);
     const lifecycle = await lifecycleStore.get(currentIssue.id);
 
     expect(result).toEqual({ status: "base_ref_repaired", headSha: "rebased-head-sha" });
@@ -809,12 +975,96 @@ describe("MergePolicyService", () => {
       blockedReason: null,
       mergeGate: null,
       mergeConflict: null,
+      activeBlockerProvenanceId: null,
+      blockerProvenances: [
+        expect.objectContaining({
+          id: provenance.id,
+          resolution: "base_ref_repair",
+          resolvedAt: expect.any(String),
+        }),
+      ],
       summaryPointers: {
         prHeadSha: "rebased-head-sha",
         prBranch: "symphony/TEST-1",
         baseRef: "main",
       },
     });
+  });
+
+  it("checkpoints the repaired head and provenance before Linear verification", async () => {
+    const config = mergeConfig({
+      noCiEvidence: "Repository intentionally has no CI for this test.",
+      conflictsState: "Approved with Conflicts",
+    });
+    const currentIssue = issue({ state: "In Review", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const observation = baseRefObservation({ operation: "review_feedback" });
+    const provenance = createReviewFeedbackBaseRefProvenance({
+      issue: currentIssue,
+      runId: "review-run-1",
+      pullRequestNumber: 42,
+      pullRequestHeadSha: "head-sha-1",
+      observation,
+    });
+    await lifecycleStore.updateIssue(currentIssue, {
+      baseRefObservation: observation,
+      blockerProvenances: [provenance],
+      activeBlockerProvenanceId: provenance.id,
+    });
+    const conflictGit = new FakeConflictGit({
+      status: "clean",
+      originalHeadSha: "head-sha-1",
+      observedPrBaseHeadSha: "base-sha-1",
+      liveBaseHeadSha: "base-sha-2",
+      preparedBaseHeadSha: "base-sha-2",
+      mergeBaseSha: "base-sha-1",
+      squashCommitSha: "squash-sha-1",
+      rebasedHeadSha: "rebased-head-sha",
+      conflictedFiles: [],
+    });
+    const outbox = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        outbox,
+        new MemoryWriter(currentIssue, "skipped"),
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client: new FakeMergeClient({ liveBaseHeadSha: "base-sha-2" }),
+      conflictGit,
+    });
+
+    await expect(
+      service.repairBaseRefDrift(currentIssue, observation),
+    ).rejects.toThrow(/Merge gate writeback did not succeed/);
+
+    await expect(lifecycleStore.get(currentIssue.id)).resolves.toMatchObject({
+      phase: "implementation",
+      blockedReason: null,
+      activeBlockerProvenanceId: null,
+      blockerProvenances: [
+        expect.objectContaining({
+          id: provenance.id,
+          resolution: "base_ref_repair",
+          resolvedAt: expect.any(String),
+        }),
+      ],
+      summaryPointers: {
+        prHeadSha: "rebased-head-sha",
+      },
+    });
+    expect(currentIssue.state).toBe("In Review");
+    expect(await outbox.list()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: "transition", status: "skipped" }),
+      ]),
+    );
   });
 
   it("repairs stale worktree base against the current live base when the observation is stale", async () => {
@@ -853,7 +1103,10 @@ describe("MergePolicyService", () => {
       conflictGit,
     });
 
-    const result = await service.repairBaseRefDrift(currentIssue, baseRefObservation());
+    const result = await service.repairBaseRefDrift(
+      currentIssue,
+      baseRefObservation(),
+    );
     const lifecycle = await lifecycleStore.get(currentIssue.id);
 
     expect(result).toEqual({ status: "base_ref_repaired", headSha: "rebased-head-sha" });
@@ -1071,6 +1324,94 @@ describe("MergePolicyService", () => {
     });
   });
 
+  it("does not carry base-ref provenance into a stash conflict while unwinding a failed local refresh", async () => {
+    const config = mergeConfig({
+      noCiEvidence: "Repository intentionally has no CI for this test.",
+      conflictsState: "Approved with Conflicts",
+    });
+    const currentIssue = issue({ state: "In Review", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const observation = baseRefObservation({ operation: "review_feedback" });
+    const provenance = createReviewFeedbackBaseRefProvenance({
+      issue: currentIssue,
+      runId: "review-run-1",
+      pullRequestNumber: 42,
+      pullRequestHeadSha: "head-sha-1",
+      observation,
+    });
+    await lifecycleStore.ensureIssue(currentIssue, {
+      phase: "blocked",
+      blockedReason: "Worktree HEAD is not based on the live origin base",
+      summaryPointers: {
+        workspacePath: path.join(root, currentIssue.identifier),
+        gitBranchName: "symphony/TEST-1",
+        baseRef: "main",
+        prUrl: null,
+        prNumber: null,
+        prHeadSha: null,
+        prBranch: null,
+      },
+      baseRefObservation: observation,
+      blockerProvenances: [provenance],
+      activeBlockerProvenanceId: provenance.id,
+    });
+    const conflictGit = new FakeConflictGit({
+      status: "clean",
+      originalHeadSha: "head-sha-1",
+      observedPrBaseHeadSha: "base-sha-1",
+      liveBaseHeadSha: "base-sha-2",
+      preparedBaseHeadSha: "base-sha-2",
+      mergeBaseSha: "base-sha-1",
+      squashCommitSha: "squash-sha-1",
+      rebasedHeadSha: "unused-pr-rebase-sha",
+      conflictedFiles: [],
+    });
+    conflictGit.localRefreshError = new Error("local refresh failed");
+    conflictGit.preservedStash = preservedStashRecord(path.join(root, currentIssue.identifier));
+    conflictGit.stashApplyResult = {
+      status: "conflicted",
+      stash: {
+        ...conflictGit.preservedStash,
+        status: "apply_conflicted",
+        conflictedFiles: ["src/local.ts"],
+        appliedAt: "2026-01-01T00:00:02.000Z",
+      },
+      changedFiles: ["src/local.ts"],
+      conflictedFiles: ["src/local.ts"],
+      headSha: "head-sha-1",
+    };
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        new MemoryWriter(currentIssue),
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client: new FakeMergeClient({ liveBaseHeadSha: "base-sha-2" }),
+      conflictGit,
+    });
+
+    const result = await service.repairBaseRefDrift(currentIssue, observation);
+    const lifecycle = await lifecycleStore.get(currentIssue.id);
+
+    expect(result.status).toBe("conflict_dispatched");
+    expect(lifecycle).toMatchObject({
+      activeBlockerProvenanceId: provenance.id,
+      mergeConflict: {
+        blockerProvenanceId: null,
+        servicePreparation: {
+          strategy: "stash_apply",
+          status: "conflicted",
+        },
+      },
+    });
+  });
+
   it("reuses an existing created preserved stash on base-ref repair retry", async () => {
     const config = mergeConfig({
       noCiEvidence: "Repository intentionally has no CI for this test.",
@@ -1153,6 +1494,19 @@ describe("MergePolicyService", () => {
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const observation = baseRefObservation({ operation: "review_feedback" });
+    const provenance = createReviewFeedbackBaseRefProvenance({
+      issue: currentIssue,
+      runId: "review-run-1",
+      pullRequestNumber: 42,
+      pullRequestHeadSha: "head-sha-1",
+      observation,
+    });
+    await lifecycleStore.updateIssue(currentIssue, {
+      baseRefObservation: observation,
+      blockerProvenances: [provenance],
+      activeBlockerProvenanceId: provenance.id,
+    });
     const conflictGit = new FakeConflictGit({
       status: "clean",
       originalHeadSha: "head-sha-1",
@@ -1193,7 +1547,7 @@ describe("MergePolicyService", () => {
       conflictGit,
     });
 
-    const result = await service.repairBaseRefDrift(currentIssue, baseRefObservation());
+    const result = await service.repairBaseRefDrift(currentIssue, observation);
     const lifecycle = await lifecycleStore.get(currentIssue.id);
 
     expect(result.status).toBe("conflict_dispatched");
@@ -1216,6 +1570,7 @@ describe("MergePolicyService", () => {
     expect(lifecycle).toMatchObject({
       phase: "merge_conflict_resolution",
       mergeConflict: {
+        blockerProvenanceId: provenance.id,
         status: "open",
         resolutionStatus: "pending",
         currentHeadSha: "rebased-head-sha",
@@ -1233,6 +1588,7 @@ describe("MergePolicyService", () => {
           },
         },
       },
+      activeBlockerProvenanceId: provenance.id,
       preservedWorktreeStashes: [
         expect.objectContaining({
           status: "apply_conflicted",
@@ -4334,6 +4690,7 @@ class FakeConflictGit extends ServiceOwnedMergeConflictGit {
   preservedStash: IssuePreservedWorktreeStash | null = null;
   stashApplyResult: Awaited<ReturnType<ServiceOwnedMergeConflictGit["applyPreservedStash"]>> | null = null;
   localRefreshResult: Awaited<ReturnType<ServiceOwnedMergeConflictGit["refreshLocalBranchBase"]>> | null = null;
+  localRefreshError: Error | null = null;
 
   constructor(private readonly result: ServiceOwnedMergeConflictPreparationResult) {
     super();
@@ -4351,6 +4708,7 @@ class FakeConflictGit extends ServiceOwnedMergeConflictGit {
 
   override async refreshLocalBranchBase(input: Parameters<ServiceOwnedMergeConflictGit["refreshLocalBranchBase"]>[0]) {
     this.refreshInput = input;
+    if (this.localRefreshError !== null) throw this.localRefreshError;
     return (
       this.localRefreshResult ?? {
         status: "refreshed" as const,

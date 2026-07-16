@@ -59,6 +59,7 @@ export async function submitIssueBreakdownPlanFromMcp(
       accepted: result.accepted,
       replayed: result.replayed,
       planId: result.plan.id,
+      finalDisposition: result.plan.finalDisposition,
       proposedIssueCount: result.plan.proposedIssues.length,
     };
   } finally {
@@ -94,12 +95,18 @@ async function readIssueBreakdownPlanContext(filePath: string): Promise<IssueBre
   return parsed;
 }
 
-function issueBreakdownPlanInputSchema(): Record<string, unknown> {
+export function issueBreakdownPlanInputSchema(): Record<string, unknown> {
   return {
     type: "object",
     additionalProperties: false,
-    required: ["summary", "proposedIssues", "idempotencyKey"],
+    required: ["finalDisposition", "summary", "proposedIssues", "idempotencyKey"],
     properties: {
+      finalDisposition: {
+        type: "string",
+        minLength: 1,
+        description:
+          "Complete standalone final response for this planning run. Symphony stores this text untruncated and writes it verbatim to Linear; return the same text as the terminal assistant response after the handoff is accepted.",
+      },
       summary: {
         type: "string",
         minLength: 1,

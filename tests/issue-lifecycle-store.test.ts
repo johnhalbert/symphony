@@ -3,7 +3,13 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { baseRefObservationInputFingerprint } from "../src/core/BaseRefVerification.js";
 import { SymphonyError } from "../src/core/errors.js";
+import {
+  blockerProvenanceMatchesObservation,
+  createBaseRefBlockerProvenance,
+  createReviewFeedbackBaseRefProvenance,
+} from "../src/core/BlockerProvenance.js";
 import {
   buildWorkerHandoffPacket,
   FileIssueLifecycleStore,
@@ -281,6 +287,7 @@ describe("FileIssueLifecycleStore", () => {
             path: "tests/implementation.test.ts",
             status: "added",
             blobSha: "blob-sha",
+            mode: "100644",
           },
         ],
         artifactEvidence,
@@ -333,7 +340,13 @@ describe("FileIssueLifecycleStore", () => {
     expect(found?.acceptedArtifact).toMatchObject({
       id: "artifact-1",
       status: "completed_unmerged",
-      fileManifest: [{ path: "tests/implementation.test.ts", blobSha: "blob-sha" }],
+      fileManifest: [
+        {
+          path: "tests/implementation.test.ts",
+          blobSha: "blob-sha",
+          mode: "100644",
+        },
+      ],
     });
     expect(found?.workspaceSeed).toMatchObject({
       id: "workspace-seed-1",
@@ -661,6 +674,243 @@ describe("FileIssueLifecycleStore", () => {
     });
   });
 
+  it("rejects unknown blocker provenance schema versions", async () => {
+    const store = new FileIssueLifecycleStore(root);
+    await store.ensureIssue(issue());
+    const recordPath = path.join(root, "issue-lifecycle", "issue-1.json");
+    const raw = JSON.parse(
+      await nodeFs.readFile(recordPath, "utf8"),
+    ) as Record<string, unknown>;
+    raw.blockerProvenances = [{ version: 2 }];
+    await writeFile(recordPath, `${JSON.stringify(raw, null, 2)}\n`, "utf8");
+
+    await expect(store.get("issue-1")).rejects.toMatchObject({
+      code: "lifecycle_store_corrupt",
+      message: expect.stringContaining(
+        "blockerProvenances[0].version is invalid",
+      ),
+    });
+  });
+
+  it("persists exact pre-PR base-ref blocker provenance", async () => {
+    const store = new FileIssueLifecycleStore(root);
+    const candidate = issue();
+    const sourceObservation = blockerObservation();
+    const observation = {
+      ...sourceObservation,
+      operation: "dispatch_worker",
+      inputFingerprint: baseRefObservationInputFingerprint({
+        workspacePath: sourceObservation.workspacePath,
+        branchName: sourceObservation.branchName,
+        baseRef: sourceObservation.baseRef,
+        operation: "dispatch_worker",
+      }),
+    };
+    const provenance = createBaseRefBlockerProvenance({
+      issue: candidate,
+      runId: candidate.id,
+      pullRequestNumber: null,
+      pullRequestHeadSha: null,
+      observation,
+    });
+
+    await store.ensureIssue(candidate, {
+      phase: "blocked",
+      baseRefObservation: observation,
+      blockerProvenances: [provenance],
+      activeBlockerProvenanceId: provenance.id,
+    });
+
+    const stored = await store.get(candidate.id);
+    expect(stored).toMatchObject({
+      activeBlockerProvenanceId: provenance.id,
+      blockerProvenances: [
+        expect.objectContaining({
+          operation: "dispatch_worker",
+          pullRequestNumber: null,
+          pullRequestHeadSha: null,
+        }),
+      ],
+    });
+    const active = stored?.blockerProvenances?.find(
+      (record) => record.id === stored.activeBlockerProvenanceId,
+    );
+    expect(active).toBeDefined();
+    expect(
+      blockerProvenanceMatchesObservation(active!, observation, {
+        runId: candidate.id,
+        pullRequestNumber: null,
+        pullRequestHeadSha: null,
+      }),
+    ).toBe(true);
+    expect(
+      blockerProvenanceMatchesObservation(active!, {
+        ...observation,
+        checkedAt: "2026-01-01T00:00:01.000Z",
+      }),
+    ).toBe(false);
+    expect(
+      blockerProvenanceMatchesObservation(active!, {
+        ...observation,
+        githubBaseHeadSha: "base-head-2",
+      }),
+    ).toBe(false);
+    expect(
+      blockerProvenanceMatchesObservation(active!, observation, {
+        pullRequestHeadSha: "stale-pr-head",
+      }),
+    ).toBe(false);
+  });
+
+  it.each([
+    "recoveryKind",
+    "initialObservationFingerprint",
+    "initialClassification",
+    "initialLiveBaseHeadSha",
+    "initialWorktreeHeadSha",
+  ])("rejects blocker provenance missing required %s", async (field) => {
+    const store = new FileIssueLifecycleStore(root);
+    const candidate = issue();
+    const provenance = createReviewFeedbackBaseRefProvenance({
+      issue: candidate,
+      runId: "review-run-1",
+      pullRequestNumber: 42,
+      pullRequestHeadSha: "head-sha-1",
+      observation: blockerObservation(),
+    });
+    await store.ensureIssue(candidate, {
+      blockerProvenances: [provenance],
+      activeBlockerProvenanceId: provenance.id,
+    });
+    const recordPath = path.join(root, "issue-lifecycle", "issue-1.json");
+    const raw = JSON.parse(
+      await nodeFs.readFile(recordPath, "utf8"),
+    ) as Record<string, unknown>;
+    const stored = (
+      raw.blockerProvenances as Array<Record<string, unknown>>
+    )[0]!;
+    delete stored[field];
+    await writeFile(recordPath, `${JSON.stringify(raw, null, 2)}\n`, "utf8");
+
+    await expect(store.get("issue-1")).rejects.toMatchObject({
+      code: "lifecycle_store_corrupt",
+      message: expect.stringContaining(field),
+    });
+  });
+
+  it("rejects an active blocker provenance id that does not identify an unresolved record", async () => {
+    const store = new FileIssueLifecycleStore(root);
+    const candidate = issue();
+    const provenance = createReviewFeedbackBaseRefProvenance({
+      issue: candidate,
+      runId: "review-run-1",
+      pullRequestNumber: 42,
+      pullRequestHeadSha: "head-sha-1",
+      observation: blockerObservation(),
+    });
+    await store.ensureIssue(candidate, {
+      blockerProvenances: [provenance],
+      activeBlockerProvenanceId: provenance.id,
+    });
+    const recordPath = path.join(root, "issue-lifecycle", "issue-1.json");
+    const raw = JSON.parse(await nodeFs.readFile(recordPath, "utf8")) as Record<string, unknown>;
+    raw.activeBlockerProvenanceId = "blocker-provenance:missing";
+    await writeFile(recordPath, `${JSON.stringify(raw, null, 2)}\n`, "utf8");
+
+    await expect(store.get("issue-1")).rejects.toMatchObject({
+      code: "lifecycle_store_corrupt",
+      message: expect.stringContaining("does not exist"),
+    });
+  });
+
+  it("rejects an unfinished carried blocker without a conflicted service preparation", async () => {
+    const store = new FileIssueLifecycleStore(root);
+    const candidate = issue();
+    const provenance = createReviewFeedbackBaseRefProvenance({
+      issue: candidate,
+      runId: "review-run-1",
+      pullRequestNumber: 42,
+      pullRequestHeadSha: "head-sha-1",
+      observation: blockerObservation(),
+    });
+    await expect(
+      store.ensureIssue(candidate, {
+        phase: "merge_conflict_resolution",
+        blockerProvenances: [provenance],
+        activeBlockerProvenanceId: provenance.id,
+        mergeConflict: {
+        id: "merge-conflict:issue-1:head-sha-1",
+        status: "open",
+        resolutionStatus: "pending",
+        pullRequest: {
+          url: "https://github.com/acme/repo/pull/42",
+          number: 42,
+          headSha: "head-sha-1",
+          branch: "symphony/TEST-1",
+        },
+        approvedHeadSha: "head-sha-1",
+        currentHeadSha: "head-sha-1",
+        resolvedHeadSha: null,
+        baseBranch: "main",
+        baseHeadSha: "base-head-1",
+        sourceState: "In Review",
+        conflictsState: "Approved with Conflicts",
+        reason: "Base-ref repair conflicted",
+        mergeableState: "dirty",
+        blockerProvenanceId: provenance.id,
+        servicePreparation: null,
+        detectedAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        fixTurnCount: 0,
+        maxFixTurns: 3,
+        lastConflictFixRunId: null,
+        lastConflictResolutionReportId: null,
+        attemptRunIds: [],
+        writebackOperationKeys: [],
+        blockedAt: null,
+        blockedReason: null,
+        },
+      }),
+    ).rejects.toMatchObject({
+      code: "lifecycle_store_corrupt",
+      message: expect.stringContaining("unfinished merge conflict has inconsistent blocker provenance"),
+    });
+    await expect(store.get("issue-1")).resolves.toBeNull();
+  });
+
+  it("keeps provenance valid when Linear changes an issue identifier", async () => {
+    const store = new FileIssueLifecycleStore(root);
+    const candidate = issue();
+    const provenance = createReviewFeedbackBaseRefProvenance({
+      issue: candidate,
+      runId: "review-run-1",
+      pullRequestNumber: 42,
+      pullRequestHeadSha: "head-sha-1",
+      observation: blockerObservation(),
+    });
+    await store.ensureIssue(candidate, {
+      blockerProvenances: [provenance],
+      activeBlockerProvenanceId: provenance.id,
+    });
+
+    await store.updateIssue(
+      { id: candidate.id, identifier: "MOVED-1" },
+      { phase: "blocked" },
+    );
+
+    await expect(store.get(candidate.id)).resolves.toMatchObject({
+      issueIdentifier: "MOVED-1",
+      activeBlockerProvenanceId: provenance.id,
+      blockerProvenances: [
+        expect.objectContaining({
+          id: provenance.id,
+          issueId: candidate.id,
+          issueIdentifier: candidate.identifier,
+        }),
+      ],
+    });
+  });
+
   it("derives lifecycle phase from configured state buckets", () => {
     const config = testConfig(root);
     config.tracker.activeStates = ["Todo", "In Progress"];
@@ -676,3 +926,25 @@ describe("FileIssueLifecycleStore", () => {
     expect(phaseForIssueState("Done", config)).toBe("terminal");
   });
 });
+
+function blockerObservation() {
+  return {
+    version: 1 as const,
+    inputFingerprint: "base-ref-observation-1",
+    classification: "branch_not_based_on_live_base" as const,
+    operation: "review_feedback",
+    checkedAt: "2026-01-01T00:00:00.000Z",
+    workspacePath: "/tmp/workspace",
+    branchName: "symphony/TEST-1",
+    baseRef: "origin/main",
+    normalizedBaseBranch: "main",
+    localBaseRef: "refs/remotes/origin/main",
+    githubBaseHeadSha: "base-head-1",
+    localBaseHeadShaBeforeFetch: "base-head-0",
+    localBaseHeadShaAfterFetch: "base-head-1",
+    worktreeHeadSha: "head-sha-1",
+    localBaseIsAncestorOfHead: false,
+    reason: "Worktree HEAD is not based on the live origin base",
+    error: null,
+  };
+}

@@ -80,6 +80,248 @@ describe("FileWritebackOutboxStore", () => {
     expect(writer.transitions).toHaveLength(1);
   });
 
+  it("retries the exact registered operation without regenerating its intent", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writerOptions: { transitionStatus?: TrackerWriteResult["status"] } = {
+      transitionStatus: "skipped",
+    };
+    const writer = new FakeWriter(writerOptions);
+    const processor = new WritebackProcessor(
+      store,
+      writer,
+      new StructuredLogger(() => undefined),
+      300_000,
+    );
+    const operation: NewWritebackOperation = {
+      idempotencyKey: "transition:issue-1:registered-retry",
+      kind: "transition",
+      issueId: "issue-1",
+      payload: {
+        fromStates: ["Ready to Merge"],
+        toState: "In Progress",
+        reason: "Persisted immutable intent",
+      },
+    };
+
+    await expect(processor.enqueueAndProcess(operation)).resolves.toMatchObject({
+      status: "skipped",
+    });
+    writerOptions.transitionStatus = "applied";
+
+    await expect(
+      processor.retryRegistered([operation.idempotencyKey], {
+        retrySkipped: true,
+      }),
+    ).resolves.toEqual([
+      expect.objectContaining({
+        idempotencyKey: operation.idempotencyKey,
+        status: "succeeded",
+        payload: operation.payload,
+      }),
+    ]);
+    expect(writer.transitions).toEqual([
+      { issueId: operation.issueId, ...operation.payload },
+      { issueId: operation.issueId, ...operation.payload },
+    ]);
+    await expect(
+      processor.retryRegistered(["transition:issue-1:missing"], {
+        retrySkipped: true,
+      }),
+    ).rejects.toThrow(/Registered writeback does not exist/);
+  });
+
+  it("rejects reuse of an idempotency key with different writeback intent", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    await store.enqueueOnce({
+      idempotencyKey: "comment:issue-1:final-disposition",
+      kind: "comment",
+      issueId: "issue-1",
+      payload: { body: "Original full disposition", dedupeKey: "disposition" },
+    });
+
+    await expect(
+      store.enqueueOnce({
+        idempotencyKey: "comment:issue-1:final-disposition",
+        kind: "comment",
+        issueId: "issue-1",
+        payload: { body: "Different disposition", dedupeKey: "disposition" },
+      }),
+    ).rejects.toThrow(/different intent/);
+  });
+
+  it("waits for the exact lifecycle owner before executing a bound writeback", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter();
+    let lifecycle: IssueLifecycleRecord | null = null;
+    const processor = new WritebackProcessor(
+      store,
+      writer,
+      new StructuredLogger(() => undefined),
+      0,
+      { get: async () => lifecycle },
+    );
+    const operation: NewWritebackOperation = {
+      idempotencyKey: "comment:issue-1:completion-report:report-1",
+      kind: "comment",
+      issueId: "issue-1",
+      lifecycleBinding: { kind: "completion_report", recordId: "report-1" },
+      payload: { body: "Full disposition", dedupeKey: "report-1" },
+    };
+
+    await expect(processor.enqueueAndProcess(operation)).resolves.toMatchObject({
+      status: "retrying",
+    });
+    expect(writer.comments).toHaveLength(0);
+
+    lifecycle = {
+      completionReports: [
+        { id: "report-1", writebackOperationKeys: [operation.idempotencyKey] },
+      ],
+    } as unknown as IssueLifecycleRecord;
+    await processor.processDue();
+
+    await expect(store.get(operation.idempotencyKey)).resolves.toMatchObject({
+      status: "succeeded",
+    });
+    expect(writer.comments).toHaveLength(1);
+  });
+
+  it("terminally skips a retrying review-verdict comment after its owner is superseded", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter();
+    const operation: NewWritebackOperation = {
+      idempotencyKey: "comment:issue-1:review-verdict:verdict-1",
+      kind: "comment",
+      issueId: "issue-1",
+      lifecycleBinding: { kind: "review_verdict", recordId: "verdict-1" },
+      payload: { body: "Stale failed review", dedupeKey: "verdict-1" },
+    };
+    let lifecycle = {
+      lastReviewVerdictId: "verdict-1",
+      reviewVerdicts: [
+        {
+          id: "verdict-1",
+          writebackOperationKeys: [operation.idempotencyKey],
+          supersededAt: null,
+        },
+      ],
+    } as unknown as IssueLifecycleRecord;
+    const processor = new WritebackProcessor(
+      store,
+      writer,
+      new StructuredLogger(() => undefined),
+      0,
+      { get: async () => lifecycle },
+    );
+    await store.markRetry(
+      await store.enqueueOnce(operation),
+      "transient tracker failure",
+      new Date().toISOString(),
+    );
+
+    lifecycle = {
+      ...lifecycle,
+      lastReviewVerdictId: "verdict-2",
+      reviewVerdicts: [
+        {
+          id: "verdict-1",
+          writebackOperationKeys: [operation.idempotencyKey],
+          supersededAt: "2026-01-01T00:00:01.000Z",
+        },
+        {
+          id: "verdict-2",
+          writebackOperationKeys: [],
+          supersededAt: null,
+        },
+      ],
+    } as unknown as IssueLifecycleRecord;
+    await processor.processDue();
+
+    await expect(store.get(operation.idempotencyKey)).resolves.toMatchObject({
+      status: "skipped",
+      lastError: "review-verdict writeback owner has been superseded",
+    });
+    expect(writer.comments).toHaveLength(0);
+  });
+
+  it("terminally skips a review-verdict comment whose owner is no longer current", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter();
+    const operation: NewWritebackOperation = {
+      idempotencyKey: "comment:issue-1:review-verdict:verdict-1:not-current",
+      kind: "comment",
+      issueId: "issue-1",
+      lifecycleBinding: { kind: "review_verdict", recordId: "verdict-1" },
+      payload: { body: "Old review", dedupeKey: "verdict-1:not-current" },
+    };
+    const lifecycle = {
+      lastReviewVerdictId: "verdict-2",
+      reviewVerdicts: [
+        {
+          id: "verdict-1",
+          writebackOperationKeys: [operation.idempotencyKey],
+          supersededAt: null,
+        },
+      ],
+    } as unknown as IssueLifecycleRecord;
+    const processor = new WritebackProcessor(
+      store,
+      writer,
+      new StructuredLogger(() => undefined),
+      0,
+      { get: async () => lifecycle },
+    );
+
+    const result = await processor.enqueueAndProcess(operation);
+
+    expect(result).toMatchObject({
+      status: "skipped",
+      lastError: "review-verdict writeback is no longer bound to the current verdict",
+    });
+    expect(writer.comments).toHaveLength(0);
+  });
+
+  it("terminally skips a retrying bound report comment after its owner is superseded", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter();
+    const operation: NewWritebackOperation = {
+      idempotencyKey: "comment:issue-1:triage:report-1",
+      kind: "comment",
+      issueId: "issue-1",
+      lifecycleBinding: { kind: "issue_triage_report", recordId: "report-1" },
+      payload: { body: "Stale triage", dedupeKey: "report-1" },
+    };
+    const lifecycle = {
+      issueTriageReports: [
+        {
+          id: "report-1",
+          writebackOperationKeys: [operation.idempotencyKey],
+          supersededAt: "2026-01-01T00:00:01.000Z",
+        },
+      ],
+    } as unknown as IssueLifecycleRecord;
+    const processor = new WritebackProcessor(
+      store,
+      writer,
+      new StructuredLogger(() => undefined),
+      0,
+      { get: async () => lifecycle },
+    );
+    await store.markRetry(
+      await store.enqueueOnce(operation),
+      "transient tracker failure",
+      new Date().toISOString(),
+    );
+
+    await processor.processDue();
+
+    await expect(store.get(operation.idempotencyKey)).resolves.toMatchObject({
+      status: "skipped",
+      lastError: "issue-triage-report writeback owner has been superseded",
+    });
+    expect(writer.comments).toHaveLength(0);
+  });
+
   it("executes only writebacks registered on the current completed accepted artifact", async () => {
     const store = new FileWritebackOutboxStore(root);
     const writer = new FakeWriter();
@@ -615,7 +857,7 @@ describe("FileWritebackOutboxStore", () => {
     expect(writer.transitions).toHaveLength(1);
   });
 
-  it("does not requeue a skipped operation when the recovery payload does not match", async () => {
+  it("fails closed when a skipped operation is replayed with different intent", async () => {
     const store = new FileWritebackOutboxStore(root);
     const operation = {
       idempotencyKey: "transition:issue-1:merge:issue-1:head-sha-1:Done",
@@ -641,7 +883,7 @@ describe("FileWritebackOutboxStore", () => {
         },
         { retrySkipped: true },
       ),
-    ).resolves.toMatchObject({ status: "skipped" });
+    ).rejects.toThrow(/different intent/);
     expect(writer.transitions).toHaveLength(0);
   });
 
@@ -689,7 +931,7 @@ describe("FileWritebackOutboxStore", () => {
     expect(writer.transitions).toHaveLength(0);
   });
 
-  it("does not requeue a skipped comment when the explicit issue breakdown plan binding differs", async () => {
+  it("fails closed when a skipped comment is replayed with a different plan binding", async () => {
     const store = new FileWritebackOutboxStore(root);
     const operation = {
       idempotencyKey: "comment:issue-1:issue-breakdown:plan-1:children",
@@ -718,7 +960,7 @@ describe("FileWritebackOutboxStore", () => {
           retrySkippedMessages: [ISSUE_BREAKDOWN_PLAN_STALE_REASON],
         },
       ),
-    ).resolves.toMatchObject({ status: "skipped" });
+    ).rejects.toThrow(/different intent/);
     expect(writer.comments).toHaveLength(0);
   });
 
@@ -1109,6 +1351,28 @@ describe("SqliteWritebackOutboxStore", () => {
     expect(secondWriter.transitions).toHaveLength(0);
   });
 
+  it("persists lifecycle bindings and rejects changed intent", async () => {
+    const store = track(new SqliteWritebackOutboxStore(root));
+    const operation: NewWritebackOperation = {
+      idempotencyKey: "comment:issue-1:bound-report",
+      kind: "comment",
+      issueId: "issue-1",
+      lifecycleBinding: { kind: "completion_report", recordId: "report-1" },
+      payload: { body: "Original full disposition", dedupeKey: "bound-report" },
+    };
+    await store.enqueueOnce(operation);
+
+    await expect(store.get(operation.idempotencyKey)).resolves.toMatchObject({
+      lifecycleBinding: operation.lifecycleBinding,
+    });
+    await expect(
+      store.enqueueOnce({
+        ...operation,
+        payload: { ...operation.payload, body: "Changed disposition" },
+      }),
+    ).rejects.toThrow(/different intent/);
+  });
+
   it("imports legacy file outbox records on first open", async () => {
     const legacyStore = new FileWritebackOutboxStore(root);
     const operation: NewWritebackOperation = {
@@ -1368,6 +1632,7 @@ async function submitTwoChildPlan(
     {
       runId,
       issueId: parentIssue.id,
+      finalDisposition: "Split the work into two dependency-ordered child issues.",
       summary: "Split into child issues.",
       proposedIssues: [
         {

@@ -13,6 +13,7 @@ import {
 import {
   activeIssueTriageBlockers,
   issueTriageTriggerFingerprint,
+  latestIssueTriageReport,
   latestIssueTriageReportForFingerprint,
 } from "../IssueTriageService.js";
 import {
@@ -25,6 +26,7 @@ import {
   latestCurrentCompletionReport,
   phaseForIssueState,
   type IssueAcceptedArtifactRecord,
+  type IssueBlockerProvenanceRecord,
   type IssueCompletionReportRecord,
   type IssueLifecycleRecord,
   type IssueLifecycleStore,
@@ -200,6 +202,7 @@ type LifecycleFields = Pick<
   | "currentIssueTriageTriggerFingerprint"
   | "issueTriageCurrentTriggerReportIds"
   | "latestIssueTriageReportBlockers"
+  | "latestPersistedIssueTriageReportBlockers"
   | "lastPostMortemReportId"
   | "lastPostMortemReportTriggerFingerprint"
   | "lastPostMortemReportWritebackOperationKeys"
@@ -326,6 +329,7 @@ type HistoryFields = Pick<
   | "lastBaseRefObservationFingerprint"
   | "lastBaseRefObservationClassification"
   | "lastBaseRefObservation"
+  | "activeBlockerProvenance"
 >;
 
 type RunFields = Pick<
@@ -1648,6 +1652,12 @@ export class IssueCurrentStateBuilder {
         ...blocker,
         evidence: [...blocker.evidence],
       })),
+      latestPersistedIssueTriageReportBlockers: activeIssueTriageBlockers(
+        latestIssueTriageReport(lifecycle),
+      ).map((blocker) => ({
+        ...blocker,
+        evidence: [...blocker.evidence],
+      })),
       lastPostMortemReportId:
         context.lastPostMortemReport?.id ??
         lifecycle?.lastPostMortemReportId ??
@@ -1732,6 +1742,15 @@ export class IssueCurrentStateBuilder {
       lastBaseRefObservationClassification:
         context.lifecycle?.baseRefObservation?.classification ?? null,
       lastBaseRefObservation: context.lifecycle?.baseRefObservation ?? null,
+      activeBlockerProvenance:
+        context.lifecycle?.activeBlockerProvenanceId === undefined ||
+        context.lifecycle.activeBlockerProvenanceId === null
+          ? null
+          : (context.lifecycle.blockerProvenances ?? []).find(
+              (record) =>
+                record.id === context.lifecycle?.activeBlockerProvenanceId &&
+                record.resolvedAt === null,
+            ) ?? null,
     };
   }
 
@@ -2193,6 +2212,13 @@ function lifecycleRecordFromHistorySnapshot(
       latestApprovalPassVerdict === null ? [] : [latestApprovalPassVerdict],
     mergeGateResults,
     reviewFeedback,
+    blockerProvenances:
+      recordArrayFromUnknown<IssueBlockerProvenanceRecord>(
+        snapshot.lifecycleBlockerProvenances,
+      ) ?? [],
+    activeBlockerProvenanceId: stringFromUnknown(
+      snapshot.lifecycleActiveBlockerProvenanceId,
+    ),
     preservedWorktreeStashes,
     acceptedArtifact: recordFromUnknown<IssueAcceptedArtifactRecord>(
       snapshot.lifecycleAcceptedArtifact,

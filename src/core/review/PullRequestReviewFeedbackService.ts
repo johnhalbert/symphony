@@ -14,6 +14,13 @@ import type {
 } from "../../integrations/github/GitHubPullRequestClient.js";
 import type { ServiceConfig } from "../config/Config.js";
 import { SymphonyError } from "../errors.js";
+import {
+  activateBlockerProvenancePatch,
+  createReviewFeedbackBaseRefProvenance,
+  matchingReviewFeedbackBaseRefProvenance,
+  resolveActiveBlockerProvenancePatch,
+  updateReviewFeedbackBaseRefProvenanceObservationPatch,
+} from "../BlockerProvenance.js";
 import type {
   CompletionReportPullRequestRef,
   IssueCompletionReportRecord,
@@ -200,7 +207,7 @@ export class PullRequestReviewFeedbackService {
       return resultFromRecord(existing, true);
     }
 
-    const result = await this.writeFeedback(feedback, pullRequest, lifecycle, context.issue);
+    const result = await this.writeFeedback(feedback, pullRequest, lifecycle, context);
     const urls = urlsFromFeedbackResult(result);
     if (urls.length === 0) {
       throw new SymphonyError("tracker_error", "GitHub PR feedback did not return a durable URL");
@@ -285,7 +292,7 @@ export class PullRequestReviewFeedbackService {
     feedback: PullRequestReviewFeedbackInputValue,
     pullRequest: CompletionReportPullRequestRef,
     lifecycle: IssueLifecycleRecord,
-    issue: Issue,
+    context: ReviewFeedbackActiveContext,
   ): Promise<PullRequestReviewFeedbackResult> {
     if (feedback.kind === "issue_comment") {
       return this.options.client.submitPullRequestIssueCommentFeedback({
@@ -293,7 +300,7 @@ export class PullRequestReviewFeedbackService {
         body: feedback.body,
       });
     }
-    await this.verifyBaseRefBeforeReviewFeedback(lifecycle, issue);
+    await this.verifyBaseRefBeforeReviewFeedback(lifecycle, pullRequest, context);
     if (feedback.kind === "review_comment") {
       return this.options.client.submitPullRequestReviewCommentFeedback({
         pullRequestNumber: requiredPullRequestNumber(pullRequest),
@@ -323,7 +330,8 @@ export class PullRequestReviewFeedbackService {
 
   private async verifyBaseRefBeforeReviewFeedback(
     lifecycle: IssueLifecycleRecord,
-    issue: Issue,
+    pullRequest: CompletionReportPullRequestRef,
+    context: ReviewFeedbackActiveContext,
   ): Promise<void> {
     const client = baseRefClientFromReviewFeedbackClient(this.options.client);
     if (client === null) return;
@@ -332,7 +340,7 @@ export class PullRequestReviewFeedbackService {
       lifecycle.summaryPointers.gitBranchName ??
       lifecycle.summaryPointers.prBranch ??
       lifecycle.summaryPointers.branchName ??
-      issue.branchName;
+      context.issue.branchName;
     const baseRef = lifecycle.summaryPointers.baseRef ?? this.options.config.workspace.source.baseRef;
     if (
       this.options.baseRefVerifier === undefined &&
@@ -347,20 +355,63 @@ export class PullRequestReviewFeedbackService {
       operation: "review_feedback",
       client,
     });
+    const matchingProvenance = matchingReviewFeedbackBaseRefProvenance(
+      lifecycle,
+      { runId: context.activeRunId, pullRequest },
+    );
+    const provenanceObservationPatch =
+      matchingProvenance === null
+        ? {}
+        : updateReviewFeedbackBaseRefProvenanceObservationPatch(
+            lifecycle,
+            matchingProvenance.id,
+            observation,
+          );
+    const observedLifecycle = {
+      ...lifecycle,
+      ...provenanceObservationPatch,
+    };
     if (observation.classification === "ok") {
-      await this.options.lifecycleStore.updateIssue(issue, {
+      await this.options.lifecycleStore.updateIssue(context.issue, {
         baseRefObservation: observation,
+        ...(matchingProvenance === null
+          ? {}
+          : {
+              phase: "review",
+              blockedReason: null,
+              ...resolveActiveBlockerProvenancePatch(observedLifecycle, {
+                expectedProvenanceId: matchingProvenance.id,
+                resolution: "base_ref_recheck",
+                resolvedAt: observation.checkedAt,
+              }),
+            }),
       });
       return;
     }
     const blockedReason = baseRefBlockedReason(observation);
-    await this.options.lifecycleStore.updateIssue(issue, {
+    const provenance =
+      matchingProvenance === null
+        ? createReviewFeedbackBaseRefProvenance({
+            issue: context.issue,
+            runId: context.activeRunId,
+            pullRequestNumber: requiredPullRequestNumber(pullRequest),
+            pullRequestHeadSha: requiredHeadSha(pullRequest),
+            observation,
+          })
+        : (observedLifecycle.blockerProvenances ?? []).find(
+            (record) => record.id === matchingProvenance.id,
+          ) ?? matchingProvenance;
+    await this.options.lifecycleStore.updateIssue(context.issue, {
       phase: "blocked",
       blockedReason,
       baseRefObservation: observation,
+      ...(matchingProvenance === null
+        ? activateBlockerProvenancePatch(lifecycle, provenance)
+        : provenanceObservationPatch),
     });
     throw new SymphonyError("invalid_request", blockedReason, {
       baseRefObservation: observation,
+      blockerProvenance: provenance,
     });
   }
 }

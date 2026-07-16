@@ -48,6 +48,8 @@ describe("review verdict MCP handoff", () => {
 
     const result = await submitReviewVerdictFromMcp(
       {
+        finalDisposition:
+          "Review failed because the contract-required reviewer MCP path was missing.\n\nThe worker should add that bounded path and rerun the focused validation.",
         verdict: "fail",
         acceptanceResults: [
           {
@@ -68,6 +70,7 @@ describe("review verdict MCP handoff", () => {
       replayed: false,
       verdictId: "review-verdict:issue-1:review-run-1:review-verdict-1",
       verdict: "fail",
+      finalDisposition: expect.stringContaining("Review failed because"),
       handoffStatus: "pending",
       writebackOperationKeys: [],
     });
@@ -113,6 +116,8 @@ describe("review verdict MCP handoff", () => {
 
     const result = await submitReviewVerdictFromMcp(
       {
+        finalDisposition:
+          "Review passed for the exact lifecycle-bound pull request head.\n\nAll acceptance criteria are satisfied and the approval evidence is attached.",
         verdict: "pass",
         acceptanceResults: [
           {
@@ -133,6 +138,7 @@ describe("review verdict MCP handoff", () => {
       replayed: false,
       verdictId: "review-verdict:issue-1:review-run-2:review-verdict-pass-1",
       verdict: "pass",
+      finalDisposition: expect.stringContaining("Review passed for the exact"),
       handoffStatus: "pending",
       writebackOperationKeys: [],
     });
@@ -174,6 +180,8 @@ describe("review verdict MCP handoff", () => {
 
     const result = await submitReviewVerdictFromMcp(
       {
+        finalDisposition:
+          "Review is blocked because required validation is unavailable on both bounded command surfaces.\n\nThis is a non-worker-owned tooling blocker requiring triage.",
         verdict: "blocked",
         acceptanceResults: [
           {
@@ -196,6 +204,7 @@ describe("review verdict MCP handoff", () => {
       replayed: false,
       verdictId: "review-verdict:issue-1:review-run-3:review-blocked-1",
       verdict: "blocked",
+      finalDisposition: expect.stringContaining("Review is blocked because"),
       handoffStatus: "pending",
       writebackOperationKeys: [],
     });

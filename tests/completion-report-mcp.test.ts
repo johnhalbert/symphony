@@ -96,6 +96,7 @@ describe("completion report MCP handoff", () => {
       accepted: true,
       replayed: false,
       reportId: "completion-report:issue-1:run-1:idem-1",
+      finalDisposition: report().finalDisposition,
       pullRequest: {
         url: "https://github.com/acme/symphony/pull/42",
         number: 42,
@@ -115,6 +116,7 @@ describe("completion report MCP handoff", () => {
     expect(comment?.kind === "comment" ? comment.payload.body : "").toContain(
       "https://github.com/acme/symphony/pull/42",
     );
+    expect(comment?.kind === "comment" ? comment.payload.body : "").toContain(report().finalDisposition);
     expect(transition).toMatchObject({
       kind: "transition",
       payload: { toState: "Human Review" },
@@ -291,6 +293,7 @@ describe("completion report MCP handoff", () => {
     expect(tool.name).toBe(COMPLETION_REPORT_TOOL_NAME);
     expect(tool.description).toContain("completion report");
     expect(schema.required).toEqual([
+      "finalDisposition",
       "summary",
       "validationEvidence",
       "acceptanceChecklist",
@@ -300,6 +303,7 @@ describe("completion report MCP handoff", () => {
       "risks",
       "idempotencyKey",
     ]);
+    expect(asRecord(asRecord(schema.properties).finalDisposition).description).toContain("untruncated");
     expect(asRecord(asRecord(schema.properties).summary).description).toContain("implementation");
     const artifactEvidence = asRecord(asRecord(schema.properties).artifactEvidence);
     expect(artifactEvidence.description).toContain("delivery.mode=accepted_artifact");
@@ -468,6 +472,8 @@ Work on {{ issue.identifier }}.
 
 function report(idempotencyKey = "idem-1") {
   return {
+    finalDisposition:
+      "Implemented the service contract and validated the complete worker-owned change.\n\nValidation: npm test passed.\nRisks: no additional worker-owned risks were found.",
     summary: "Implemented the service contract.",
     validationEvidence: ["npm test"],
     acceptanceChecklist: [
