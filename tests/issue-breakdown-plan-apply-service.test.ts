@@ -4,14 +4,19 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import {
+  ISSUE_BREAKDOWN_TRIAGE_PROVENANCE_INVALID_REASON,
   IssueBreakdownPlanApplyService,
   planIssueBreakdownApplicationWritebacks,
   planIssueBreakdownDispositionWriteback,
   planIssueBreakdownFinalizationWritebacks,
 } from "../src/core/IssueBreakdownPlanApplyService.js";
 import { IssueBreakdownPlanService, issueBreakdownPlanRequestHash } from "../src/core/IssueBreakdownPlanService.js";
+import { issueTriageTriggerFingerprint } from "../src/core/IssueTriageService.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
-import type { IssueBreakdownCreatedIssueRef } from "../src/core/persistence/IssueLifecycleStore.js";
+import type {
+  IssueBreakdownCreatedIssueRef,
+  IssueTriageReportRecord,
+} from "../src/core/persistence/IssueLifecycleStore.js";
 import type {
   TrackerCommentInput,
   TrackerIssueCreateInput,
@@ -89,6 +94,255 @@ describe("IssueBreakdownPlanApplyService", () => {
     await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
       issueBreakdownPlans: [
         expect.objectContaining({ applicationStatus: "not_requested" }),
+      ],
+    });
+  });
+
+  it.each([
+    {
+      name: "the source report was cleared before initial application",
+      mutate: (report: IssueTriageReportRecord) => ({
+        report,
+        lastIssueTriageReportId: null,
+      }),
+    },
+    {
+      name: "the source report is no longer current",
+      mutate: (report: IssueTriageReportRecord) => ({
+        report,
+        lastIssueTriageReportId: "issue-triage-report:issue-1:newer-report",
+      }),
+    },
+    {
+      name: "the source report belongs to an older trigger",
+      mutate: (report: IssueTriageReportRecord) => ({
+        report: { ...report, triggerFingerprint: "stale-trigger" },
+        lastIssueTriageReportId: report.id,
+      }),
+    },
+    {
+      name: "the recovery route is not an automated planner route",
+      mutate: (report: IssueTriageReportRecord) => ({
+        report: {
+          ...report,
+          recoveryDisposition: {
+            ...report.recoveryDisposition!,
+            nextActor: "worker" as const,
+          },
+        },
+        lastIssueTriageReportId: report.id,
+      }),
+    },
+    {
+      name: "the recovery transition has not succeeded",
+      mutate: (report: IssueTriageReportRecord) => ({
+        report: {
+          ...report,
+          recoveryDisposition: {
+            ...report.recoveryDisposition!,
+            transitionStatus: "pending" as const,
+          },
+        },
+        lastIssueTriageReportId: report.id,
+      }),
+    },
+  ])(
+    "blocks a triage-linked plan before writeback when $name",
+    async ({ mutate }) => {
+      const config = testConfig(root);
+      config.issueBreakdown.applyToLinear.enabled = true;
+      config.writeback.enabled = true;
+      config.writeback.dispatchState = "In Progress";
+      const lifecycleStore = new FileIssueLifecycleStore(
+        config.workspace.stateDir,
+      );
+      const candidate = issue({
+        state: "In Progress",
+        labels: ["planning"],
+        updatedAt: "2026-01-02T00:00:00Z",
+      });
+      const report = await seedAutomatedPlannerTriageReport(
+        lifecycleStore,
+        candidate,
+      );
+      await submitSingleChildPlan(config, lifecycleStore, candidate, {
+        sourceIssueTriageReportId: report.id,
+      });
+      const mutated = mutate(report);
+      const lifecycle = await lifecycleStore.get(candidate.id);
+      await lifecycleStore.updateIssue(candidate, {
+        lastIssueTriageReportId: mutated.lastIssueTriageReportId,
+        issueTriageReports: (lifecycle?.issueTriageReports ?? []).map(
+          (existing) => (existing.id === report.id ? mutated.report : existing),
+        ),
+      });
+      const writeback = new CapturingWriteback();
+
+      const result = await new IssueBreakdownPlanApplyService({
+        config,
+        lifecycleStore,
+        writeback,
+      }).applyLatestFreshPlan(candidate);
+
+      expect(result).toMatchObject({
+        status: "blocked",
+        reason: ISSUE_BREAKDOWN_TRIAGE_PROVENANCE_INVALID_REASON,
+        operations: [],
+      });
+      expect(writeback.operations).toEqual([]);
+      await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+        issueBreakdownPlans: [
+          expect.objectContaining({
+            sourceIssueTriageReportId: report.id,
+            applicationStatus: "blocked",
+            applicationBlockedReason:
+              ISSUE_BREAKDOWN_TRIAGE_PROVENANCE_INVALID_REASON,
+          }),
+        ],
+      });
+    },
+  );
+
+  it("applies a triage-linked plan only after its exact automated planner route succeeds", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.writeback.enabled = true;
+    config.writeback.dispatchState = "In Progress";
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    const candidate = issue({
+      state: "In Progress",
+      labels: ["planning"],
+      updatedAt: "2026-01-02T00:00:00Z",
+    });
+    const report = await seedAutomatedPlannerTriageReport(
+      lifecycleStore,
+      candidate,
+    );
+    await submitSingleChildPlan(config, lifecycleStore, candidate, {
+      sourceIssueTriageReportId: report.id,
+    });
+    const writeback = new CapturingWriteback();
+
+    const result = await new IssueBreakdownPlanApplyService({
+      config,
+      lifecycleStore,
+      writeback,
+    }).applyLatestFreshPlan(candidate);
+
+    expect(result.status).toBe("applied");
+    expect(writeback.operations.length).toBeGreaterThan(0);
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      issueBreakdownPlans: [
+        expect.objectContaining({
+          sourceIssueTriageReportId: report.id,
+          applicationStatus: "applied",
+        }),
+      ],
+    });
+  });
+
+  it("reconciles an applied triage-linked plan after its parent reaches review", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.writeback.enabled = true;
+    config.writeback.dispatchState = "In Progress";
+    config.reviewLoop.reviewStates = ["In Review"];
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    const candidate = issue({
+      state: "In Progress",
+      labels: ["planning"],
+      updatedAt: "2026-01-02T00:00:00Z",
+    });
+    const report = await seedAutomatedPlannerTriageReport(
+      lifecycleStore,
+      candidate,
+    );
+    await submitSingleChildPlan(config, lifecycleStore, candidate, {
+      sourceIssueTriageReportId: report.id,
+    });
+    const writeback = new CapturingWriteback();
+    const service = new IssueBreakdownPlanApplyService({
+      config,
+      lifecycleStore,
+      writeback,
+    });
+    await expect(service.applyLatestFreshPlan(candidate)).resolves.toMatchObject({
+      status: "applied",
+    });
+    const operationCount = writeback.operations.length;
+
+    await expect(
+      service.applyLatestFreshPlan({ ...candidate, state: "In Review" }),
+    ).resolves.toMatchObject({ status: "applied" });
+
+    expect(writeback.operations).toHaveLength(operationCount);
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      issueBreakdownPlans: [
+        expect.objectContaining({
+          sourceIssueTriageReportId: report.id,
+          applicationStatus: "applied",
+          applicationBlockedReason: null,
+        }),
+      ],
+    });
+  });
+
+  it("reconciles an applied triage-linked plan after its source report is consumed", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.writeback.enabled = true;
+    config.writeback.dispatchState = "In Progress";
+    config.reviewLoop.reviewStates = ["In Review"];
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    const candidate = issue({
+      state: "In Progress",
+      labels: ["planning"],
+      updatedAt: "2026-01-02T00:00:00Z",
+    });
+    const report = await seedAutomatedPlannerTriageReport(
+      lifecycleStore,
+      candidate,
+    );
+    await submitSingleChildPlan(config, lifecycleStore, candidate, {
+      sourceIssueTriageReportId: report.id,
+    });
+    const writeback = new CapturingWriteback();
+    const service = new IssueBreakdownPlanApplyService({
+      config,
+      lifecycleStore,
+      writeback,
+    });
+    await expect(service.applyLatestFreshPlan(candidate)).resolves.toMatchObject({
+      status: "applied",
+    });
+    const operationCount = writeback.operations.length;
+    await lifecycleStore.updateIssue(candidate, {
+      phase: "review",
+      reviewRound: 0,
+      incompleteTurnCount: 0,
+      blockedReason: null,
+      lastIssueTriageReportId: null,
+    });
+
+    await expect(
+      service.applyLatestFreshPlan({ ...candidate, state: "In Progress" }),
+    ).resolves.toMatchObject({ status: "applied" });
+
+    expect(writeback.operations).toHaveLength(operationCount);
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      lastIssueTriageReportId: null,
+      issueBreakdownPlans: [
+        expect.objectContaining({
+          sourceIssueTriageReportId: report.id,
+          applicationStatus: "applied",
+          applicationBlockedReason: null,
+        }),
       ],
     });
   });
@@ -255,10 +509,7 @@ describe("IssueBreakdownPlanApplyService", () => {
     expect(writer.comments).toHaveLength(1);
     expectExactDisposition(writer.comments[0]?.body ?? "", FINAL_DISPOSITION);
     expect(writer.transitions).toHaveLength(0);
-    expect(records.find((record) => record.kind === "transition")).toMatchObject({
-      status: "skipped",
-      lastError: ISSUE_BREAKDOWN_PLAN_STALE_REASON,
-    });
+    expect(records.find((record) => record.kind === "transition")).toBeUndefined();
   });
 
   it("leaves local planning behavior unchanged when apply is disabled", async () => {
@@ -672,6 +923,75 @@ describe("IssueBreakdownPlanApplyService", () => {
     });
   });
 
+  it("hydrates missing child refs from registered succeeded writebacks before checking freshness", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.writeback.enabled = true;
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue({ labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
+    const plan = await submitTwoChildPlan(config, lifecycleStore, candidate);
+    const childOperations = planIssueBreakdownApplicationWritebacks(candidate, plan) as IssueCreateWriteback[];
+    const firstChild = childOperations[0]!;
+    const lifecycle = await lifecycleStore.get(candidate.id);
+    await lifecycleStore.updateIssue(candidate, {
+      issueBreakdownPlans:
+        lifecycle?.issueBreakdownPlans.map((existing) =>
+          existing.id === plan.id
+            ? {
+                ...existing,
+                applicationStatus: "pending",
+                applicationOperationKeys: childOperations.map(
+                  (operation) => operation.idempotencyKey,
+                ),
+                createdIssueRefs: [],
+              }
+            : existing,
+        ) ?? [],
+      lastIssueBreakdownPlanId: plan.id,
+    });
+    const store = new FileWritebackOutboxStore(config.workspace.stateDir);
+    await store.markSucceeded(
+      await store.enqueueOnce(firstChild),
+      issueCreateResult(firstChild),
+    );
+    const liveCandidate = {
+      ...candidate,
+      blockedBy: [
+        { id: "child-1", identifier: "TEST-2", state: "Todo" },
+      ],
+      hasChildren: true,
+    };
+    const writer = new FakeWriter();
+    const processor = new WritebackProcessor(
+      store,
+      writer,
+      new StructuredLogger(() => undefined),
+      300_000,
+      lifecycleStore,
+      false,
+      freshnessGuard(liveCandidate, config),
+    );
+
+    const result = await new IssueBreakdownPlanApplyService({
+      config,
+      lifecycleStore,
+      writeback: processor,
+    }).applyLatestFreshPlan(liveCandidate);
+    const recovered = await lifecycleStore.get(candidate.id);
+
+    expect(result.status).toBe("applied");
+    expect(writer.issueCreates).toHaveLength(1);
+    expect(writer.issueCreates[0]?.proposedIssueIndex).toBe(1);
+    expect(recovered?.issueBreakdownPlans[0]).toMatchObject({
+      applicationStatus: "applied",
+      applicationBlockedReason: null,
+      createdIssueRefs: [
+        expect.objectContaining({ proposedIssueIndex: 0, id: "child-1" }),
+        expect.objectContaining({ proposedIssueIndex: 1, id: "child-2" }),
+      ],
+    });
+  });
+
   it("recovers stale-skipped child writebacks on a fresh live apply without duplicating succeeded children", async () => {
     const config = testConfig(root);
     config.issueBreakdown.applyToLinear.enabled = true;
@@ -799,6 +1119,107 @@ describe("IssueBreakdownPlanApplyService", () => {
     }
     expect(lifecycle?.issueBreakdownPlans[0]?.applicationStatus).toBe("applied");
   });
+
+  it("retries arbitrary skipped plan writebacks only after explicit operator resume", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.writeback.enabled = true;
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue({ labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
+    const plan = await submitSingleChildPlan(config, lifecycleStore, candidate);
+    const childOperation = planIssueBreakdownApplicationWritebacks(
+      candidate,
+      plan,
+    )[0] as IssueCreateWriteback;
+    const planWithRef = {
+      ...plan,
+      createdIssueRefs: [createdIssueRef(childOperation)],
+    };
+    const dispositionOperation = planIssueBreakdownDispositionWriteback(
+      candidate,
+      planWithRef,
+    );
+    const finalOperations = planIssueBreakdownFinalizationWritebacks(
+      candidate,
+      planWithRef,
+    );
+    const relationOperation = finalOperations.find(
+      (operation) => operation.kind === "issue_relation",
+    );
+    if (!relationOperation) throw new Error("Expected parent relation writeback");
+    const skippedReason = "operator-fixable relation precondition failed";
+    await lifecycleStore.updateIssue(candidate, {
+      issueBreakdownPlans: [
+        {
+          ...planWithRef,
+          applicationStatus: "blocked",
+          applicationOperationKeys: [
+            childOperation.idempotencyKey,
+            dispositionOperation.idempotencyKey,
+            ...finalOperations.map((operation) => operation.idempotencyKey),
+          ],
+          applicationBlockedReason: skippedReason,
+        },
+      ],
+      lastIssueBreakdownPlanId: plan.id,
+    });
+    const store = new FileWritebackOutboxStore(config.workspace.stateDir);
+    await store.markSucceeded(
+      await store.enqueueOnce(childOperation),
+      issueCreateResult(childOperation),
+    );
+    await store.markSucceeded(await store.enqueueOnce(dispositionOperation), {
+      status: "applied",
+      message: "Comment written",
+    });
+    await store.markSkipped(
+      await store.enqueueOnce(relationOperation),
+      skippedReason,
+    );
+    const writer = new FakeWriter();
+    const processor = new WritebackProcessor(
+      store,
+      writer,
+      new StructuredLogger(() => undefined),
+      300_000,
+      lifecycleStore,
+      false,
+      freshnessGuard(candidate, config),
+    );
+    const service = new IssueBreakdownPlanApplyService({
+      config,
+      lifecycleStore,
+      writeback: processor,
+    });
+
+    const automatic = await service.applyLatestFreshPlan(candidate);
+
+    expect(automatic).toMatchObject({ status: "blocked", reason: skippedReason });
+    expect(writer.issueRelations).toEqual([]);
+    await expect(store.get(relationOperation.idempotencyKey)).resolves.toMatchObject({
+      status: "skipped",
+      lastError: skippedReason,
+    });
+
+    const resumed = await service.applyLatestFreshPlan(candidate, {
+      retrySkippedAfterOperatorResume: true,
+    });
+
+    expect(resumed.status).toBe("applied");
+    expect(writer.issueCreates).toEqual([]);
+    expect(writer.issueRelations).toHaveLength(1);
+    await expect(store.get(relationOperation.idempotencyKey)).resolves.toMatchObject({
+      status: "succeeded",
+    });
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      issueBreakdownPlans: [
+        expect.objectContaining({
+          applicationStatus: "applied",
+          applicationBlockedReason: null,
+        }),
+      ],
+    });
+  });
 });
 
 class CapturingWriteback implements Pick<WritebackProcessorType, "enqueueAndProcess"> {
@@ -904,7 +1325,12 @@ async function submitSingleChildPlan(
   config: ServiceConfig,
   lifecycleStore: FileIssueLifecycleStore,
   candidate: Issue,
-  options: { idempotencyKey?: string; runId?: string; finalDisposition?: string } = {},
+  options: {
+    idempotencyKey?: string;
+    runId?: string;
+    finalDisposition?: string;
+    sourceIssueTriageReportId?: string | null;
+  } = {},
 ) {
   const runId = options.runId ?? "run-plan-1";
   const result = await new IssueBreakdownPlanService({ config, lifecycleStore }).submit_issue_breakdown_plan(
@@ -924,9 +1350,74 @@ async function submitSingleChildPlan(
       ],
       idempotencyKey: options.idempotencyKey ?? "plan-1",
     },
-    { issue: candidate, activeRunId: runId, role: "worker", phase: "issue_breakdown" },
+    {
+      issue: candidate,
+      activeRunId: runId,
+      role:
+        options.sourceIssueTriageReportId ? "planner" : "worker",
+      phase: "issue_breakdown",
+      sourceIssueTriageReportId:
+        options.sourceIssueTriageReportId ?? null,
+    },
   );
   return result.plan;
+}
+
+async function seedAutomatedPlannerTriageReport(
+  lifecycleStore: FileIssueLifecycleStore,
+  candidate: Issue,
+): Promise<IssueTriageReportRecord> {
+  const lifecycle = await lifecycleStore.ensureIssue(candidate, {
+    phase: "blocked",
+    reviewRound: 3,
+    blockedReason: "max reviewer failures reached (3/3)",
+  });
+  const reportId = `issue-triage-report:${candidate.id}:triage-planner`;
+  const transitionOperationKey = `transition:${candidate.id}:issue-triage:triage-planner:automated-recovery:In_Progress`;
+  const report: IssueTriageReportRecord = {
+    id: reportId,
+    idempotencyKey: "triage-planner",
+    requestHash: "triage-planner-hash",
+    runId: "triage-run-1",
+    issueId: candidate.id,
+    issueIdentifier: candidate.identifier,
+    triggerFingerprint: issueTriageTriggerFingerprint(lifecycle),
+    disposition: "decompose_issue",
+    confidence: "high",
+    summary: "The issue requires a bounded automated planner breakdown.",
+    evidence: ["The current blocker is under-specified."],
+    recommendedAction: "Create and apply a bounded child plan.",
+    blockers: [
+      {
+        kind: "under_specified_needs_decomposition",
+        status: "active",
+        nextActor: "planner",
+        confidence: "high",
+        summary: "The issue requires a bounded planner breakdown.",
+        evidence: ["The current blocker is under-specified."],
+        recommendedAction: "Create and apply a bounded child plan.",
+      },
+    ],
+    recoveryDisposition: {
+      mode: "automated",
+      nextActor: "planner",
+      targetState: "In Progress",
+      reportWritebackStatus: "applied",
+      transitionOperationKey,
+      transitionStatus: "applied",
+      reason: "machine-owned recovery routed to planner",
+    },
+    submittedAt: "2026-01-02T00:00:00.000Z",
+    writebackOperationKeys: [
+      `comment:${candidate.id}:issue-triage:triage-planner`,
+      transitionOperationKey,
+    ],
+  };
+  await lifecycleStore.updateIssue(candidate, {
+    lastIssueTriageReportId: report.id,
+    issueTriageReports: [report],
+  });
+  return report;
 }
 
 async function seedLegacyValidationDriftPlan(

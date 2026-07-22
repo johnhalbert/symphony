@@ -4,6 +4,9 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   IssueTriageService,
+  issueTriageAutomaticAttemptsForTrigger,
+  issueTriageRecoveryRetriageReason,
+  issueTriageRecoveryRetriageReasonForContext,
   issueTriageTriggerFingerprint,
   legacyIssueTriageReportRequestHash,
   parseIssueTriageReport,
@@ -29,7 +32,12 @@ describe("IssueTriageService", () => {
   it("accepts and replays a triage report for a max-failure blocked trigger", async () => {
     const config = testConfig(root);
     config.issueTriage.enabled = true;
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.issueBreakdown.applyToLinear.autoApply = true;
     config.writeback.enabled = true;
+    config.writeback.dispatchState = "In Progress";
+    config.reviewLoop.blockedStates = ["Blocked"];
     const candidate = issue({ state: "Blocked" });
     const lifecycleStore = new FileIssueLifecycleStore(root);
     const runStore = new FileRunTranscriptStore(root);
@@ -85,10 +93,26 @@ describe("IssueTriageService", () => {
 
     expect(accepted.replayed).toBe(false);
     expect(replayed.replayed).toBe(true);
-    expect(accepted.report.writebackOperationKeys).toEqual(["comment:issue-1:issue-triage:triage-1"]);
-    expect(replayed.report.writebackOperationKeys).toEqual(["comment:issue-1:issue-triage:triage-1"]);
+    expect(accepted.report.writebackOperationKeys).toEqual([
+      "comment:issue-1:issue-triage:triage-1",
+      "transition:issue-1:issue-triage:triage-1:automated-recovery:In_Progress",
+    ]);
+    expect(replayed.report.writebackOperationKeys).toEqual([
+      "comment:issue-1:issue-triage:triage-1",
+      "transition:issue-1:issue-triage:triage-1:automated-recovery:In_Progress",
+    ]);
+    expect(accepted.report.recoveryDisposition).toEqual({
+      mode: "automated",
+      nextActor: "planner",
+      targetState: "In Progress",
+      transitionOperationKey:
+        "transition:issue-1:issue-triage:triage-1:automated-recovery:In_Progress",
+      transitionStatus: "pending",
+      reportWritebackStatus: "pending",
+      reason: "machine-owned recovery routed to planner",
+    });
     const writebacks = await writebackOutbox.list();
-    expect(writebacks).toHaveLength(1);
+    expect(writebacks).toHaveLength(2);
     expect(writebacks[0]).toMatchObject({
       idempotencyKey: "comment:issue-1:issue-triage:triage-1",
       kind: "comment",
@@ -99,7 +123,7 @@ describe("IssueTriageService", () => {
     expect(writebacks[0]?.kind === "comment" ? writebacks[0].payload.body : "").toContain("### 1. under_specified_needs_decomposition");
     expect(writebacks[0]?.kind === "comment" ? writebacks[0].payload.body : "").toContain("### 2. merge_gate_check_failure");
     expect(writebacks[0]?.kind === "comment" ? writebacks[0].payload.body : "").toContain("Confidence: high");
-    expect(writebacks[0]?.kind === "comment" ? writebacks[0].payload.body : "").toContain("Recommended human action:");
+    expect(writebacks[0]?.kind === "comment" ? writebacks[0].payload.body : "").toContain("Automated recovery action:");
     expect(writebacks[0]?.kind === "comment" ? writebacks[0].payload.body : "").toContain(
       "Use SpecKit to decompose the hidden sibling API scope into blocking child issues.",
     );
@@ -124,7 +148,18 @@ describe("IssueTriageService", () => {
             },
           ],
           triggerFingerprint: input.triggerFingerprint,
-          writebackOperationKeys: ["comment:issue-1:issue-triage:triage-1"],
+          recoveryDisposition: {
+            mode: "automated",
+            nextActor: "planner",
+            targetState: "In Progress",
+            transitionOperationKey:
+              "transition:issue-1:issue-triage:triage-1:automated-recovery:In_Progress",
+            transitionStatus: "pending",
+          },
+          writebackOperationKeys: [
+            "comment:issue-1:issue-triage:triage-1",
+            "transition:issue-1:issue-triage:triage-1:automated-recovery:In_Progress",
+          ],
         },
       ],
     });
@@ -166,6 +201,322 @@ describe("IssueTriageService", () => {
       code: "invalid_request",
       message: "Issue triage is not currently eligible for this issue",
     });
+  });
+
+  it("does not count legacy reports without recovery provenance toward the automatic attempt limit", async () => {
+    const config = testConfig(root);
+    config.issueTriage.enabled = true;
+    config.issueTriage.maxAttemptsPerTrigger = 1;
+    config.writeback.enabled = true;
+    config.reviewLoop.blockedStates = ["Blocked"];
+    const candidate = issue({ state: "Blocked" });
+    const lifecycleStore = new FileIssueLifecycleStore(root);
+    const writebackOutbox = new FileWritebackOutboxStore(root);
+    const lifecycle = await lifecycleStore.ensureIssue(candidate, {
+      phase: "blocked",
+      reviewRound: 3,
+      blockedReason: "max reviewer failures reached (3/3)",
+    });
+    const triggerFingerprint = issueTriageTriggerFingerprint(lifecycle);
+    const parsedLegacy = parseIssueTriageReport(
+      reportInput("legacy-run", "legacy-report", triggerFingerprint),
+    );
+    const legacyReportId = "issue-triage-report:issue-1:legacy-report";
+    await lifecycleStore.updateIssue(candidate, {
+      lastIssueTriageReportId: legacyReportId,
+      issueTriageReports: [
+        {
+          id: legacyReportId,
+          idempotencyKey: parsedLegacy.idempotencyKey,
+          requestHash: legacyIssueTriageReportRequestHash(parsedLegacy),
+          runId: parsedLegacy.runId,
+          issueId: candidate.id,
+          issueIdentifier: candidate.identifier,
+          triggerFingerprint,
+          disposition: parsedLegacy.disposition,
+          confidence: parsedLegacy.confidence,
+          summary: parsedLegacy.summary,
+          evidence: parsedLegacy.evidence,
+          recommendedAction: parsedLegacy.recommendedAction,
+          blockers: parsedLegacy.blockers,
+          recoveryDisposition: null,
+          submittedAt: "2026-01-01T00:00:00.000Z",
+          writebackOperationKeys: [],
+        },
+      ],
+    });
+    const current = await lifecycleStore.get(candidate.id);
+
+    expect(current).not.toBeNull();
+    expect(
+      issueTriageAutomaticAttemptsForTrigger(current!, triggerFingerprint),
+    ).toBe(0);
+    expect(shouldIssueTriageRun(current, config, candidate)).toBe(true);
+
+    const service = new IssueTriageService({
+      config,
+      lifecycleStore,
+      writebackOutbox,
+    });
+    const accepted = await service.submitIssueTriageReport(
+      reportInput("structured-run", "structured-report", triggerFingerprint),
+      {
+        issue: candidate,
+        activeRunId: "structured-run",
+        role: "triage",
+        phase: "issue_triage",
+      },
+    );
+
+    expect(accepted.report.recoveryDisposition).not.toBeNull();
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      issueTriageReports: [
+        { id: legacyReportId, recoveryDisposition: null },
+        { id: accepted.report.id, recoveryDisposition: expect.any(Object) },
+      ],
+    });
+  });
+
+  it("allows a new triage when an external recovery becomes automated", async () => {
+    const config = testConfig(root);
+    config.issueTriage.enabled = true;
+    config.issueTriage.maxAttemptsPerTrigger = 1;
+    config.writeback.enabled = true;
+    config.writeback.dispatchState = "In Progress";
+    config.reviewLoop.blockedStates = ["Blocked"];
+    const unavailable = issue({
+      state: "Blocked",
+      assignedToWorker: false,
+    });
+    const lifecycleStore = new FileIssueLifecycleStore(root);
+    const writebackOutbox = new FileWritebackOutboxStore(root);
+    const lifecycle = await lifecycleStore.ensureIssue(unavailable, {
+      phase: "blocked",
+      reviewRound: 3,
+      blockedReason: "max reviewer failures reached (3/3)",
+    });
+    const triggerFingerprint = issueTriageTriggerFingerprint(lifecycle);
+    const service = new IssueTriageService({
+      config,
+      lifecycleStore,
+      writebackOutbox,
+    });
+    const first = await service.submitIssueTriageReport(
+      reportInput("triage-run-1", "triage-1", triggerFingerprint),
+      {
+        issue: unavailable,
+        activeRunId: "triage-run-1",
+        role: "triage",
+        phase: "issue_triage",
+      },
+    );
+    expect(first.report.recoveryDisposition).toMatchObject({
+      mode: "external",
+      nextActor: null,
+      transitionStatus: "not_required",
+    });
+    const unchanged = await lifecycleStore.get(unavailable.id);
+    expect(
+      issueTriageRecoveryRetriageReason(unchanged, unavailable, config),
+    ).toBeNull();
+    expect(shouldIssueTriageRun(unchanged, config, unavailable)).toBe(false);
+
+    const resumed = { ...unavailable, assignedToWorker: true };
+    const current = await lifecycleStore.get(unavailable.id);
+    expect(
+      issueTriageRecoveryRetriageReasonForContext(
+        {
+          issue: resumed,
+          blockers: first.report.blockers,
+          previousDisposition: first.report.recoveryDisposition!,
+        },
+        config,
+      ),
+    ).toBe("external_recovery_became_automated");
+    expect(issueTriageRecoveryRetriageReason(current, resumed, config)).toBe(
+      "external_recovery_became_automated",
+    );
+    expect(shouldIssueTriageRun(current, config, resumed)).toBe(true);
+
+    const second = await service.submitIssueTriageReport(
+      reportInput("triage-run-2", "triage-2", triggerFingerprint),
+      {
+        issue: resumed,
+        activeRunId: "triage-run-2",
+        role: "triage",
+        phase: "issue_triage",
+      },
+    );
+    expect(second.report.recoveryDisposition).toMatchObject({
+      mode: "automated",
+      nextActor: "worker",
+      targetState: "In Progress",
+      transitionStatus: "pending",
+    });
+  });
+
+  it("allows one new triage when automated recovery changes from worker to planner", async () => {
+    const config = testConfig(root);
+    config.issueTriage.enabled = true;
+    config.issueTriage.maxAttemptsPerTrigger = 1;
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.planningLabels = ["planning"];
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.issueBreakdown.applyToLinear.autoApply = true;
+    config.writeback.enabled = true;
+    config.writeback.dispatchState = "In Progress";
+    config.reviewLoop.blockedStates = ["Blocked"];
+    const candidate = issue({ state: "In Progress", labels: [] });
+    const lifecycleStore = new FileIssueLifecycleStore(root);
+    const writebackOutbox = new FileWritebackOutboxStore(root);
+    const lifecycle = await lifecycleStore.ensureIssue(candidate, {
+      phase: "blocked",
+      reviewRound: 3,
+      blockedReason: "max reviewer failures reached (3/3)",
+    });
+    const triggerFingerprint = issueTriageTriggerFingerprint(lifecycle);
+    const service = new IssueTriageService({
+      config,
+      lifecycleStore,
+      writebackOutbox,
+    });
+    const first = await service.submitIssueTriageReport(
+      reportInput("triage-run-1", "triage-1", triggerFingerprint),
+      {
+        issue: candidate,
+        activeRunId: "triage-run-1",
+        role: "triage",
+        phase: "issue_triage",
+      },
+    );
+    expect(first.report.recoveryDisposition).toMatchObject({
+      mode: "automated",
+      nextActor: "worker",
+      targetState: "In Progress",
+      transitionStatus: "not_required",
+    });
+
+    const planningRequired = { ...candidate, labels: ["planning"] };
+    const current = await lifecycleStore.get(candidate.id);
+    expect(
+      issueTriageRecoveryRetriageReasonForContext(
+        {
+          issue: planningRequired,
+          blockers: first.report.blockers,
+          previousDisposition: first.report.recoveryDisposition!,
+        },
+        config,
+      ),
+    ).toBe("automated_recovery_route_changed");
+    expect(
+      issueTriageRecoveryRetriageReason(current, planningRequired, config),
+    ).toBe("automated_recovery_route_changed");
+    expect(shouldIssueTriageRun(current, config, planningRequired)).toBe(true);
+
+    const second = await service.submitIssueTriageReport(
+      reportInput("triage-run-2", "triage-2", triggerFingerprint),
+      {
+        issue: planningRequired,
+        activeRunId: "triage-run-2",
+        role: "triage",
+        phase: "issue_triage",
+      },
+    );
+    expect(second.report.recoveryDisposition).toMatchObject({
+      mode: "automated",
+      nextActor: "planner",
+      targetState: "In Progress",
+      transitionStatus: "not_required",
+    });
+
+    const retriaged = await lifecycleStore.get(candidate.id);
+    expect(
+      issueTriageRecoveryRetriageReason(retriaged, planningRequired, config),
+    ).toBeNull();
+    expect(shouldIssueTriageRun(retriaged, config, planningRequired)).toBe(false);
+  });
+
+  it("allows a new triage after a completed automated route drifts from its target state", async () => {
+    const config = testConfig(root);
+    config.issueTriage.enabled = true;
+    config.issueTriage.maxAttemptsPerTrigger = 1;
+    config.writeback.enabled = true;
+    config.writeback.dispatchState = "In Progress";
+    config.reviewLoop.blockedStates = ["Blocked"];
+    const candidate = issue({ state: "In Progress" });
+    const lifecycleStore = new FileIssueLifecycleStore(root);
+    const writebackOutbox = new FileWritebackOutboxStore(root);
+    const lifecycle = await lifecycleStore.ensureIssue(candidate, {
+      phase: "blocked",
+      reviewRound: 3,
+      blockedReason: "max reviewer failures reached (3/3)",
+    });
+    const triggerFingerprint = issueTriageTriggerFingerprint(lifecycle);
+    const service = new IssueTriageService({
+      config,
+      lifecycleStore,
+      writebackOutbox,
+    });
+    const first = await service.submitIssueTriageReport(
+      reportInput("triage-run-1", "triage-1", triggerFingerprint),
+      {
+        issue: candidate,
+        activeRunId: "triage-run-1",
+        role: "triage",
+        phase: "issue_triage",
+      },
+    );
+    expect(first.report.recoveryDisposition).toMatchObject({
+      mode: "automated",
+      nextActor: "worker",
+      transitionStatus: "not_required",
+    });
+
+    const drifted = { ...candidate, state: "Blocked" };
+    const current = await lifecycleStore.get(candidate.id);
+    expect(
+      issueTriageRecoveryRetriageReasonForContext(
+        {
+          issue: drifted,
+          blockers: first.report.blockers,
+          previousDisposition: first.report.recoveryDisposition!,
+        },
+        config,
+      ),
+    ).toBe("automated_recovery_target_state_drift");
+    expect(issueTriageRecoveryRetriageReason(current, drifted, config)).toBe(
+      "automated_recovery_target_state_drift",
+    );
+    expect(shouldIssueTriageRun(current, config, drifted)).toBe(true);
+
+    const second = await service.submitIssueTriageReport(
+      reportInput("triage-run-2", "triage-2", triggerFingerprint),
+      {
+        issue: drifted,
+        activeRunId: "triage-run-2",
+        role: "triage",
+        phase: "issue_triage",
+      },
+    );
+    expect(second.report.recoveryDisposition).toMatchObject({
+      mode: "automated",
+      nextActor: "worker",
+      transitionStatus: "pending",
+    });
+  });
+
+  it("allows automated max-review triage while Linear remains In Review", async () => {
+    const config = testConfig(root);
+    config.issueTriage.enabled = true;
+    const candidate = issue({ state: "In Review" });
+    const lifecycleStore = new FileIssueLifecycleStore(root);
+    const lifecycle = await lifecycleStore.ensureIssue(candidate, {
+      phase: "review",
+      reviewRound: 3,
+      blockedReason: "max reviewer failures reached (3/3)",
+    });
+
+    expect(shouldIssueTriageRun(lifecycle, config)).toBe(true);
   });
 
   it("allows manual triage reports after the configured trigger attempt limit", async () => {

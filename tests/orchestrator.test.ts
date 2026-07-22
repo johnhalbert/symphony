@@ -29,7 +29,10 @@ import {
   OperatorApprovalService,
   type OperatorApprovalRecord,
 } from "../src/core/approval/OperatorApprovalService.js";
-import { parseServiceConfig } from "../src/core/config/Config.js";
+import {
+  parseServiceConfig,
+  type ServiceConfig,
+} from "../src/core/config/Config.js";
 import { ReviewVerdictService } from "../src/core/ReviewVerdictService.js";
 import { FakeHarness } from "../src/core/harness/FakeHarness.js";
 import type {
@@ -817,6 +820,83 @@ describe("Orchestrator", () => {
       expect(pageInputs.length).toBeGreaterThan(0);
       expect(idFetches).toBe(0);
       expect(processed).toEqual([]);
+    } finally {
+      await orchestrator.stop();
+    }
+  });
+
+  it("recovers lifecycle-bound reconciliation candidates outside filtered paged lanes", async () => {
+    const config = testConfig(root);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const recoveryIssue = issue({
+      id: "issue-recovery-parent",
+      identifier: "TEST-RECOVERY-PARENT",
+      state: "In Progress",
+      assignedToWorker: false,
+      hasChildren: true,
+    });
+    await lifecycleStore.ensureIssue(recoveryIssue, {
+      phase: "blocked",
+      blockedReason: "automated triage recovery requires reconciliation",
+    });
+    const exactFetches: string[][] = [];
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds(issueIds) {
+        exactFetches.push(issueIds);
+        return issueIds.includes(recoveryIssue.id) ? [recoveryIssue] : [];
+      },
+      async fetchIssueCandidatePageByFilter() {
+        return {
+          issues: [],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        };
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+    });
+    const internals = orchestrator as unknown as {
+      processTickIssueCandidates(): Promise<void>;
+      processTickIssueCandidate(
+        candidate: Issue,
+        options?: { refreshBeforeTransition?: boolean },
+      ): Promise<boolean>;
+    };
+    const processed: Array<{ id: string; refreshBeforeTransition?: boolean }> = [];
+    internals.processTickIssueCandidate = async (candidate, options) => {
+      processed.push({
+        id: candidate.id,
+        ...(options?.refreshBeforeTransition === undefined
+          ? {}
+          : { refreshBeforeTransition: options.refreshBeforeTransition }),
+      });
+      return true;
+    };
+
+    try {
+      await internals.processTickIssueCandidates();
+
+      expect(exactFetches).toEqual([[recoveryIssue.id]]);
+      expect(processed).toEqual([
+        { id: recoveryIssue.id, refreshBeforeTransition: false },
+      ]);
     } finally {
       await orchestrator.stop();
     }
@@ -4526,13 +4606,17 @@ describe("Orchestrator", () => {
     });
   });
 
-  it("dispatches classify-only issue triage for max-failure blocked issues", async () => {
+  it("dispatches classify-only issue triage while a max-failure issue remains In Review", async () => {
     const config = testConfig(root);
     config.issueTriage.enabled = true;
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.issueBreakdown.applyToLinear.autoApply = true;
     config.writeback.enabled = true;
+    config.reviewLoop.reviewStates = ["In Review"];
     config.reviewLoop.blockedStates = ["Blocked"];
     const candidate = issue({
-      state: "Blocked",
+      state: "In Review",
       branchName: "symphony/TEST-1",
     });
     const tracker: TrackerClient = {
@@ -4540,7 +4624,7 @@ describe("Orchestrator", () => {
         return [];
       },
       async fetchIssuesByStates(states) {
-        return states.includes("Blocked") ? [candidate] : [];
+        return states.includes("In Review") ? [candidate] : [];
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -4604,12 +4688,24 @@ describe("Orchestrator", () => {
               nextActor: "planner",
             },
           ],
-          writebackOperationKeys: ["comment:issue-1:issue-triage:triage-run-1"],
+          recoveryDisposition: {
+            mode: "automated",
+            nextActor: "planner",
+            targetState: "In Progress",
+            reportWritebackStatus: "pending",
+            transitionOperationKey:
+              "transition:issue-1:issue-triage:triage-run-1:automated-recovery:In_Progress",
+            transitionStatus: "pending",
+          },
+          writebackOperationKeys: [
+            "comment:issue-1:issue-triage:triage-run-1",
+            "transition:issue-1:issue-triage:triage-run-1:automated-recovery:In_Progress",
+          ],
         },
       ],
     });
     const writebacks = await outboxStore.list();
-    expect(writebacks).toHaveLength(1);
+    expect(writebacks).toHaveLength(2);
     expect(writebacks[0]).toMatchObject({
       idempotencyKey: "comment:issue-1:issue-triage:triage-run-1",
       kind: "comment",
@@ -4621,12 +4717,686 @@ describe("Orchestrator", () => {
     ).toContain("## Symphony Issue Triage");
     expect(
       writebacks[0]?.kind === "comment" ? writebacks[0].payload.body : "",
-    ).toContain("Recommended human action:");
+    ).toContain("Automated recovery action:");
     await expect(runStore.getRun("triage-run-1")).resolves.toMatchObject({
       role: "triage",
       runPhase: "issue_triage",
       runKind: "triage",
       status: "succeeded",
+    });
+  });
+
+  it("dispatches planner recovery from automated triage before clearing the review ceiling", async () => {
+    const config = testConfig(root);
+    config.issueTriage.enabled = true;
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.promptTemplate = "Plan {{ issue.identifier }}";
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.issueBreakdown.applyToLinear.autoApply = true;
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.reviewLoop.blockedStates = ["Blocked"];
+    const candidate = issue({
+      state: "In Progress",
+      branchName: "symphony/TEST-1",
+    });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    const blocked = await lifecycleStore.ensureIssue(candidate, {
+      phase: "blocked",
+      reviewRound: 3,
+      blockedReason: "max reviewer failures reached (3/3)",
+    });
+    const reportId = "issue-triage-report:issue-1:triage-run-1";
+    await lifecycleStore.updateIssue(candidate, {
+      lastIssueTriageReportId: reportId,
+      issueTriageReports: [
+        {
+          id: reportId,
+          idempotencyKey: "triage-run-1",
+          requestHash: "triage-hash-1",
+          runId: "triage-run-1",
+          issueId: candidate.id,
+          issueIdentifier: candidate.identifier,
+          triggerFingerprint: issueTriageTriggerFingerprint(blocked),
+          disposition: "decompose_issue",
+          confidence: "high",
+          summary: "The current issue needs a bounded breakdown plan.",
+          evidence: ["blockedReason=max reviewer failures reached (3/3)"],
+          recommendedAction: "Create the required child issue plan.",
+          blockers: [
+            {
+              kind: "under_specified_needs_decomposition",
+              status: "active",
+              nextActor: "planner",
+              confidence: "high",
+              summary: "The current issue needs a bounded breakdown plan.",
+              evidence: [
+                "blockedReason=max reviewer failures reached (3/3)",
+              ],
+              recommendedAction: "Create the required child issue plan.",
+            },
+          ],
+          recoveryDisposition: {
+            mode: "automated",
+            nextActor: "planner",
+            targetState: "In Progress",
+            reportWritebackStatus: "applied",
+            transitionOperationKey:
+              "transition:issue-1:issue-triage:triage-run-1:automated-recovery:In_Progress",
+            transitionStatus: "applied",
+            reason: "machine-owned recovery routed to planner",
+          },
+          submittedAt: "2026-01-01T00:00:01.000Z",
+          writebackOperationKeys: [
+            "comment:issue-1:issue-triage:triage-run-1",
+            "transition:issue-1:issue-triage:triage-run-1:automated-recovery:In_Progress",
+          ],
+        },
+      ],
+    });
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const outboxStore = new FileWritebackOutboxStore(
+      config.workspace.stateDir,
+    );
+    const writer = new StateChangingWriter(() => undefined);
+    const writeback = new WritebackProcessor(
+      outboxStore,
+      writer,
+      logger,
+      config.writeback.maxBackoffMs,
+      lifecycleStore,
+      false,
+      {
+        getConfig: () => config,
+        resolveIssue: async () => ({ status: "ok", issue: candidate }),
+      },
+    );
+    const harness = new IssueBreakdownAcceptingHarness(lifecycleStore);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(
+      () => harness.runs.length === 1,
+      "automated triage planner recovery",
+    );
+    await waitFor(
+      () => orchestrator.snapshot().counts.running === 0,
+      "automated triage planner completion",
+    );
+    await orchestrator.refreshNow();
+    await orchestrator.stop();
+
+    expect(harness.runs[0]?.ctx).toMatchObject({
+      role: "planner",
+      runPhase: "issue_breakdown",
+    });
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      phase: "implementation",
+      reviewRound: 0,
+      incompleteTurnCount: 0,
+      blockedReason: null,
+      lastIssueTriageReportId: null,
+      planningFailureCount: 0,
+      issueBreakdownPlans: [
+        expect.objectContaining({
+          runId: "issue_breakdown-run-1",
+          sourceIssueTriageReportId: reportId,
+          applicationStatus: "applied",
+        }),
+      ],
+    });
+    expect(writer.issueCreates).toHaveLength(1);
+  });
+
+  it.each([
+    {
+      name: "a triage-excluded label",
+      issuePatch: { labels: ["no-triage"] },
+      configure: (config: ServiceConfig): void => {
+        config.agent.excludeLabels = ["no-triage"];
+      },
+    },
+    {
+      name: "existing child issues",
+      issuePatch: { hasChildren: true },
+      configure: (_config: ServiceConfig): void => undefined,
+    },
+  ])(
+    "moves a review-ceiling issue to Blocked when triage is unavailable because of $name",
+    async ({ issuePatch, configure }) => {
+      const config = testConfig(root);
+      config.issueTriage.enabled = true;
+      config.writeback.enabled = true;
+      config.writeback.mode = "live";
+      config.reviewLoop.reviewStates = ["In Review"];
+      config.reviewLoop.blockedStates = ["Blocked"];
+      configure(config);
+      let currentState = "In Review";
+      const candidate = issue({
+        ...issuePatch,
+        state: currentState,
+        branchName: "symphony/TEST-1",
+      });
+      const currentIssue = (): Issue => ({
+        ...candidate,
+        state: currentState,
+      });
+      const tracker: TrackerClient = {
+        async fetchCandidateIssues() {
+          return [currentIssue()];
+        },
+        async fetchIssuesByStates(states) {
+          return issuesInStates([currentIssue()], states);
+        },
+        async fetchIssueStatesByIds() {
+          return [currentIssue()];
+        },
+      };
+      const logger = new StructuredLogger(() => undefined);
+      const lifecycleStore = new FileIssueLifecycleStore(
+        config.workspace.stateDir,
+      );
+      await lifecycleStore.ensureIssue(candidate, {
+        phase: "blocked",
+        reviewRound: 3,
+        blockedReason: "max reviewer failures reached (3/3)",
+      });
+      const writer = new StateChangingWriter((state) => {
+        currentState = state;
+      });
+      const writeback = new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        logger,
+        config.writeback.maxBackoffMs,
+      );
+      const harness = new FakeHarness();
+      const orchestrator = new Orchestrator({
+        config,
+        tracker,
+        workspaceManager: new WorkspaceManager({
+          workspace: config.workspace,
+          hooks: config.hooks,
+          logger,
+        }),
+        harness,
+        logger,
+        promptTemplate: "Work on {{ issue.identifier }}",
+        lifecycleStore,
+        runStore: new FileRunTranscriptStore(config.workspace.stateDir),
+        writeback,
+      });
+
+      await orchestrator.refreshNow();
+      await orchestrator.stop();
+
+      expect(harness.runs).toHaveLength(0);
+      expect(currentState).toBe("Blocked");
+      expect(writer.transitions).toEqual([
+        expect.objectContaining({ toState: "Blocked" }),
+      ]);
+      await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+        phase: "blocked",
+        blockedReason:
+          "review failure ceiling reached, but automated issue triage is unavailable under the current issue or workflow guardrails",
+      });
+    },
+  );
+
+  it("moves an automated worker route to Blocked when worker guardrails change before dispatch", async () => {
+    const config = testConfig(root);
+    config.issueTriage.enabled = true;
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.agent.workerExcludeLabels = ["no-worker"];
+    let currentState = "In Progress";
+    const candidate = issue({
+      state: currentState,
+      labels: ["no-worker"],
+      branchName: "symphony/TEST-1",
+    });
+    const currentIssue = (): Issue => ({ ...candidate, state: currentState });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [currentIssue()];
+      },
+      async fetchIssuesByStates(states) {
+        return issuesInStates([currentIssue()], states);
+      },
+      async fetchIssueStatesByIds() {
+        return [currentIssue()];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    await seedAutomatedWorkerTriageReport(lifecycleStore, candidate);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore: new FileRunTranscriptStore(config.workspace.stateDir),
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        logger,
+        config.writeback.maxBackoffMs,
+      ),
+    });
+
+    await orchestrator.refreshNow();
+    await orchestrator.stop();
+
+    expect(currentState).toBe("Blocked");
+    expect(writer.transitions).toEqual([
+      expect.objectContaining({ toState: "Blocked" }),
+    ]);
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      phase: "blocked",
+      blockedReason:
+        "automated triage requires worker repair, but worker dispatch is unavailable under the current issue or workflow guardrails",
+      lastIssueTriageReportId: expect.any(String),
+    });
+  });
+
+  it.each([
+    {
+      name: "the active state drifts from the recorded target",
+      state: "Todo",
+      labels: [] as string[],
+    },
+    {
+      name: "a planning label changes the machine actor to planner",
+      state: "In Progress",
+      labels: ["planning"],
+    },
+  ])("retriages without external Blocked when $name", async ({ state, labels }) => {
+    const config = testConfig(root);
+    config.issueTriage.enabled = true;
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.planningLabels = ["planning"];
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.issueBreakdown.applyToLinear.autoApply = true;
+    config.writeback.enabled = true;
+    config.writeback.dispatchState = "In Progress";
+    config.tracker.activeStates = ["Todo", "In Progress"];
+    config.reviewLoop.blockedStates = ["Blocked"];
+    const seededIssue = issue({
+      state: "In Progress",
+      labels: [],
+      branchName: "symphony/TEST-1",
+    });
+    const currentIssue = (): Issue => ({ ...seededIssue, state, labels });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [currentIssue()];
+      },
+      async fetchIssuesByStates(states) {
+        return issuesInStates([currentIssue()], states);
+      },
+      async fetchIssueStatesByIds() {
+        return [currentIssue()];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    await seedAutomatedWorkerTriageReport(lifecycleStore, seededIssue);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const outboxStore = new FileWritebackOutboxStore(
+      config.workspace.stateDir,
+    );
+    const harness = new IssueTriageAcceptingHarness(
+      lifecycleStore,
+      outboxStore,
+    );
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1, "active-state retriage");
+    await waitFor(
+      () => orchestrator.snapshot().counts.running === 0,
+      "active-state retriage completion",
+    );
+    await orchestrator.stop();
+
+    expect(harness.runs[0]?.ctx).toMatchObject({
+      role: "triage",
+      runPhase: "issue_triage",
+    });
+    await expect(lifecycleStore.get(seededIssue.id)).resolves.toMatchObject({
+      blockedReason: "max reviewer failures reached (3/3)",
+      issueTriageReports: [
+        expect.objectContaining({
+          id: expect.stringContaining("triage-worker-run-1"),
+        }),
+        expect.objectContaining({
+          runId: "triage-run-1",
+          recoveryDisposition: expect.objectContaining({
+            mode: "automated",
+            nextActor: "planner",
+          }),
+        }),
+      ],
+    });
+    const history = await readIssueState(config.workspace.stateDir, seededIssue.id);
+    expect(
+      history?.history.some(
+        (snapshot) => snapshot.transitionKind === "dispatch_triage",
+      ),
+    ).toBe(true);
+    expect(
+      history?.history.some(
+        (snapshot) =>
+          snapshot.transitionKind === "block_issue" &&
+          snapshot.reason?.includes("automated triage requires"),
+      ),
+    ).toBe(false);
+  });
+
+  it("recovers a triage-linked plan persisted before planner exit", async () => {
+    const config = testConfig(root);
+    config.issueTriage.enabled = true;
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.issueBreakdown.applyToLinear.autoApply = true;
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.reviewLoop.reviewStates = ["In Review"];
+    let currentState = "In Progress";
+    const candidate = issue({
+      state: currentState,
+      branchName: "symphony/TEST-1",
+    });
+    const currentIssue = (): Issue => ({ ...candidate, state: currentState });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [currentIssue()];
+      },
+      async fetchIssuesByStates(states) {
+        return issuesInStates([currentIssue()], states);
+      },
+      async fetchIssueStatesByIds() {
+        return [currentIssue()];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    const reportId = await seedAutomatedPlannerTriageReport(
+      lifecycleStore,
+      candidate,
+    );
+    await new IssueBreakdownPlanService({
+      config,
+      lifecycleStore,
+    }).submit_issue_breakdown_plan(
+      {
+        runId: "planner-run-before-restart",
+        issueId: candidate.id,
+        finalDisposition: "Created the triage-requested child plan.",
+        idempotencyKey: "plan-before-restart",
+        summary: "Create one bounded implementation child.",
+        proposedIssues: [
+          {
+            title: "Implement the bounded repair",
+            description: agentEligibleIssueContract(),
+            acceptanceCriteria: ["The repair is implemented and tested."],
+            dependencies: [],
+            labels: ["planning"],
+          },
+        ],
+      },
+      {
+        issue: candidate,
+        activeRunId: "planner-run-before-restart",
+        role: "planner",
+        phase: "issue_breakdown",
+        sourceIssueTriageReportId: reportId,
+      },
+    );
+    const outboxStore = new FileWritebackOutboxStore(
+      config.workspace.stateDir,
+    );
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(
+      outboxStore,
+      writer,
+      logger,
+      config.writeback.maxBackoffMs,
+      lifecycleStore,
+      false,
+      {
+        getConfig: () => config,
+        resolveIssue: async () => ({ status: "ok", issue: currentIssue() }),
+      },
+    );
+    const harness = new FakeHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore: new FileRunTranscriptStore(config.workspace.stateDir),
+      writeback,
+    });
+
+    await orchestrator.refreshNow();
+    await orchestrator.refreshNow();
+    await orchestrator.stop();
+
+    expect(harness.runs).toHaveLength(0);
+    const recovered = await lifecycleStore.get(candidate.id);
+    const inspection = await orchestrator.inspectIssueHistory(candidate.id);
+    expect(inspection.record).toMatchObject({
+      phase: "review",
+      lastIssueTriageReportId: null,
+      lastIssueBreakdownPlanSourceIssueTriageReportId: reportId,
+      lastIssueBreakdownPlanSatisfiesCurrentValidation: true,
+    });
+    expect(
+      inspection.record?.history.map((item) => ({
+        transitionKind: item.transitionKind,
+        reason: item.reason,
+      })),
+    ).toContainEqual({
+      transitionKind: "reconcile_issue_breakdown_plan_application",
+      reason: "issue_breakdown_plan_application_reconciliation",
+    });
+    expect({
+      currentState,
+      issueCreateCount: writer.issueCreates.length,
+      lifecycle: recovered,
+      transition: inspection.record?.history.at(-1),
+    }).toMatchObject({
+      currentState: "In Review",
+      issueCreateCount: 1,
+      lifecycle: {
+      phase: "review",
+      reviewRound: 0,
+      blockedReason: null,
+      lastIssueTriageReportId: null,
+      issueBreakdownPlans: [
+        expect.objectContaining({
+          runId: "planner-run-before-restart",
+          sourceIssueTriageReportId: reportId,
+          applicationStatus: "applied",
+        }),
+      ],
+      },
+    });
+  });
+
+  it("reconciles a normal accepted breakdown plan persisted before application", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.issueBreakdown.applyToLinear.autoApply = true;
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.reviewLoop.reviewStates = ["In Review"];
+    let currentState = "In Progress";
+    const candidate = issue({
+      state: currentState,
+      labels: ["planning"],
+      branchName: "symphony/TEST-1",
+    });
+    const currentIssue = (): Issue => ({ ...candidate, state: currentState });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [currentIssue()];
+      },
+      async fetchIssuesByStates(states) {
+        return issuesInStates([currentIssue()], states);
+      },
+      async fetchIssueStatesByIds() {
+        return [currentIssue()];
+      },
+    };
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    await new IssueBreakdownPlanService({
+      config,
+      lifecycleStore,
+    }).submit_issue_breakdown_plan(
+      {
+        runId: "planner-run-before-application",
+        issueId: candidate.id,
+        finalDisposition: "Created the requested implementation child plan.",
+        idempotencyKey: "normal-plan-before-application",
+        summary: "Create one bounded implementation child.",
+        proposedIssues: [
+          {
+            title: "Implement the planned repair",
+            description: agentEligibleIssueContract(),
+            acceptanceCriteria: ["The repair is implemented and tested."],
+            dependencies: [],
+            labels: ["planning"],
+          },
+        ],
+      },
+      {
+        issue: candidate,
+        activeRunId: "planner-run-before-application",
+        role: "planner",
+        phase: "issue_breakdown",
+      },
+    );
+    const logger = new StructuredLogger(() => undefined);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(
+      new FileWritebackOutboxStore(config.workspace.stateDir),
+      writer,
+      logger,
+      config.writeback.maxBackoffMs,
+      lifecycleStore,
+      false,
+      {
+        getConfig: () => config,
+        resolveIssue: async () => ({ status: "ok", issue: currentIssue() }),
+      },
+    );
+    const harness = new FakeHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore: new FileRunTranscriptStore(config.workspace.stateDir),
+      writeback,
+    });
+
+    await orchestrator.refreshNow();
+    await orchestrator.stop();
+
+    expect(harness.runs).toHaveLength(0);
+    expect(currentState).toBe("In Review");
+    expect(writer.issueCreates).toHaveLength(1);
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      phase: "review",
+      planningFailureCount: 0,
+      issueBreakdownPlans: [
+        expect.objectContaining({
+          runId: "planner-run-before-application",
+          sourceIssueTriageReportId: null,
+          applicationStatus: "applied",
+        }),
+      ],
     });
   });
 
@@ -4736,9 +5506,12 @@ describe("Orchestrator", () => {
     ).toHaveLength(0);
   });
 
-  it("blocks reviewer-blocked review issues before dispatching issue triage", async () => {
+  it("keeps reviewer-blocked issues in review while dispatching issue triage", async () => {
     const config = testConfig(root);
     config.issueTriage.enabled = true;
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.issueBreakdown.applyToLinear.autoApply = true;
     config.writeback.enabled = true;
     config.writeback.mode = "live";
     config.reviewLoop.reviewStates = ["In Review"];
@@ -4820,23 +5593,6 @@ describe("Orchestrator", () => {
 
     await orchestrator.refreshNow();
     await waitFor(
-      () => currentState === "Blocked",
-      "review-blocked issue transition",
-    );
-    expect(harness.runs).toHaveLength(0);
-    expect(writer.transitions.map((transition) => transition.toState)).toEqual([
-      "Blocked",
-    ]);
-    expect(writer.comments[0]?.body).toContain(
-      "review blocked: Required validation is unavailable to reviewer command surfaces.",
-    );
-    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
-      phase: "blocked",
-      blockedReason: "review blocked: Required validation is unavailable to reviewer command surfaces.",
-    });
-
-    await orchestrator.refreshNow();
-    await waitFor(
       () => harness.runs.length === 1,
       "review-blocked issue triage dispatch",
     );
@@ -4852,8 +5608,11 @@ describe("Orchestrator", () => {
     expect(harness.runs[0]?.prompt).toContain(
       "review blocked: Required validation is unavailable to reviewer command surfaces.",
     );
+    expect(
+      writer.transitions.some((transition) => transition.toState === "Blocked"),
+    ).toBe(false);
     await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
-      phase: "blocked",
+      phase: "review",
       blockedReason: "review blocked: Required validation is unavailable to reviewer command surfaces.",
       lastIssueTriageReportId: "issue-triage-report:issue-1:triage-run-1",
       issueTriageReports: [
@@ -4870,13 +5629,9 @@ describe("Orchestrator", () => {
       ],
     });
     const writebacks = await outboxStore.list();
-    expect(writebacks).toHaveLength(3);
-    expect(writebacks.filter((item) => item.kind === "comment")).toHaveLength(
-      2,
-    );
-    expect(writebacks.filter((item) => item.kind === "transition")).toHaveLength(
-      1,
-    );
+    expect(writebacks).toHaveLength(2);
+    expect(writebacks.filter((item) => item.kind === "comment")).toHaveLength(1);
+    expect(writebacks.filter((item) => item.kind === "transition")).toHaveLength(1);
     expect(
       writebacks.some(
         (item) =>
@@ -4884,6 +5639,132 @@ describe("Orchestrator", () => {
           item.payload.body.includes("## Symphony Issue Triage"),
       ),
     ).toBe(true);
+  });
+
+  it("waits for the full reviewer disposition comment before dispatching issue triage", async () => {
+    const config = testConfig(root);
+    config.issueTriage.enabled = true;
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.issueBreakdown.applyToLinear.autoApply = true;
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.writeback.maxBackoffMs = 0;
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.blockedStates = ["Blocked"];
+    const candidate = issue({
+      state: "In Review",
+      branchName: "symphony/TEST-1",
+    });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    const commentKey =
+      "comment:issue-1:review-run-1:review-verdict-blocked";
+    const blockedVerdict: IssueReviewVerdictRecord = {
+      ...reviewVerdictRecord(candidate),
+      id: "review-verdict:issue-1:review-verdict-blocked-pending",
+      idempotencyKey: "review-verdict-blocked-pending",
+      verdict: "blocked",
+      finalDisposition:
+        "Review cannot complete until Symphony classifies the unavailable validation surface.",
+      findings: ["Required validation is unavailable to the reviewer."],
+      writebackOperationKeys: [commentKey],
+    };
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "review",
+      blockedReason:
+        "review blocked: Required validation is unavailable to the reviewer.",
+      lastReviewVerdictId: blockedVerdict.id,
+      reviewVerdicts: [blockedVerdict],
+    });
+    const outboxStore = new FileWritebackOutboxStore(
+      config.workspace.stateDir,
+    );
+    await outboxStore.enqueueOnce({
+      idempotencyKey: commentKey,
+      kind: "comment",
+      issueId: candidate.id,
+      runId: blockedVerdict.runId,
+      lifecycleBinding: {
+        kind: "review_verdict",
+        recordId: blockedVerdict.id,
+      },
+      payload: {
+        dedupeKey: "review-run-1:review-verdict-blocked",
+        body: blockedVerdict.finalDisposition!,
+      },
+    });
+    let allowComment = false;
+    const writer: TrackerWriter = {
+      async transitionIssueState() {
+        return { status: "applied" };
+      },
+      async createIssueComment() {
+        if (!allowComment) throw new Error("Linear comment unavailable");
+        return { status: "applied" };
+      },
+    };
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const harness = new IssueTriageAcceptingHarness(
+      lifecycleStore,
+      outboxStore,
+    );
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        outboxStore,
+        writer,
+        logger,
+        config.writeback.maxBackoffMs,
+      ),
+    });
+
+    await orchestrator.refreshNow();
+    expect(harness.runs).toHaveLength(0);
+    await expect(outboxStore.get(commentKey)).resolves.toMatchObject({
+      status: "retrying",
+    });
+
+    allowComment = true;
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1, "visible-verdict triage");
+    await waitFor(
+      () => orchestrator.snapshot().counts.running === 0,
+      "visible-verdict triage completion",
+    );
+    await orchestrator.stop();
+
+    expect(harness.runs[0]?.ctx).toMatchObject({
+      role: "triage",
+      runPhase: "issue_triage",
+    });
+    await expect(outboxStore.get(commentKey)).resolves.toMatchObject({
+      status: "succeeded",
+    });
   });
 
   it("resets stale reviewer-blocked lifecycles in active states before worker dispatch", async () => {
@@ -4995,7 +5876,7 @@ describe("Orchestrator", () => {
     ).toBeLessThan(transitionKinds?.indexOf("dispatch_worker") ?? -1);
   });
 
-  it("keeps blocked issues stopped after triage even when blockers are worker-owned", async () => {
+  it("retriages legacy worker-owned reports without dispatching a worker from Blocked", async () => {
     const config = testConfig(root);
     config.issueTriage.enabled = true;
     config.writeback.enabled = true;
@@ -5107,10 +5988,21 @@ describe("Orchestrator", () => {
 
     expect(state).toBe("Blocked");
     expect(writer.transitions).toEqual([]);
-    expect(harness.runs).toEqual([]);
+    expect(harness.runs).toHaveLength(1);
+    expect(harness.runs[0]?.ctx).toMatchObject({
+      role: "triage",
+      runPhase: "issue_triage",
+    });
+    expect(
+      harness.runs.some(
+        (run) =>
+          run.ctx.role === "worker" &&
+          run.ctx.runPhase === "implementation",
+      ),
+    ).toBe(false);
   });
 
-  it("does not route mixed active triage blockers back to worker dispatch", async () => {
+  it("retriages legacy mixed blockers without routing them to worker dispatch", async () => {
     const config = testConfig(root);
     config.issueTriage.enabled = true;
     config.writeback.enabled = true;
@@ -5231,7 +6123,18 @@ describe("Orchestrator", () => {
 
     expect(state).toBe("Blocked");
     expect(writer.transitions).toEqual([]);
-    expect(harness.runs).toEqual([]);
+    expect(harness.runs).toHaveLength(1);
+    expect(harness.runs[0]?.ctx).toMatchObject({
+      role: "triage",
+      runPhase: "issue_triage",
+    });
+    expect(
+      harness.runs.some(
+        (run) =>
+          run.ctx.role === "worker" &&
+          run.ctx.runPhase === "implementation",
+      ),
+    ).toBe(false);
   });
 
   it("rebounds stale mixed triage dispatches back to blocked before worker dispatch", async () => {
@@ -10175,6 +11078,9 @@ describe("Orchestrator", () => {
   it("flushes issue triage report writebacks when the triage handoff is accepted", async () => {
     const config = testConfig(root);
     config.issueTriage.enabled = true;
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.issueBreakdown.applyToLinear.autoApply = true;
     config.writeback.enabled = true;
     config.reviewLoop.blockedStates = ["Blocked"];
     const candidate = issue({
@@ -10237,6 +11143,7 @@ describe("Orchestrator", () => {
       () => orchestrator.snapshot().counts.running === 0,
       "issue triage completion",
     );
+    await orchestrator.refreshNow();
     await orchestrator.stop();
 
     expect(writer.comments).toHaveLength(1);
@@ -10253,12 +11160,186 @@ describe("Orchestrator", () => {
         idempotencyKey: "comment:issue-1:issue-triage:triage-run-1",
         status: "succeeded",
       }),
+      expect.objectContaining({
+        idempotencyKey:
+          "transition:issue-1:issue-triage:triage-run-1:automated-recovery:In_Progress",
+        status: "succeeded",
+      }),
     ]);
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      issueTriageReports: [
+        expect.objectContaining({
+          recoveryDisposition: expect.objectContaining({
+            mode: "automated",
+            nextActor: "planner",
+            transitionStatus: "applied",
+          }),
+        }),
+      ],
+    });
+  });
+
+  it("waits for the full triage report comment before dispatching an already-targeted worker route", async () => {
+    const config = testConfig(root);
+    config.issueTriage.enabled = true;
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.writeback.maxBackoffMs = 0;
+    config.writeback.dispatchState = "In Progress";
+    const candidate = issue({
+      state: "In Progress",
+      branchName: "symphony/TEST-1",
+    });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    const blocked = await lifecycleStore.ensureIssue(candidate, {
+      phase: "blocked",
+      reviewRound: 3,
+      blockedReason: "max reviewer failures reached (3/3)",
+    });
+    const reportId = "issue-triage-report:issue-1:triage-pending-comment";
+    const commentKey =
+      "comment:issue-1:issue-triage:triage-pending-comment";
+    await lifecycleStore.updateIssue(candidate, {
+      lastIssueTriageReportId: reportId,
+      issueTriageReports: [
+        {
+          id: reportId,
+          idempotencyKey: "triage-pending-comment",
+          requestHash: "triage-pending-comment-hash",
+          runId: "triage-pending-comment-run",
+          issueId: candidate.id,
+          issueIdentifier: candidate.identifier,
+          triggerFingerprint: issueTriageTriggerFingerprint(blocked),
+          finalDisposition:
+            "The current contract has one bounded worker-owned repair.",
+          disposition: "implementation_repair",
+          confidence: "high",
+          summary: "The current blocker is worker-owned.",
+          evidence: ["The current contract bounds the repair."],
+          recommendedAction: "Dispatch one focused worker repair.",
+          blockers: [
+            {
+              kind: "implementation_unsatisfied_requirements",
+              status: "active",
+              nextActor: "worker",
+              confidence: "high",
+              summary: "The current blocker is worker-owned.",
+              evidence: ["The current contract bounds the repair."],
+              recommendedAction: "Dispatch one focused worker repair.",
+            },
+          ],
+          recoveryDisposition: {
+            mode: "automated",
+            nextActor: "worker",
+            targetState: "In Progress",
+            reportWritebackStatus: "pending",
+            transitionOperationKey: null,
+            transitionStatus: "not_required",
+            reason: "machine-owned recovery routed to worker",
+          },
+          submittedAt: "2026-01-01T00:00:01.000Z",
+          writebackOperationKeys: [commentKey],
+        },
+      ],
+    });
+    const outboxStore = new FileWritebackOutboxStore(
+      config.workspace.stateDir,
+    );
+    await outboxStore.enqueueOnce({
+      idempotencyKey: commentKey,
+      kind: "comment",
+      issueId: candidate.id,
+      runId: "triage-pending-comment-run",
+      lifecycleBinding: {
+        kind: "issue_triage_report",
+        recordId: reportId,
+      },
+      payload: {
+        dedupeKey: "issue-triage:triage-pending-comment",
+        body: "Full triage disposition",
+      },
+    });
+    let allowComment = false;
+    const writer: TrackerWriter = {
+      async transitionIssueState() {
+        throw new Error("unexpected triage transition");
+      },
+      async createIssueComment() {
+        if (!allowComment) throw new Error("Linear comment unavailable");
+        return { status: "applied" };
+      },
+    };
+    const harness = new FakeHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore: new FileRunTranscriptStore(config.workspace.stateDir),
+      writeback: new WritebackProcessor(
+        outboxStore,
+        writer,
+        logger,
+        config.writeback.maxBackoffMs,
+      ),
+    });
+
+    await orchestrator.refreshNow();
+    expect(harness.runs).toHaveLength(0);
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      issueTriageReports: [
+        expect.objectContaining({
+          recoveryDisposition: expect.objectContaining({
+            reportWritebackStatus: "pending",
+            transitionStatus: "not_required",
+          }),
+        }),
+      ],
+    });
+
+    allowComment = true;
+    for (let index = 0; index < 4 && harness.runs.length === 0; index += 1) {
+      await orchestrator.refreshNow();
+    }
+    await waitFor(() => harness.runs.length === 1, "worker recovery dispatch");
+    await orchestrator.stop();
+
+    expect(harness.runs[0]?.ctx).toMatchObject({
+      role: "worker",
+      runPhase: "implementation",
+    });
+    await expect(outboxStore.get(commentKey)).resolves.toMatchObject({
+      status: "succeeded",
+    });
   });
 
   it("reconciles missing issue triage report writebacks without redispatching triage", async () => {
     const config = testConfig(root);
     config.issueTriage.enabled = true;
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.issueBreakdown.applyToLinear.autoApply = true;
     config.writeback.enabled = true;
     config.reviewLoop.blockedStates = ["Blocked"];
     const candidate = issue({
@@ -10364,7 +11445,10 @@ describe("Orchestrator", () => {
       lastIssueTriageReportId: "issue-triage-report:issue-1:triage-1",
       issueTriageReports: [
         {
-          writebackOperationKeys: ["comment:issue-1:issue-triage:triage-1"],
+          writebackOperationKeys: [
+            "comment:issue-1:issue-triage:triage-1",
+            "transition:issue-1:issue-triage:triage-1:automated-recovery:In_Progress",
+          ],
         },
       ],
     });
@@ -10609,12 +11693,12 @@ describe("Orchestrator", () => {
 
   it.each([
     {
-      name: "comment fails while Blocked transition succeeds",
+      name: "comment failure holds the Blocked transition",
       writer: (setState: (state: string) => void) =>
         new PublicationApprovalCommentFailingWriter(setState),
-      stateBeforeRecovery: "Blocked",
+      stateBeforeRecovery: "Todo",
       recoveryComments: 1,
-      recoveryTransitions: 0,
+      recoveryTransitions: 1,
     },
     {
       name: "Blocked transition fails after comment succeeds",
@@ -18907,6 +19991,7 @@ function mergePolicyRulesetSnapshot(
     blockedReason: null,
     lastIssueBreakdownPlanId: null,
     lastIssueBreakdownPlanApplicationStatus: null,
+    lastIssueBreakdownPlanSourceIssueTriageReportId: null,
     lastIssueBreakdownPlanIssueContentFingerprint: null,
     lastIssueBreakdownPlanConfigFingerprint: null,
     lastIssueBreakdownPlanSatisfiesCurrentValidation: false,
@@ -18915,6 +20000,7 @@ function mergePolicyRulesetSnapshot(
     lastIssueTriageReportId: null,
     lastIssueTriageReportTriggerFingerprint: null,
     lastIssueTriageReportWritebackOperationKeys: null,
+    lastIssueTriageRecoveryDisposition: null,
     currentIssueTriageTriggerFingerprint: null,
     issueTriageCurrentTriggerReportIds: [],
     latestIssueTriageReportBlockers: [],
@@ -19007,6 +20093,8 @@ function mergePolicyRulesetSnapshot(
     manualStage: null,
     manualForceLabels: false,
     manualIgnoreState: false,
+    lastReviewVerdictDispositionWritebackStatus: "applied",
+    lastCompletionReportDispositionWritebackStatus: "applied",
     ...overrides,
   };
 }
@@ -19248,6 +20336,7 @@ function shutdownTestRunningEntry(activeIssue: Issue, abortController: AbortCont
     issueBreakdownPlanAccepted: false,
     issueTriageReportAccepted: false,
     issuePostMortemReportAccepted: false,
+    automatedTriagePlannerRecoveryReportId: null,
     pullRequestHandoffAccepted: false,
     reviewVerdictAccepted: false,
     reviewEvidence: null,
@@ -19817,6 +20906,120 @@ class ProviderLimitThenCompleteHarness implements AgentHarness {
   }
 }
 
+async function seedAutomatedPlannerTriageReport(
+  lifecycleStore: FileIssueLifecycleStore,
+  candidate: Issue,
+): Promise<string> {
+  const blocked = await lifecycleStore.ensureIssue(candidate, {
+    phase: "blocked",
+    reviewRound: 3,
+    blockedReason: "max reviewer failures reached (3/3)",
+  });
+  const reportId = `issue-triage-report:${candidate.id}:triage-run-1`;
+  await lifecycleStore.updateIssue(candidate, {
+    lastIssueTriageReportId: reportId,
+    issueTriageReports: [
+      {
+        id: reportId,
+        idempotencyKey: "triage-run-1",
+        requestHash: "triage-hash-1",
+        runId: "triage-run-1",
+        issueId: candidate.id,
+        issueIdentifier: candidate.identifier,
+        triggerFingerprint: issueTriageTriggerFingerprint(blocked),
+        disposition: "decompose_issue",
+        confidence: "high",
+        summary: "Automated triage requested a bounded breakdown plan.",
+        evidence: ["blockedReason=max reviewer failures reached (3/3)"],
+        recommendedAction: "Create and apply the required child issue plan.",
+        blockers: [
+          {
+            kind: "under_specified_needs_decomposition",
+            status: "active",
+            nextActor: "planner",
+            confidence: "high",
+            summary: "Automated triage requested a bounded breakdown plan.",
+            evidence: ["blockedReason=max reviewer failures reached (3/3)"],
+            recommendedAction:
+              "Create and apply the required child issue plan.",
+          },
+        ],
+        recoveryDisposition: {
+          mode: "automated",
+          nextActor: "planner",
+          targetState: "In Progress",
+          reportWritebackStatus: "applied",
+          transitionOperationKey: `transition:${candidate.id}:issue-triage:triage-run-1:automated-recovery:In_Progress`,
+          transitionStatus: "applied",
+          reason: "machine-owned recovery routed to planner",
+        },
+        submittedAt: "2026-01-01T00:00:01.000Z",
+        writebackOperationKeys: [
+          `comment:${candidate.id}:issue-triage:triage-run-1`,
+          `transition:${candidate.id}:issue-triage:triage-run-1:automated-recovery:In_Progress`,
+        ],
+      },
+    ],
+  });
+  return reportId;
+}
+
+async function seedAutomatedWorkerTriageReport(
+  lifecycleStore: FileIssueLifecycleStore,
+  candidate: Issue,
+): Promise<string> {
+  const blocked = await lifecycleStore.ensureIssue(candidate, {
+    phase: "blocked",
+    reviewRound: 3,
+    blockedReason: "max reviewer failures reached (3/3)",
+  });
+  const reportId = `issue-triage-report:${candidate.id}:triage-worker-run-1`;
+  await lifecycleStore.updateIssue(candidate, {
+    lastIssueTriageReportId: reportId,
+    issueTriageReports: [
+      {
+        id: reportId,
+        idempotencyKey: "triage-worker-run-1",
+        requestHash: "triage-worker-hash-1",
+        runId: "triage-worker-run-1",
+        issueId: candidate.id,
+        issueIdentifier: candidate.identifier,
+        triggerFingerprint: issueTriageTriggerFingerprint(blocked),
+        disposition: "implementation_repair",
+        confidence: "high",
+        summary: "Automated triage found a bounded worker repair.",
+        evidence: ["The latest review finding is worker-owned."],
+        recommendedAction: "Run a focused implementation repair.",
+        blockers: [
+          {
+            kind: "implementation_unsatisfied_requirements",
+            status: "active",
+            nextActor: "worker",
+            confidence: "high",
+            summary: "The latest review finding is worker-owned.",
+            evidence: ["The repair is bounded by the current contract."],
+            recommendedAction: "Run a focused implementation repair.",
+          },
+        ],
+        recoveryDisposition: {
+          mode: "automated",
+          nextActor: "worker",
+          targetState: "In Progress",
+          reportWritebackStatus: "applied",
+          transitionOperationKey: null,
+          transitionStatus: "not_required",
+          reason: "machine-owned recovery routed to worker",
+        },
+        submittedAt: "2026-01-01T00:00:01.000Z",
+        writebackOperationKeys: [
+          `comment:${candidate.id}:issue-triage:triage-worker-run-1`,
+        ],
+      },
+    ],
+  });
+  return reportId;
+}
+
 class IssueBreakdownAcceptingHarness implements AgentHarness {
   readonly id = "issue-breakdown-accepting";
   readonly runs: Array<{ ctx: AgentRunContext; prompt: string }> = [];
@@ -19851,8 +21054,10 @@ class IssueBreakdownAcceptingHarness implements AgentHarness {
         {
           issue: ctx.issue,
           activeRunId: runId,
-          role: "worker",
+          role: ctx.role === "planner" ? "planner" : "worker",
           phase: "issue_breakdown",
+          sourceIssueTriageReportId:
+            ctx.sourceIssueTriageReportId ?? null,
         },
       );
     }

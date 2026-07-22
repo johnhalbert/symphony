@@ -2,12 +2,14 @@ import { createHash } from "node:crypto";
 import type { ServiceConfig } from "./config/Config.js";
 import { parseIssueContract } from "./IssueContractLint.js";
 import { issueBreakdownPlanFingerprintsMatch, latestFreshIssueBreakdownPlan } from "./IssueBreakdownPlanService.js";
+import { issueTriageTriggerFingerprint } from "./IssueTriageService.js";
 import type {
   IssueBreakdownCreatedIssueRef,
   IssueBreakdownPlanRecord,
   IssueLifecycleRecord,
   IssueLifecycleStore,
 } from "./persistence/IssueLifecycleStore.js";
+import { isSupersededLifecycleRecord } from "./persistence/IssueLifecycleStore.js";
 import type { Issue } from "./types.js";
 import type {
   EnqueueWritebackOptions,
@@ -28,8 +30,21 @@ export type IssueBreakdownPlanApplyResult =
 export interface IssueBreakdownPlanApplyServiceOptions {
   config: ServiceConfig;
   lifecycleStore: IssueLifecycleStore;
-  writeback?: Pick<WritebackProcessor, "enqueueAndProcess"> | undefined;
+  writeback?:
+    | (Pick<WritebackProcessor, "enqueueAndProcess"> &
+        Partial<Pick<WritebackProcessor, "getOperation" | "retryRegistered">>)
+    | undefined;
 }
+
+export interface IssueBreakdownPlanApplyOptions {
+  dryRun?: boolean;
+  retrySkippedAfterOperatorResume?: boolean;
+}
+
+export const ISSUE_BREAKDOWN_TRIAGE_PROVENANCE_INVALID_REASON =
+  "issue breakdown plan application cannot verify its automated triage planner recovery provenance";
+export const ISSUE_BREAKDOWN_OPERATOR_RESUME_RETRY_UNAVAILABLE_REASON =
+  "issue breakdown operator resume cannot retry registered skipped writebacks";
 
 export class IssueBreakdownPlanApplyService {
   constructor(private readonly options: IssueBreakdownPlanApplyServiceOptions) {}
@@ -40,16 +55,60 @@ export class IssueBreakdownPlanApplyService {
 
   async applyLatestFreshPlan(
     issue: Issue,
-    options: { dryRun?: boolean } = {},
+    options: IssueBreakdownPlanApplyOptions = {},
   ): Promise<IssueBreakdownPlanApplyResult> {
     if (!this.options.config.issueBreakdown.applyToLinear.enabled) {
       return { status: "not_required", reason: "apply_to_linear_disabled" };
     }
     const contract = parseIssueContract(issue.description);
-    const lifecycle = await this.options.lifecycleStore.get(issue.id);
-    const latestPlan = lifecycle?.lastIssueBreakdownPlanId
-      ? lifecycle.issueBreakdownPlans.find((candidate) => candidate.id === lifecycle.lastIssueBreakdownPlanId) ?? null
+    let lifecycle = await this.options.lifecycleStore.get(issue.id);
+    const initialLatestPlanId = lifecycle?.lastIssueBreakdownPlanId ?? null;
+    let latestPlan = initialLatestPlanId
+      ? lifecycle?.issueBreakdownPlans.find(
+          (candidate) => candidate.id === initialLatestPlanId,
+        ) ?? null
       : null;
+    if (options.dryRun !== true && lifecycle && latestPlan) {
+      const hydratedPlan = await this.hydrateCreatedIssueRefs(
+        issue,
+        latestPlan,
+      );
+      if (hydratedPlan !== latestPlan) {
+        lifecycle = await this.options.lifecycleStore.get(issue.id);
+        const latestPlanId = lifecycle?.lastIssueBreakdownPlanId ?? null;
+        latestPlan = latestPlanId
+          ? lifecycle?.issueBreakdownPlans.find(
+              (candidate) => candidate.id === latestPlanId,
+            ) ?? null
+          : null;
+      }
+    }
+    if (
+      lifecycle &&
+      latestPlan &&
+      !hasValidAutomatedTriagePlannerProvenance(
+        issue,
+        lifecycle,
+        latestPlan,
+        this.options.config,
+        { allowAppliedPlanTargetDrift: latestPlan.applicationStatus === "applied" },
+      )
+    ) {
+      const blockedPlan =
+        options.dryRun === true
+          ? latestPlan
+          : await this.updatePlan(issue, latestPlan, {
+              applicationStatus: "blocked",
+              applicationBlockedReason:
+                ISSUE_BREAKDOWN_TRIAGE_PROVENANCE_INVALID_REASON,
+            });
+      return {
+        status: "blocked",
+        plan: blockedPlan,
+        operations: [],
+        reason: ISSUE_BREAKDOWN_TRIAGE_PROVENANCE_INVALID_REASON,
+      };
+    }
     if (
       contract.valid &&
       contract.contract.delivery.mode === "accepted_artifact"
@@ -87,6 +146,26 @@ export class IssueBreakdownPlanApplyService {
         applicationBlockedReason: "issue breakdown apply requires writeback to be enabled",
       });
       return { status: "blocked", plan: updated, operations: [], reason: updated.applicationBlockedReason ?? "writeback unavailable" };
+    }
+
+    if (
+      options.retrySkippedAfterOperatorResume === true &&
+      plan.applicationStatus === "blocked"
+    ) {
+      const retryUnavailableReason =
+        await this.retryRegisteredSkippedPlanOperations(plan);
+      if (retryUnavailableReason !== null) {
+        const updated = await this.updatePlan(issue, plan, {
+          applicationStatus: "blocked",
+          applicationBlockedReason: retryUnavailableReason,
+        });
+        return {
+          status: "blocked",
+          plan: updated,
+          operations: [],
+          reason: retryUnavailableReason,
+        };
+      }
     }
 
     const replayPlan = plan;
@@ -178,7 +257,39 @@ export class IssueBreakdownPlanApplyService {
       applicationOperationKeys: mergeOperationKeys(workingPlan.applicationOperationKeys, finalOperations),
     });
     for (const operation of finalOperations) {
-      processed.push(await this.options.writeback.enqueueAndProcess(operation, issueBreakdownRetryOptions(operation, replayPlan)));
+      const result = await this.options.writeback.enqueueAndProcess(
+        operation,
+        issueBreakdownRetryOptions(operation, replayPlan),
+      );
+      processed.push(result);
+      if (result.status === "skipped" || result.status === "dead_letter") {
+        const updated = await this.updatePlan(issue, workingPlan, {
+          applicationStatus: "blocked",
+          applicationBlockedReason:
+            result.resultMessage ??
+            result.lastError ??
+            "issue breakdown finalization writeback did not succeed",
+        });
+        return {
+          status: "blocked",
+          plan: updated,
+          operations: processed,
+          reason:
+            updated.applicationBlockedReason ??
+            "issue breakdown apply blocked",
+        };
+      }
+      if (result.status !== "succeeded") {
+        const pending = await this.updatePlan(issue, workingPlan, {
+          applicationStatus: "pending",
+          applicationBlockedReason: null,
+        });
+        return {
+          status: "pending",
+          plan: pending,
+          operations: processed,
+        };
+      }
     }
 
     const blocked = processed.find((operation) => operation.status === "skipped" || operation.status === "dead_letter");
@@ -209,6 +320,73 @@ export class IssueBreakdownPlanApplyService {
       applicationBlockedReason: null,
     });
     return { status: "pending", plan: pending, operations: processed };
+  }
+
+  private async hydrateCreatedIssueRefs(
+    issue: Issue,
+    plan: IssueBreakdownPlanRecord,
+  ): Promise<IssueBreakdownPlanRecord> {
+    const getOperation = this.options.writeback?.getOperation;
+    if (!getOperation) return plan;
+
+    const existingIndexes = new Set(
+      plan.createdIssueRefs.map((ref) => ref.proposedIssueIndex),
+    );
+    const registeredKeys = new Set(plan.applicationOperationKeys);
+    const hydratedRefs: IssueBreakdownCreatedIssueRef[] = [];
+    for (const operation of planIssueBreakdownApplicationWritebacks(
+      issue,
+      plan,
+    )) {
+      if (operation.kind !== "issue_create") continue;
+      if (
+        existingIndexes.has(operation.payload.proposedIssueIndex) ||
+        !registeredKeys.has(operation.idempotencyKey)
+      ) {
+        continue;
+      }
+      const record = await getOperation.call(
+        this.options.writeback,
+        operation.idempotencyKey,
+      );
+      if (!isMatchingSucceededIssueCreate(record, operation, plan)) continue;
+      const ref = createdIssueRefFromOperation(record);
+      if (ref) hydratedRefs.push(ref);
+    }
+    if (hydratedRefs.length === 0) return plan;
+    return this.updatePlan(issue, plan, {
+      createdIssueRefs: mergeCreatedIssueRefs(
+        plan.createdIssueRefs,
+        hydratedRefs,
+      ),
+    });
+  }
+
+  private async retryRegisteredSkippedPlanOperations(
+    plan: IssueBreakdownPlanRecord,
+  ): Promise<string | null> {
+    const getOperation = this.options.writeback?.getOperation;
+    const retryRegistered = this.options.writeback?.retryRegistered;
+    if (!getOperation || !retryRegistered) {
+      return ISSUE_BREAKDOWN_OPERATOR_RESUME_RETRY_UNAVAILABLE_REASON;
+    }
+
+    for (const operationKey of plan.applicationOperationKeys) {
+      const record = await getOperation.call(
+        this.options.writeback,
+        operationKey,
+      );
+      if (record?.status !== "skipped") continue;
+      if (!writebackOperationBelongsToPlan(record, plan)) {
+        return `${ISSUE_BREAKDOWN_OPERATOR_RESUME_RETRY_UNAVAILABLE_REASON}: ${operationKey} is not bound to plan ${plan.id}`;
+      }
+      await retryRegistered.call(
+        this.options.writeback,
+        [operationKey],
+        { retrySkipped: true },
+      );
+    }
+    return null;
   }
 
   private async updatePlan(
@@ -265,6 +443,100 @@ export class IssueBreakdownPlanApplyService {
     }
     return markedStale;
   }
+}
+
+function hasValidAutomatedTriagePlannerProvenance(
+  issue: Issue,
+  lifecycle: IssueLifecycleRecord,
+  plan: IssueBreakdownPlanRecord,
+  config: ServiceConfig,
+  options: { allowAppliedPlanTargetDrift: boolean },
+): boolean {
+  const sourceReportId = plan.sourceIssueTriageReportId ?? null;
+  if (sourceReportId === null) return true;
+  const sourceIsCurrent = lifecycle.lastIssueTriageReportId === sourceReportId;
+  const sourceWasConsumed =
+    options.allowAppliedPlanTargetDrift &&
+    lifecycle.lastIssueTriageReportId === null;
+  if (!sourceIsCurrent && !sourceWasConsumed) return false;
+  const report = lifecycle.issueTriageReports.find(
+    (candidate) => candidate.id === sourceReportId,
+  );
+  if (
+    !report ||
+    isSupersededLifecycleRecord(report) ||
+    report.issueId !== issue.id ||
+    (sourceIsCurrent &&
+      report.triggerFingerprint !== issueTriageTriggerFingerprint(lifecycle))
+  ) {
+    return false;
+  }
+
+  const recovery = report.recoveryDisposition;
+  if (
+    !recovery ||
+    recovery.mode !== "automated" ||
+    recovery.nextActor !== "planner" ||
+    recovery.targetState === null ||
+    !statesEqual(recovery.targetState, config.writeback.dispatchState) ||
+    (!options.allowAppliedPlanTargetDrift &&
+      !statesEqual(issue.state, recovery.targetState))
+  ) {
+    return false;
+  }
+  if (recovery.transitionStatus === "not_required") {
+    return recovery.transitionOperationKey === null;
+  }
+  return (
+    recovery.transitionStatus === "applied" &&
+    recovery.transitionOperationKey !== null &&
+    report.writebackOperationKeys.includes(recovery.transitionOperationKey)
+  );
+}
+
+function isMatchingSucceededIssueCreate(
+  record: WritebackOperation | null,
+  expected: Extract<NewWritebackOperation, { kind: "issue_create" }>,
+  plan: IssueBreakdownPlanRecord,
+): record is Extract<WritebackOperation, { kind: "issue_create" }> {
+  return Boolean(
+    record &&
+      record.status === "succeeded" &&
+      record.kind === "issue_create" &&
+      record.idempotencyKey === expected.idempotencyKey &&
+      record.issueId === expected.issueId &&
+      record.runId === expected.runId &&
+      record.payload.planId === plan.id &&
+      record.payload.proposedIssueIndex ===
+        expected.payload.proposedIssueIndex &&
+      record.payload.payloadHash === expected.payload.payloadHash,
+  );
+}
+
+function writebackOperationBelongsToPlan(
+  operation: WritebackOperation,
+  plan: IssueBreakdownPlanRecord,
+): boolean {
+  if (operation.issueId !== plan.issueId || operation.runId !== plan.runId)
+    return false;
+  if (operation.kind === "issue_create")
+    return operation.payload.planId === plan.id;
+  if (operation.kind === "issue_relation")
+    return operation.payload.planId === plan.id;
+  if (operation.kind === "transition")
+    return operation.payload.issueBreakdownPlanId === plan.id;
+  if (operation.kind !== "comment") return false;
+  return (
+    operation.payload.issueBreakdownPlanId === plan.id ||
+    operation.idempotencyKey ===
+      `comment:${plan.issueId}:issue-breakdown:${plan.id}:disposition` ||
+    operation.idempotencyKey ===
+      `comment:${plan.issueId}:issue-breakdown:${plan.id}:children`
+  );
+}
+
+function statesEqual(left: string, right: string): boolean {
+  return left.trim().toLowerCase() === right.trim().toLowerCase();
 }
 
 export function planIssueBreakdownApplicationWritebacks(

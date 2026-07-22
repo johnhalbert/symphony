@@ -351,6 +351,53 @@ describe("ReviewVerdictService", () => {
     });
   });
 
+  it("turns the reviewer failure ceiling into an internal triage checkpoint", async () => {
+    const { service, lifecycleStore, config } = fixture((candidateConfig) => {
+      candidateConfig.issueTriage.enabled = true;
+      candidateConfig.reviewLoop.failureLimits.reviewerFailures = 1;
+    });
+    const candidate = issue({ state: "In Review" });
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "review",
+      reviewRound: 0,
+      reviewFeedback: [requestChangesFeedback()],
+    });
+
+    const submitted = await service.submitReviewVerdict(
+      failVerdict(),
+      context({ issue: candidate }),
+    );
+    const lifecycle = await lifecycleStore.get(candidate.id);
+    if (lifecycle === null) throw new Error("expected lifecycle");
+    const plan = planReviewVerdictSubmissionApplication({
+      config,
+      issue: candidate,
+      lifecycle,
+      submission: submitted.verdict,
+    });
+
+    expect(plan.patch).toMatchObject({
+      phase: "blocked",
+      reviewRound: 1,
+      blockedReason: "max reviewer failures reached (1/1)",
+    });
+    expect(plan.operations).toHaveLength(1);
+    expect(plan.operations[0]).toMatchObject({
+      kind: "comment",
+      lifecycleBinding: {
+        kind: "review_verdict",
+        recordId: submitted.verdict.id,
+      },
+    });
+    expect(
+      plan.operations[0]?.kind === "comment"
+        ? plan.operations[0].payload.body
+        : "",
+    ).toContain("Status: paused in review, automated triage pending");
+    expect(plan.operations.some((operation) => operation.kind === "transition"))
+      .toBe(false);
+  });
+
   it("accepts a manual fail verdict with the issue state gate explicitly ignored", async () => {
     const { service, lifecycleStore, outbox, config } = fixture();
     const candidate = issue({ state: "Todo", branchName: "symphony/TEST-1" });

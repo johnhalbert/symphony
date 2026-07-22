@@ -82,6 +82,7 @@ export interface IssueBreakdownPlanRecord {
   runId: string;
   issueId: string;
   issueIdentifier: string;
+  sourceIssueTriageReportId?: string | null;
   finalDisposition?: string;
   summary: string;
   proposedIssues: ProposedIssueRecord[];
@@ -441,6 +442,28 @@ export type IssueTriageBlockerNextActor =
   | "orchestrator"
   | "infra";
 
+export type IssueTriageRecoveryMode = "automated" | "external";
+export type IssueTriageRecoveryActor = "planner" | "worker";
+export type IssueTriageRecoveryTransitionStatus =
+  | "not_required"
+  | "pending"
+  | "applied"
+  | "failed";
+export type IssueTriageReportWritebackStatus =
+  | "pending"
+  | "applied"
+  | "failed";
+
+export interface IssueTriageRecoveryDispositionRecord {
+  mode: IssueTriageRecoveryMode;
+  nextActor: IssueTriageRecoveryActor | null;
+  targetState: string | null;
+  reportWritebackStatus: IssueTriageReportWritebackStatus;
+  transitionOperationKey: string | null;
+  transitionStatus: IssueTriageRecoveryTransitionStatus;
+  reason: string;
+}
+
 export interface IssueTriageBlockerRecord {
   kind: IssueTriageBlockerKind;
   status: IssueTriageBlockerStatus;
@@ -466,6 +489,7 @@ export interface IssueTriageReportRecord extends LifecycleSupersessionFields {
   evidence: string[];
   recommendedAction: string;
   blockers: IssueTriageBlockerRecord[];
+  recoveryDisposition?: IssueTriageRecoveryDispositionRecord | null;
   submittedAt: string;
   writebackOperationKeys: string[];
 }
@@ -1752,6 +1776,14 @@ function normalizeIssueBreakdownPlan(value: unknown, filePath: string, index: nu
     runId: requiredString(value.runId, filePath, `issueBreakdownPlans[${index}].runId`),
     issueId: requiredString(value.issueId, filePath, `issueBreakdownPlans[${index}].issueId`),
     issueIdentifier: requiredString(value.issueIdentifier, filePath, `issueBreakdownPlans[${index}].issueIdentifier`),
+    sourceIssueTriageReportId:
+      value.sourceIssueTriageReportId === undefined
+        ? null
+        : nullableString(
+            value.sourceIssueTriageReportId,
+            filePath,
+            `issueBreakdownPlans[${index}].sourceIssueTriageReportId`,
+          ),
     ...optionalFinalDispositionPatch(
       value.finalDisposition,
       filePath,
@@ -2624,12 +2656,134 @@ function normalizeIssueTriageReport(value: unknown, filePath: string, index: num
             },
           ]
         : normalizedBlockers,
+    recoveryDisposition: normalizeIssueTriageRecoveryDisposition(
+      value.recoveryDisposition,
+      filePath,
+      `issueTriageReports[${index}].recoveryDisposition`,
+    ),
     submittedAt: requiredString(value.submittedAt, filePath, `issueTriageReports[${index}].submittedAt`),
     writebackOperationKeys:
       value.writebackOperationKeys === undefined
         ? []
         : requiredStringArray(value.writebackOperationKeys, filePath, `issueTriageReports[${index}].writebackOperationKeys`),
     ...normalizeSupersessionFields(value, filePath, `issueTriageReports[${index}]`),
+  };
+}
+
+function normalizeIssueTriageRecoveryDisposition(
+  value: unknown,
+  filePath: string,
+  field: string,
+): IssueTriageRecoveryDispositionRecord | null {
+  if (value === undefined || value === null) return null;
+  if (!isRecord(value)) throw corruptLifecycle(filePath, `${field} is invalid`);
+  const mode = requiredString(value.mode, filePath, `${field}.mode`);
+  if (mode !== "automated" && mode !== "external") {
+    throw corruptLifecycle(filePath, `${field}.mode is invalid`);
+  }
+  const nextActor = optionalNullableString(
+    value.nextActor,
+    filePath,
+    `${field}.nextActor`,
+  );
+  if (
+    nextActor !== null &&
+    nextActor !== "planner" &&
+    nextActor !== "worker"
+  ) {
+    throw corruptLifecycle(filePath, `${field}.nextActor is invalid`);
+  }
+  const transitionStatus = requiredString(
+    value.transitionStatus,
+    filePath,
+    `${field}.transitionStatus`,
+  );
+  if (
+    transitionStatus !== "not_required" &&
+    transitionStatus !== "pending" &&
+    transitionStatus !== "applied" &&
+    transitionStatus !== "failed"
+  ) {
+    throw corruptLifecycle(filePath, `${field}.transitionStatus is invalid`);
+  }
+  const reportWritebackStatus =
+    value.reportWritebackStatus === undefined
+      ? "pending"
+      : requiredString(
+          value.reportWritebackStatus,
+          filePath,
+          `${field}.reportWritebackStatus`,
+        );
+  if (
+    reportWritebackStatus !== "pending" &&
+    reportWritebackStatus !== "applied" &&
+    reportWritebackStatus !== "failed"
+  ) {
+    throw corruptLifecycle(
+      filePath,
+      `${field}.reportWritebackStatus is invalid`,
+    );
+  }
+  const targetState = optionalNullableString(
+    value.targetState,
+    filePath,
+    `${field}.targetState`,
+  );
+  const transitionOperationKey = optionalNullableString(
+    value.transitionOperationKey,
+    filePath,
+    `${field}.transitionOperationKey`,
+  );
+  if (mode === "automated" && nextActor === null) {
+    throw corruptLifecycle(
+      filePath,
+      `${field}.nextActor is required for automated recovery`,
+    );
+  }
+  if (mode === "external" && nextActor !== null) {
+    throw corruptLifecycle(
+      filePath,
+      `${field}.nextActor must be null for external recovery`,
+    );
+  }
+  if (mode === "automated" && targetState === null) {
+    throw corruptLifecycle(
+      filePath,
+      `${field}.targetState is required for automated recovery`,
+    );
+  }
+  if (transitionOperationKey !== null && targetState === null) {
+    throw corruptLifecycle(
+      filePath,
+      `${field}.targetState is required when a transition operation is recorded`,
+    );
+  }
+  if (
+    (transitionStatus === "pending" || transitionStatus === "applied") &&
+    transitionOperationKey === null
+  ) {
+    throw corruptLifecycle(
+      filePath,
+      `${field}.transitionOperationKey is required when transitionStatus is ${transitionStatus}`,
+    );
+  }
+  if (
+    transitionStatus === "not_required" &&
+    transitionOperationKey !== null
+  ) {
+    throw corruptLifecycle(
+      filePath,
+      `${field}.transitionOperationKey must be null when transitionStatus is not_required`,
+    );
+  }
+  return {
+    mode,
+    nextActor,
+    targetState,
+    reportWritebackStatus,
+    transitionOperationKey,
+    transitionStatus,
+    reason: requiredString(value.reason, filePath, `${field}.reason`),
   };
 }
 

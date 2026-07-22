@@ -674,6 +674,101 @@ describe("FileIssueLifecycleStore", () => {
     });
   });
 
+  it.each([
+    {
+      name: "automated recovery without an actor",
+      recoveryDisposition: {
+        mode: "automated",
+        nextActor: null,
+        targetState: "In Progress",
+        transitionOperationKey: null,
+        transitionStatus: "not_required",
+        reason: "invalid automated route",
+      },
+      message: "nextActor is required for automated recovery",
+    },
+    {
+      name: "external recovery with an actor",
+      recoveryDisposition: {
+        mode: "external",
+        nextActor: "worker",
+        targetState: "Blocked",
+        transitionOperationKey: null,
+        transitionStatus: "not_required",
+        reason: "invalid external route",
+      },
+      message: "nextActor must be null for external recovery",
+    },
+    {
+      name: "pending recovery without an operation key",
+      recoveryDisposition: {
+        mode: "automated",
+        nextActor: "worker",
+        targetState: "In Progress",
+        transitionOperationKey: null,
+        transitionStatus: "pending",
+        reason: "invalid pending route",
+      },
+      message: "transitionOperationKey is required when transitionStatus is pending",
+    },
+    {
+      name: "not-required recovery with an operation key",
+      recoveryDisposition: {
+        mode: "external",
+        nextActor: null,
+        targetState: "Blocked",
+        transitionOperationKey: "transition:issue-1:blocked",
+        transitionStatus: "not_required",
+        reason: "invalid no-op route",
+      },
+      message: "transitionOperationKey must be null when transitionStatus is not_required",
+    },
+  ])("rejects $name", async ({ recoveryDisposition, message }) => {
+    const store = new FileIssueLifecycleStore(root);
+    await store.ensureIssue(issue());
+    const recordPath = path.join(root, "issue-lifecycle", "issue-1.json");
+    const raw = JSON.parse(
+      await nodeFs.readFile(recordPath, "utf8"),
+    ) as Record<string, unknown>;
+    raw.lastIssueTriageReportId = "issue-triage-report:issue-1:triage-1";
+    raw.issueTriageReports = [
+      {
+        id: "issue-triage-report:issue-1:triage-1",
+        idempotencyKey: "triage-1",
+        requestHash: "request-hash-1",
+        runId: "triage-run-1",
+        issueId: "issue-1",
+        issueIdentifier: "TEST-1",
+        triggerFingerprint: "trigger-1",
+        disposition: "implementation_repair",
+        confidence: "high",
+        summary: "A bounded repair remains.",
+        evidence: ["review finding"],
+        recommendedAction: "Apply the repair.",
+        blockers: [
+          {
+            kind: "implementation_unsatisfied_requirements",
+            status: "active",
+            nextActor: "worker",
+            confidence: "high",
+            summary: "A bounded repair remains.",
+            evidence: ["review finding"],
+            recommendedAction: "Apply the repair.",
+          },
+        ],
+        recoveryDisposition,
+        submittedAt: "2026-01-01T00:00:00.000Z",
+        writebackOperationKeys: [],
+      },
+    ];
+    await writeFile(recordPath, `${JSON.stringify(raw, null, 2)}\n`, "utf8");
+
+    await expect(store.get("issue-1")).rejects.toMatchObject({
+      code: "lifecycle_store_corrupt",
+      message: expect.stringContaining(message),
+    });
+  });
+
   it("rejects unknown blocker provenance schema versions", async () => {
     const store = new FileIssueLifecycleStore(root);
     await store.ensureIssue(issue());

@@ -11,6 +11,7 @@ import { mapWithFileReadConcurrency } from "../persistence/FileReadConcurrency.j
 import {
   isSupersededLifecycleRecord,
   latestCurrentCompletionReport,
+  type IssueBreakdownPlanRecord,
   type IssueLifecycleStore,
 } from "../persistence/IssueLifecycleStore.js";
 import { ProjectionRevisionNotifier, type ProjectionChangeListener, type ProjectionChangeUnsubscribe } from "../persistence/ProjectionRevision.js";
@@ -182,8 +183,14 @@ export function bindWritebackOperationToLifecycle<
 
 export const ISSUE_BREAKDOWN_PLAN_STALE_REASON = "issue breakdown plan is no longer fresh";
 export const ISSUE_BREAKDOWN_WRITEBACK_NOT_CURRENT_REASON = "issue breakdown writeback is not bound to the current plan";
+export const ISSUE_BREAKDOWN_FINALIZATION_PENDING_REASON =
+  "issue breakdown parent transition is waiting for preceding finalization writebacks";
 export const ACCEPTED_ARTIFACT_WRITEBACK_NOT_CURRENT_REASON =
   "accepted-artifact writeback is not bound to the current completed artifact";
+// Tracker writes are idempotently verified, but the lease avoids replaying a request that is merely slow.
+export const WRITEBACK_IN_FLIGHT_LEASE_MS = 5 * 60_000;
+export const WRITEBACK_IN_FLIGHT_RECOVERY_REASON =
+  "recovered expired in-flight writeback claim after processor interruption";
 
 export type IssueBreakdownIssueLookupResult =
   | { status: "ok"; issue: Issue }
@@ -208,6 +215,7 @@ export interface WritebackOutboxStore {
   close?(): Promise<void>;
   enqueueOnce(operation: NewWritebackOperation): Promise<WritebackOperation>;
   claimDue(now?: Date, options?: { idempotencyKeys?: readonly string[] }): Promise<WritebackOperation[]>;
+  requeueExpiredInFlight(staleBefore: Date, retryAt?: Date): Promise<number>;
   markSucceeded(record: WritebackOperation, result?: TrackerWriteResult): Promise<WritebackOperation>;
   markSkipped(record: WritebackOperation, message: string, result?: TrackerWriteResult): Promise<WritebackOperation>;
   requeueSkipped(record: WritebackOperation): Promise<WritebackOperation>;
@@ -292,6 +300,39 @@ export class FileWritebackOutboxStore implements WritebackOutboxStore {
       }
     }
     return claimed;
+  }
+
+  async requeueExpiredInFlight(
+    staleBefore: Date,
+    retryAt = new Date(),
+  ): Promise<number> {
+    const staleBeforeMs = staleBefore.getTime();
+    let recovered = 0;
+    for (const record of await this.list()) {
+      if (
+        record.status !== "in_flight" ||
+        (Number.isFinite(Date.parse(record.updatedAt)) &&
+          Date.parse(record.updatedAt) > staleBeforeMs)
+      ) {
+        continue;
+      }
+      const current = await this.get(record.idempotencyKey);
+      if (
+        current?.status !== "in_flight" ||
+        (Number.isFinite(Date.parse(current.updatedAt)) &&
+          Date.parse(current.updatedAt) > staleBeforeMs)
+      ) {
+        continue;
+      }
+      await this.update(current, {
+        status: "retrying",
+        attempt: current.attempt + 1,
+        nextAttemptAt: retryAt.toISOString(),
+        lastError: WRITEBACK_IN_FLIGHT_RECOVERY_REASON,
+      });
+      recovered += 1;
+    }
+    return recovered;
   }
 
   async markSucceeded(record: WritebackOperation, result?: TrackerWriteResult): Promise<WritebackOperation> {
@@ -537,6 +578,38 @@ export class SqliteWritebackOutboxStore implements WritebackOutboxStore {
     });
     if (changed) this.notifyProjectionChanged();
     return claimed;
+  }
+
+  async requeueExpiredInFlight(
+    staleBefore: Date,
+    retryAt = new Date(),
+  ): Promise<number> {
+    let changed = false;
+    const recovered = await this.withWrite(async (database) => {
+      const result = await this.run(
+        database,
+        `
+          UPDATE writeback_operations
+          SET status = 'retrying',
+              attempt = attempt + 1,
+              updated_at = ?,
+              next_attempt_at = ?,
+              last_error = ?
+          WHERE status = 'in_flight'
+            AND updated_at <= ?
+        `,
+        [
+          retryAt.toISOString(),
+          retryAt.toISOString(),
+          WRITEBACK_IN_FLIGHT_RECOVERY_REASON,
+          staleBefore.toISOString(),
+        ],
+      );
+      changed = result.changes > 0;
+      return result.changes;
+    });
+    if (changed) this.notifyProjectionChanged();
+    return recovered;
   }
 
   async markSucceeded(record: WritebackOperation, result?: TrackerWriteResult): Promise<WritebackOperation> {
@@ -908,6 +981,12 @@ export class WritebackProcessor {
     return this.store.enqueueOnce(operation);
   }
 
+  async getOperation(
+    idempotencyKey: string,
+  ): Promise<WritebackOperation | null> {
+    return this.store.get(idempotencyKey);
+  }
+
   async enqueueAndProcess(operation: NewWritebackOperation, options: EnqueueWritebackOptions = {}): Promise<WritebackOperation> {
     let record = await this.store.enqueueOnce(operation);
     if (record.status === "succeeded") return record;
@@ -954,8 +1033,19 @@ export class WritebackProcessor {
   }
 
   async processDue(options: ProcessDueOptions = {}): Promise<void> {
+    const now = new Date();
+    const recoveredInFlight = await this.store.requeueExpiredInFlight(
+      new Date(now.getTime() - WRITEBACK_IN_FLIGHT_LEASE_MS),
+      now,
+    );
+    if (recoveredInFlight > 0) {
+      this.logger.warn("expired in-flight writebacks recovered", {
+        count: recoveredInFlight,
+        lease_ms: WRITEBACK_IN_FLIGHT_LEASE_MS,
+      });
+    }
     const claimOptions = options.idempotencyKeys === undefined ? {} : { idempotencyKeys: options.idempotencyKeys };
-    for (const record of await this.store.claimDue(new Date(), claimOptions)) {
+    for (const record of await this.store.claimDue(now, claimOptions)) {
       try {
         const guard = await this.verifyLifecycleBoundOperation(record);
         if (guard.status === "blocked") {
@@ -1071,6 +1161,8 @@ export class WritebackProcessor {
       if (freshPlan?.id !== issueBreakdownPlanId) {
         return { status: "blocked", message: ISSUE_BREAKDOWN_PLAN_STALE_REASON };
       }
+      const finalizationGuard = await this.verifyIssueBreakdownTransitionFinalization(record, plan);
+      if (finalizationGuard.status !== "ready") return finalizationGuard;
       return { status: "ready" };
     }
     if (!isPullRequestHandoffOperation(record) || !this.lifecycleStore) return { status: "ready" };
@@ -1084,6 +1176,37 @@ export class WritebackProcessor {
         message: "pull request handoff requires a durable accepted completion report with matching PR evidence",
       };
     }
+    return { status: "ready" };
+  }
+
+  private async verifyIssueBreakdownTransitionFinalization(
+    record: WritebackOperation,
+    plan: IssueBreakdownPlanRecord,
+  ): Promise<LifecycleGuardResult> {
+    if (record.kind !== "transition") return { status: "ready" };
+
+    for (const operationKey of issueBreakdownFinalizationPredecessorKeys(record.issueId, plan)) {
+      if (!plan.applicationOperationKeys.includes(operationKey)) {
+        return {
+          status: "retry",
+          message: `${ISSUE_BREAKDOWN_FINALIZATION_PENDING_REASON}: ${operationKey} is not registered`,
+        };
+      }
+      const predecessor = await this.store.get(operationKey);
+      if (!isIssueBreakdownFinalizationPredecessor(predecessor, plan.id, operationKey)) {
+        return {
+          status: "retry",
+          message: `${ISSUE_BREAKDOWN_FINALIZATION_PENDING_REASON}: ${operationKey} is missing or has incompatible intent`,
+        };
+      }
+      if (predecessor.status !== "succeeded") {
+        return {
+          status: "retry",
+          message: `${ISSUE_BREAKDOWN_FINALIZATION_PENDING_REASON}: ${operationKey} is ${predecessor.status}`,
+        };
+      }
+    }
+
     return { status: "ready" };
   }
 
@@ -1231,6 +1354,7 @@ export class WritebackProcessor {
     }
     if (
       binding.kind === "review_verdict" &&
+      record.kind === "transition" &&
       lifecycle.lastReviewVerdictId !== owner.id
     ) {
       return {
@@ -1238,12 +1362,52 @@ export class WritebackProcessor {
         message: "review-verdict writeback is no longer bound to the current verdict",
       };
     }
-    return owner.writebackOperationKeys.includes(record.idempotencyKey)
-      ? { status: "ready" }
-      : {
+    if (!owner.writebackOperationKeys.includes(record.idempotencyKey)) {
+      return {
+        status: "retry",
+        message: `${binding.kind.replaceAll("_", "-")} writeback is waiting for operation registration`,
+      };
+    }
+    if (
+      record.kind === "transition" &&
+      (binding.kind === "issue_triage_report" ||
+        binding.kind === "review_verdict" ||
+        binding.kind === "completion_report")
+    ) {
+      const ownerLabel = binding.kind.replaceAll("_", "-");
+      let registeredReportComment = false;
+      for (const operationKey of owner.writebackOperationKeys) {
+        if (operationKey === record.idempotencyKey) continue;
+        const predecessor = await this.store.get(operationKey);
+        if (predecessor === null) {
+          return {
+            status: "retry",
+            message: `${ownerLabel} transition is waiting for the full report writeback`,
+          };
+        }
+        if (predecessor.kind !== "comment") continue;
+        registeredReportComment = true;
+        if (predecessor.status === "skipped" || predecessor.status === "dead_letter") {
+          return {
+            status: "blocked",
+            message: `${ownerLabel} transition cannot proceed because report writeback ${operationKey} is ${predecessor.status}`,
+          };
+        }
+        if (predecessor.status !== "succeeded") {
+          return {
+            status: "retry",
+            message: `${ownerLabel} transition is waiting for report writeback ${operationKey}`,
+          };
+        }
+      }
+      if (!registeredReportComment) {
+        return {
           status: "retry",
-          message: `${binding.kind.replaceAll("_", "-")} writeback is waiting for operation registration`,
+          message: `${ownerLabel} transition is waiting for the full report writeback`,
         };
+      }
+    }
+    return { status: "ready" };
   }
 
   private async execute(record: WritebackOperation) {
@@ -1401,7 +1565,12 @@ type IssueBreakdownPlanBinding =
 
 function issueBreakdownPlanBindingForOperation(record: WritebackOperation): IssueBreakdownPlanBinding {
   if (record.kind === "transition") {
-    const planId = record.payload.issueBreakdownPlanId?.trim();
+    const explicitPlanId = record.payload.issueBreakdownPlanId?.trim() || null;
+    const idempotencyPlanId = parseIssueBreakdownTransitionIdempotencyKey(record);
+    if (explicitPlanId && idempotencyPlanId && explicitPlanId !== idempotencyPlanId) {
+      return { status: "blocked", message: "issue breakdown transition plan binding is ambiguous" };
+    }
+    const planId = explicitPlanId ?? idempotencyPlanId;
     return planId ? { status: "bound", planId } : { status: "none" };
   }
   if (record.kind === "issue_create") return { status: "bound", planId: record.payload.planId };
@@ -1415,7 +1584,7 @@ function issueBreakdownPlanBindingForComment(record: Extract<WritebackOperation,
   if (explicit) return { status: "bound", planId: explicit };
 
   const dedupePlanId = parseIssueBreakdownChildrenDedupeKey(record.payload.dedupeKey);
-  const idempotencyPlanId = parseIssueBreakdownChildrenIdempotencyKey(record.idempotencyKey);
+  const idempotencyPlanId = parseIssueBreakdownChildrenIdempotencyKey(record);
   if (dedupePlanId && idempotencyPlanId && dedupePlanId !== idempotencyPlanId) {
     return { status: "blocked", message: "issue breakdown comment plan binding is ambiguous" };
   }
@@ -1437,8 +1606,51 @@ function parseIssueBreakdownChildrenDedupeKey(dedupeKey: string): string | null 
   return dedupeKey.match(/^issue-breakdown-children:(.+)$/)?.[1] ?? null;
 }
 
-function parseIssueBreakdownChildrenIdempotencyKey(idempotencyKey: string): string | null {
-  return idempotencyKey.match(/^comment:[^:]+:issue-breakdown:([^:]+):children$/)?.[1] ?? null;
+function parseIssueBreakdownChildrenIdempotencyKey(
+  record: Extract<WritebackOperation, { kind: "comment" }>,
+): string | null {
+  const prefix = `comment:${record.issueId}:issue-breakdown:`;
+  const suffix = ":children";
+  if (!record.idempotencyKey.startsWith(prefix) || !record.idempotencyKey.endsWith(suffix)) return null;
+  const planId = record.idempotencyKey.slice(prefix.length, -suffix.length).trim();
+  return planId || null;
+}
+
+function parseIssueBreakdownTransitionIdempotencyKey(
+  record: Extract<WritebackOperation, { kind: "transition" }>,
+): string | null {
+  const prefix = `transition:${record.issueId}:issue-breakdown:`;
+  const suffix = `:${record.payload.toState}`;
+  if (!record.idempotencyKey.startsWith(prefix) || !record.idempotencyKey.endsWith(suffix)) return null;
+  const planId = record.idempotencyKey.slice(prefix.length, -suffix.length).trim();
+  return planId || null;
+}
+
+function issueBreakdownFinalizationPredecessorKeys(
+  issueId: string,
+  plan: IssueBreakdownPlanRecord,
+): string[] {
+  const relationPrefix = `issue-relation:${issueId}:${plan.id}:`;
+  const operationKeys = new Set(
+    plan.applicationOperationKeys.filter((operationKey) => operationKey.startsWith(relationPrefix)),
+  );
+  for (const ref of plan.createdIssueRefs) {
+    operationKeys.add(`${relationPrefix}${ref.proposedIssueIndex}:parent`);
+  }
+  operationKeys.add(`comment:${issueId}:issue-breakdown:${plan.id}:children`);
+  return [...operationKeys];
+}
+
+function isIssueBreakdownFinalizationPredecessor(
+  record: WritebackOperation | null,
+  planId: string,
+  operationKey: string,
+): record is Extract<WritebackOperation, { kind: "issue_relation" | "comment" }> {
+  if (record === null || record.idempotencyKey !== operationKey) return false;
+  if (record.kind === "issue_relation") return record.payload.planId === planId;
+  if (record.kind !== "comment") return false;
+  const binding = issueBreakdownPlanBindingForComment(record);
+  return binding.status === "bound" && binding.planId === planId;
 }
 
 export function computeWritebackBackoffMs(attempt: number, maxBackoffMs: number): number {

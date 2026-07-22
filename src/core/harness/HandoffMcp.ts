@@ -336,6 +336,7 @@ async function writeHandoffMcpContexts(
       issue: ctx.issue,
       activeRunId: input.activeRunId,
       role: ctx.role === "planner" ? "planner" : "worker",
+      sourceIssueTriageReportId: ctx.sourceIssueTriageReportId ?? null,
       workspacePath: ctx.workspace.path,
       workspace: ctx.workspace,
       phase: "issue_breakdown",

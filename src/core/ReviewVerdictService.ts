@@ -29,6 +29,7 @@ import type { RunTranscriptStore } from "./persistence/RunTranscriptStore.js";
 import type { Issue } from "./types.js";
 import {
   planBlockedEscalationWritebacks,
+  planReviewFailureCeilingTriageWritebacks,
   planReviewBlockedWritebacks,
   planReviewAcceptedArtifactPassWritebacks,
   planReviewFailWritebacks,
@@ -407,23 +408,23 @@ export function planReviewVerdictSubmissionApplication(input: {
   };
   let operations: NewWritebackOperation[];
   if (ceilingReached) {
-    operations = planBlockedEscalationWritebacks(
-      {
-        issue: input.issue,
-        runId: input.submission.runId,
-        reason: `max reviewer failures reached (${reviewRound}/${maxReviewerFailures})`,
-        incompleteTurnCount: input.lifecycle.incompleteTurnCount,
-        maxIncompleteTurns: input.config.reviewLoop.maxIncompleteTurns,
-        reviewRound,
-        maxReviewRounds: maxReviewerFailures,
-        lastCompletionReport: latestCurrentCompletionReport(input.lifecycle),
-        lastReviewVerdict: provisionalVerdict,
-        ...(finalDisposition === undefined ? {} : { finalDisposition }),
-        requiredAction:
-          "Review the requested changes, decide whether the worker should continue, and move the issue out of Blocked when it is ready for another implementation pass.",
-      },
-      input.config,
-    );
+    const context = {
+      issue: input.issue,
+      runId: input.submission.runId,
+      reason: `max reviewer failures reached (${reviewRound}/${maxReviewerFailures})`,
+      incompleteTurnCount: input.lifecycle.incompleteTurnCount,
+      maxIncompleteTurns: input.config.reviewLoop.maxIncompleteTurns,
+      reviewRound,
+      maxReviewRounds: maxReviewerFailures,
+      lastCompletionReport: latestCurrentCompletionReport(input.lifecycle),
+      lastReviewVerdict: provisionalVerdict,
+      ...(finalDisposition === undefined ? {} : { finalDisposition }),
+      requiredAction:
+        "Review the requested changes, decide whether the worker should continue, and move the issue out of Blocked when it is ready for another implementation pass.",
+    };
+    operations = input.config.issueTriage.enabled
+      ? planReviewFailureCeilingTriageWritebacks(context, input.config)
+      : planBlockedEscalationWritebacks(context, input.config);
   } else if (input.submission.verdict === "fail") {
     operations = planReviewFailWritebacks(reviewWritebackContextForSubmission(input.issue, input.submission), input.config, writebackDetails);
   } else if (input.submission.verdict === "blocked") {

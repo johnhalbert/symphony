@@ -1,7 +1,22 @@
-import { describe, expect, it } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { FakeHarness } from "../src/core/harness/FakeHarness.js";
 import { ShutdownCoordinator } from "../src/core/shutdown/ShutdownCoordinator.js";
 import { ShutdownStatusLine } from "../src/core/shutdown/ShutdownStatusLine.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
+import { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
+import { SqliteIssueStateStore } from "../src/core/orchestration/SqliteIssueStateStore.js";
+import { SqliteMergeQueueStore } from "../src/core/orchestration/SqliteMergeQueueStore.js";
+import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
+import type { TrackerWriter } from "../src/core/tracker/TrackerWriter.js";
+import {
+  FileWritebackOutboxStore,
+  WritebackProcessor,
+} from "../src/core/writeback/WritebackOutbox.js";
+import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
+import { testConfig } from "./helpers.js";
 
 describe("ShutdownCoordinator", () => {
   it("starts graceful shutdown once and routes a repeated interrupt through force exit", async () => {
@@ -82,6 +97,90 @@ describe("ShutdownCoordinator", () => {
   });
 });
 
+describe("Orchestrator shutdown", () => {
+  let root: string;
+
+  beforeEach(async () => {
+    root = await mkdtemp(path.join(os.tmpdir(), "symphony-shutdown-"));
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it("waits for an active tick before closing orchestrator stores", async () => {
+    const config = testConfig(root);
+    const logger = new StructuredLogger(() => undefined);
+    const issueStateStore = new SqliteIssueStateStore(
+      config.workspace.stateDir,
+    );
+    const mergeQueueStore = new SqliteMergeQueueStore(
+      config.workspace.stateDir,
+    );
+    const issueStateClose = vi.spyOn(issueStateStore, "close");
+    const mergeQueueClose = vi.spyOn(mergeQueueStore, "close");
+    const writeback = new WritebackProcessor(
+      new FileWritebackOutboxStore(config.workspace.stateDir),
+      idleWriter(),
+      logger,
+      config.agent.maxRetryBackoffMs,
+    );
+    const tickEntered = deferred<void>();
+    const releaseTick = deferred<void>();
+    vi.spyOn(writeback, "processDue").mockImplementation(async () => {
+      tickEntered.resolve();
+      await releaseTick.promise;
+    });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: idleTracker(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      writeback,
+      issueStateStore,
+      mergeQueueStore,
+    });
+
+    const tick = orchestrator.refreshNow();
+    await tickEntered.promise;
+    let stopSettled = false;
+    const stopping = orchestrator.stop().then(() => {
+      stopSettled = true;
+    });
+    await flushPromises();
+
+    const stopSettledWhileTickActive = stopSettled;
+    const closeCallsWhileTickActive = {
+      issueState: issueStateClose.mock.calls.length,
+      mergeQueue: mergeQueueClose.mock.calls.length,
+    };
+    releaseTick.resolve();
+    await Promise.all([tick, stopping]);
+    const closeCallsAfterShutdown = {
+      issueState: issueStateClose.mock.calls.length,
+      mergeQueue: mergeQueueClose.mock.calls.length,
+    };
+    await writeback.close();
+
+    expect(stopSettledWhileTickActive).toBe(false);
+    expect(closeCallsWhileTickActive).toEqual({
+      issueState: 0,
+      mergeQueue: 0,
+    });
+    expect(closeCallsAfterShutdown).toEqual({
+      issueState: 1,
+      mergeQueue: 1,
+    });
+  });
+});
+
 describe("ShutdownStatusLine", () => {
   it("keeps a fixed TTY status line below log output and clears it on finish", () => {
     let now = 1_000;
@@ -150,6 +249,31 @@ function fakeTimeout(): NodeJS.Timeout {
 
 async function flushPromises(): Promise<void> {
   for (let index = 0; index < 5; index += 1) await Promise.resolve();
+}
+
+function idleTracker(): TrackerClient {
+  return {
+    async fetchCandidateIssues() {
+      return [];
+    },
+    async fetchIssuesByStates() {
+      return [];
+    },
+    async fetchIssueStatesByIds() {
+      return [];
+    },
+  };
+}
+
+function idleWriter(): TrackerWriter {
+  return {
+    async transitionIssueState() {
+      return { status: "applied" };
+    },
+    async createIssueComment() {
+      return { status: "applied" };
+    },
+  };
 }
 
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T | PromiseLike<T>) => void } {

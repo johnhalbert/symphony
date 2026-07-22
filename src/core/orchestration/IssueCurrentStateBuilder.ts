@@ -9,9 +9,11 @@ import {
   issueBreakdownConfigFingerprint,
   issueBreakdownPlanSatisfiesCurrentValidation,
   issueContentFingerprint,
+  issueContentFingerprintForBreakdownPlan,
 } from "../IssueBreakdownPlanService.js";
 import {
   activeIssueTriageBlockers,
+  issueTriageReportCountsTowardAutomaticAttemptLimit,
   issueTriageTriggerFingerprint,
   latestIssueTriageReport,
   latestIssueTriageReportForFingerprint,
@@ -193,12 +195,14 @@ type LifecycleFields = Pick<
   | "blockedReason"
   | "lastIssueBreakdownPlanId"
   | "lastIssueBreakdownPlanApplicationStatus"
+  | "lastIssueBreakdownPlanSourceIssueTriageReportId"
   | "lastIssueBreakdownPlanIssueContentFingerprint"
   | "lastIssueBreakdownPlanConfigFingerprint"
   | "lastIssueBreakdownPlanSatisfiesCurrentValidation"
   | "lastIssueTriageReportId"
   | "lastIssueTriageReportTriggerFingerprint"
   | "lastIssueTriageReportWritebackOperationKeys"
+  | "lastIssueTriageRecoveryDisposition"
   | "currentIssueTriageTriggerFingerprint"
   | "issueTriageCurrentTriggerReportIds"
   | "latestIssueTriageReportBlockers"
@@ -282,6 +286,7 @@ type LifecycleBreakdownFields = Pick<
   LifecycleFields,
   | "lastIssueBreakdownPlanId"
   | "lastIssueBreakdownPlanApplicationStatus"
+  | "lastIssueBreakdownPlanSourceIssueTriageReportId"
   | "lastIssueBreakdownPlanIssueContentFingerprint"
   | "lastIssueBreakdownPlanConfigFingerprint"
   | "lastIssueBreakdownPlanSatisfiesCurrentValidation"
@@ -292,6 +297,7 @@ type LifecycleTriageFields = Pick<
   | "lastIssueTriageReportId"
   | "lastIssueTriageReportTriggerFingerprint"
   | "lastIssueTriageReportWritebackOperationKeys"
+  | "lastIssueTriageRecoveryDisposition"
   | "currentIssueTriageTriggerFingerprint"
   | "issueTriageCurrentTriggerReportIds"
   | "latestIssueTriageReportBlockers"
@@ -749,6 +755,11 @@ export class IssueCurrentStateBuilder {
         sourceSnapshotId: snapshot.historySnapshotId,
       };
     }
+    const lastIssueBreakdownPlan = context.lifecycle?.lastIssueBreakdownPlanId
+      ? (context.lifecycle.issueBreakdownPlans.find(
+          (plan) => plan.id === context.lifecycle?.lastIssueBreakdownPlanId,
+        ) ?? null)
+      : null;
     return {
       complete: true,
       sourceSnapshotId: snapshot.historySnapshotId,
@@ -771,7 +782,13 @@ export class IssueCurrentStateBuilder {
         childrenTruncated: issue.childrenTruncated === true,
         trackerCreatedAt: issue.createdAt,
         trackerUpdatedAt: issue.updatedAt,
-        currentIssueContentFingerprint: issueContentFingerprint(issue),
+        currentIssueContentFingerprint:
+          lastIssueBreakdownPlan === null
+            ? issueContentFingerprint(issue)
+            : issueContentFingerprintForBreakdownPlan(
+                issue,
+                lastIssueBreakdownPlan,
+              ),
       },
     };
   }
@@ -1190,6 +1207,8 @@ export class IssueCurrentStateBuilder {
         lastIssueBreakdownPlanId,
         lastIssueBreakdownPlanApplicationStatus:
           lastIssueBreakdownPlan?.applicationStatus ?? null,
+        lastIssueBreakdownPlanSourceIssueTriageReportId:
+          lastIssueBreakdownPlan?.sourceIssueTriageReportId ?? null,
         lastIssueBreakdownPlanIssueContentFingerprint:
           lastIssueBreakdownPlan?.issueContentFingerprint ?? null,
         lastIssueBreakdownPlanConfigFingerprint:
@@ -1245,7 +1264,8 @@ export class IssueCurrentStateBuilder {
         : issueTriageReports.filter(
             (report) =>
               report.triggerFingerprint === currentFingerprint &&
-              !isSupersededLifecycleRecord(report),
+              !isSupersededLifecycleRecord(report) &&
+              issueTriageReportCountsTowardAutomaticAttemptLimit(report),
           );
     const lastReport =
       currentFingerprint === null
@@ -1264,6 +1284,8 @@ export class IssueCurrentStateBuilder {
           lastReport?.triggerFingerprint ?? null,
         lastIssueTriageReportWritebackOperationKeys:
           lastReport?.writebackOperationKeys ?? null,
+        lastIssueTriageRecoveryDisposition:
+          lastReport?.recoveryDisposition ?? null,
         currentIssueTriageTriggerFingerprint: currentFingerprint,
         issueTriageCurrentTriggerReportIds: currentTriggerReports.map(
           (report) => report.id,
@@ -1455,7 +1477,13 @@ export class IssueCurrentStateBuilder {
         : (lifecycle.issueBreakdownPlans.find(
             (plan) => plan.id === lifecycle.lastIssueBreakdownPlanId,
           ) ?? null);
-    const currentIssueFingerprint = issueContentFingerprint(issue);
+    const currentIssueFingerprint =
+      lastIssueBreakdownPlan === null
+        ? issueContentFingerprint(issue)
+        : issueContentFingerprintForBreakdownPlan(
+            issue,
+            lastIssueBreakdownPlan,
+          );
     const currentIssueBreakdownFingerprint = issueBreakdownConfigFingerprint(
       this.options.config,
     );
@@ -1467,7 +1495,8 @@ export class IssueCurrentStateBuilder {
         : lifecycle.issueTriageReports.filter(
             (report) =>
               report.triggerFingerprint === currentIssueTriageFingerprint &&
-              !isSupersededLifecycleRecord(report),
+              !isSupersededLifecycleRecord(report) &&
+              issueTriageReportCountsTowardAutomaticAttemptLimit(report),
           );
     const lastIssueTriageReport =
       lifecycle === null || currentIssueTriageFingerprint === null
@@ -1623,6 +1652,8 @@ export class IssueCurrentStateBuilder {
       lastIssueBreakdownPlanId: lifecycle?.lastIssueBreakdownPlanId ?? null,
       lastIssueBreakdownPlanApplicationStatus:
         context.lastIssueBreakdownPlan?.applicationStatus ?? null,
+      lastIssueBreakdownPlanSourceIssueTriageReportId:
+        context.lastIssueBreakdownPlan?.sourceIssueTriageReportId ?? null,
       lastIssueBreakdownPlanIssueContentFingerprint:
         context.lastIssueBreakdownPlan?.issueContentFingerprint ?? null,
       lastIssueBreakdownPlanConfigFingerprint:
@@ -1642,6 +1673,8 @@ export class IssueCurrentStateBuilder {
         context.lastIssueTriageReport?.triggerFingerprint ?? null,
       lastIssueTriageReportWritebackOperationKeys:
         context.lastIssueTriageReport?.writebackOperationKeys ?? null,
+      lastIssueTriageRecoveryDisposition:
+        context.lastIssueTriageReport?.recoveryDisposition ?? null,
       currentIssueTriageTriggerFingerprint:
         context.currentIssueTriageFingerprint,
       issueTriageCurrentTriggerReportIds:

@@ -36,9 +36,11 @@ Validation evidence:
 ## Required Behavior
 
 - Analyze thoroughly across contract coverage, validation quality, regressions, touched surfaces, and likely adjacent scenarios.
+- Complete the whole current-issue review before returning a fail verdict. When one contract-entitled failure pattern appears, inspect every owned symmetric surface and applicable matrix variant, and report all presently discoverable gate findings together rather than stopping after the first defect.
 - Classify every concern as either a `gateFinding` or a `discoveryFinding`.
 - Use `gateFindings` only for worker-owned, contract-entitled defects that justify a fail verdict. Each gate finding must cite the contract anchor, scenario entitlement, observed failure, current-issue ownership, and bounded repair.
 - Use a `blocked` verdict, not `fail`, when review cannot complete because required validation, tooling, credentials, or service-owned evidence is unavailable to worker/reviewer roles and the bounded repair is not worker-owned.
+- Treat PR publication, lifecycle-bound head/base alignment, service-owned rebase state, and unavailable GitHub credentials or observations as blocked service evidence, not as worker failure, unless concrete evidence ties the condition to worker-authored content.
 - Use `discoveryFindings` for inferred scope, adjacent sibling scenarios, hidden matrix axes, sibling issue scope, future hardening, or out-of-scope concerns. Discovery findings are valuable backlog evidence, but they do not make the verdict fail by themselves.
 - A pass verdict is allowed when all written contract requirements are satisfied, even if important discovery findings remain.
 - Do not steal scope from sibling issues. If a concern belongs elsewhere, report it as `sibling_issue_scope` or `followup_issue`.

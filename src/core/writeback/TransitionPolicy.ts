@@ -1,4 +1,6 @@
 import type { ServiceConfig } from "../config/Config.js";
+import { evaluateWorkerDispatchCapability } from "../IssueDispatchCapability.js";
+import { parseIssueContract } from "../IssueContractLint.js";
 import type {
   ExpectedRedArtifactEvidence,
   IssueAcceptedArtifactRecord,
@@ -8,6 +10,10 @@ import type {
   IssueMergeConflictResolutionReportRecord,
   IssuePostMortemReportRecord,
   IssueReviewVerdictRecord,
+  IssueTriageBlockerRecord,
+  IssueTriageRecoveryActor,
+  IssueTriageRecoveryDispositionRecord,
+  IssueTriageRecoveryMode,
   IssueTriageReportRecord,
   PullRequestReviewEvidenceItem,
   ReviewDiscoveryFindingRecord,
@@ -66,6 +72,28 @@ export interface IssueTriageReportWritebackContext {
   issue: Issue;
   report: IssueTriageReportRecord;
   blockedReason?: string | null;
+  planningFailureCount?: number;
+  hasFreshIssueBreakdownPlan?: boolean;
+  issueBreakdownPlanApplicationStatus?: string | null;
+  incompleteTurnCount?: number;
+  hasActiveMergeConflict?: boolean;
+}
+
+export interface IssueTriageRecoveryRouteContext {
+  issue: Issue;
+  blockers: readonly IssueTriageBlockerRecord[];
+  planningFailureCount?: number;
+  hasFreshIssueBreakdownPlan?: boolean;
+  issueBreakdownPlanApplicationStatus?: string | null;
+  incompleteTurnCount?: number;
+  hasActiveMergeConflict?: boolean;
+}
+
+export interface IssueTriageRecoveryRouteDecision {
+  mode: IssueTriageRecoveryMode;
+  nextActor: IssueTriageRecoveryActor | null;
+  targetState: string | null;
+  reason: string;
 }
 
 export interface IssueTriageBlockedReboundWritebackContext {
@@ -1044,13 +1072,63 @@ export function planBlockedEscalationWritebacks(
   return operations;
 }
 
+export function planReviewFailureCeilingTriageWritebacks(
+  context: BlockedEscalationWritebackContext,
+  config: ServiceConfig,
+): NewWritebackOperation[] {
+  if (!config.writeback.enabled || !config.issueTriage.enabled) return [];
+  if (!isStateIn(context.issue.state, config.reviewLoop.reviewStates)) return [];
+
+  const eventKey = `${context.runId}:review-ceiling-triage`;
+  return [
+    {
+      idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
+      kind: "comment",
+      issueId: context.issue.id,
+      runId: context.runId,
+      payload: {
+        dedupeKey: eventKey,
+        body: [
+          "## Symphony Review Ceiling",
+          "",
+          "Status: paused in review, automated triage pending",
+          "",
+          `Run: ${context.runId}`,
+          `Ceiling reason: ${context.reason}`,
+          "",
+          "Counts:",
+          `- Incomplete turns: ${formatCount(context.incompleteTurnCount, context.maxIncompleteTurns)}`,
+          `- Review rounds: ${formatCount(context.reviewRound, context.maxReviewRounds)}`,
+          "",
+          "Last completion report:",
+          ...formatCompletionReportSummary(context.lastCompletionReport ?? null),
+          "",
+          "Last review verdict:",
+          ...formatReviewVerdictSummary(context.lastReviewVerdict ?? null),
+          "",
+          "Next action:",
+          "Symphony will classify the active blockers before changing Linear state. Machine-owned repair will resume automatically; Linear Blocked is reserved for work that cannot continue without external or human action.",
+          ...formatBlockerProvenanceForComment(
+            context.blockerProvenance ?? null,
+          ),
+          ...formatFinalDispositionForComment(context.finalDisposition),
+        ].join("\n"),
+      },
+    },
+  ];
+}
+
 export function planIssueTriageReportWritebacks(
   context: IssueTriageReportWritebackContext,
   config: ServiceConfig,
 ): NewWritebackOperation[] {
   if (!config.writeback.enabled) return [];
   const eventKey = `issue-triage:${safeKeySegment(context.report.idempotencyKey)}`;
-  return [
+  const recoveryDisposition =
+    context.report.recoveryDisposition ??
+    decideIssueTriageRecoveryDisposition(context, config);
+  const automaticallyActionable = recoveryDisposition.mode === "automated";
+  const operations: NewWritebackOperation[] = [
     {
       idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
       kind: "comment",
@@ -1061,7 +1139,9 @@ export function planIssueTriageReportWritebacks(
         body: [
           "## Symphony Issue Triage",
           "",
-          "Status: triage complete, human action required",
+          automaticallyActionable
+            ? "Status: triage complete, automated recovery scheduled"
+            : "Status: triage complete, human or external action required",
           "",
           `Run: ${context.report.runId}`,
           `Blocked reason: ${context.blockedReason ?? "n/a"}`,
@@ -1072,16 +1152,255 @@ export function planIssueTriageReportWritebacks(
           "Blockers, ordered by Symphony precedence:",
           ...formatIssueTriageBlockerWritebackLines(context.report),
           "",
-          "Recommended human action:",
+          automaticallyActionable
+            ? "Automated recovery action:"
+            : "Recommended human or external action:",
           context.report.recommendedAction,
           "",
-          "Operator next-action matrix:",
-          ...formatIssueTriageNextActionMatrix(context, config),
+          "Recovery provenance:",
+          `- Mode: ${recoveryDisposition.mode}`,
+          `- Next actor: ${recoveryDisposition.nextActor ?? "none"}`,
+          `- Target state: ${recoveryDisposition.targetState ?? "not configured"}`,
+          `- Full report writeback: ${recoveryDisposition.reportWritebackStatus}`,
+          `- Transition operation: ${recoveryDisposition.transitionOperationKey ?? recoveryDisposition.transitionStatus}`,
+          `- Decision: ${recoveryDisposition.reason}`,
+          ...(automaticallyActionable
+            ? [
+                "",
+                `Transitioning to ${config.writeback.dispatchState}; Symphony will reset the exhausted review budget and route ${recoveryDisposition.nextActor === "planner" ? "planning before implementation" : "a focused worker repair"}.`,
+              ]
+            : [
+                "",
+                "Operator next-action matrix:",
+                ...formatIssueTriageNextActionMatrix(context, config),
+              ]),
           ...formatFinalDispositionForComment(context.report.finalDisposition),
         ].join("\n"),
       },
     },
   ];
+
+  if (
+    recoveryDisposition.targetState !== null &&
+    recoveryDisposition.transitionOperationKey !== null &&
+    recoveryDisposition.transitionStatus === "pending"
+  ) {
+    const fromStates = uniqueStates([
+      ...config.tracker.activeStates,
+      ...config.tracker.handoffStates,
+      ...config.reviewLoop.reviewStates,
+      ...config.reviewLoop.blockedStates,
+      ...(config.mergePolicy.mode === "gated" &&
+      config.mergePolicy.conflictsState !== null
+        ? [config.mergePolicy.conflictsState]
+        : []),
+    ]);
+    if (isStateIn(context.issue.state, fromStates)) {
+      operations.push({
+        idempotencyKey: recoveryDisposition.transitionOperationKey,
+        kind: "transition",
+        issueId: context.issue.id,
+        runId: context.report.runId,
+        payload: {
+          fromStates,
+          toState: recoveryDisposition.targetState,
+          reason: automaticallyActionable
+            ? "Symphony triage identified machine-owned recovery"
+            : "Symphony triage requires human or external action",
+        },
+      });
+    }
+  }
+
+  return operations;
+}
+
+export function decideIssueTriageRecoveryDisposition(
+  context: IssueTriageReportWritebackContext,
+  config: ServiceConfig,
+): IssueTriageRecoveryDispositionRecord {
+  const routeDecision = decideIssueTriageRecoveryRoute(
+    {
+      issue: context.issue,
+      blockers: context.report.blockers,
+      ...(context.planningFailureCount === undefined
+        ? {}
+        : { planningFailureCount: context.planningFailureCount }),
+      ...(context.hasFreshIssueBreakdownPlan === undefined
+        ? {}
+        : { hasFreshIssueBreakdownPlan: context.hasFreshIssueBreakdownPlan }),
+      ...(context.issueBreakdownPlanApplicationStatus === undefined
+        ? {}
+        : {
+            issueBreakdownPlanApplicationStatus:
+              context.issueBreakdownPlanApplicationStatus,
+          }),
+      ...(context.incompleteTurnCount === undefined
+        ? {}
+        : { incompleteTurnCount: context.incompleteTurnCount }),
+      ...(context.hasActiveMergeConflict === undefined
+        ? {}
+        : { hasActiveMergeConflict: context.hasActiveMergeConflict }),
+    },
+    config,
+  );
+  const targetState = routeDecision.targetState;
+  const fromStates = uniqueStates([
+    ...config.tracker.activeStates,
+    ...config.tracker.handoffStates,
+    ...config.reviewLoop.reviewStates,
+    ...config.reviewLoop.blockedStates,
+    ...(config.mergePolicy.mode === "gated" &&
+    config.mergePolicy.conflictsState !== null
+      ? [config.mergePolicy.conflictsState]
+      : []),
+  ]);
+  const transitionRequired =
+    targetState !== null && !sameName(context.issue.state, targetState);
+  const transitionEligible =
+    config.writeback.enabled &&
+    transitionRequired &&
+    isStateIn(context.issue.state, fromStates);
+  const route =
+    routeDecision.mode === "automated"
+      ? "automated-recovery"
+      : "external-block";
+  const eventKey = `issue-triage:${safeKeySegment(context.report.idempotencyKey)}`;
+  return {
+    ...routeDecision,
+    reportWritebackStatus: config.writeback.enabled ? "pending" : "failed",
+    transitionOperationKey:
+      transitionEligible && targetState !== null
+        ? `transition:${context.issue.id}:${eventKey}:${route}:${safeKeySegment(targetState)}`
+        : null,
+    transitionStatus:
+      targetState === null || (transitionRequired && !transitionEligible)
+        ? "failed"
+        : transitionRequired
+          ? "pending"
+          : "not_required",
+  };
+}
+
+/**
+ * Selects a durable recovery route from current issue state. The result has no
+ * report identity or writeback status, so ruleset snapshots can safely
+ * re-evaluate it when assignment, labels, children, or configuration change.
+ */
+export function decideIssueTriageRecoveryRoute(
+  context: IssueTriageRecoveryRouteContext,
+  config: ServiceConfig,
+): IssueTriageRecoveryRouteDecision {
+  const activeBlockers = context.blockers.filter(
+    (blocker) => blocker.status === "active",
+  );
+  const activeActors = new Set(
+    activeBlockers.map((blocker) => blocker.nextActor),
+  );
+  const plannerRecoveryAvailable = issueTriagePlannerRecoveryAvailable(
+    context,
+    config,
+  );
+  const workerRecovery = evaluateWorkerDispatchCapability(
+    context.issue,
+    config,
+    config.writeback.dispatchState,
+    {
+      hasFreshIssueBreakdownPlan:
+        context.hasFreshIssueBreakdownPlan === true,
+      issueBreakdownPlanApplicationStatus:
+        context.issueBreakdownPlanApplicationStatus ?? null,
+      ...(context.incompleteTurnCount === undefined
+        ? {}
+        : { incompleteTurnCount: context.incompleteTurnCount }),
+      ...(context.hasActiveMergeConflict === undefined
+        ? {}
+        : { hasActiveMergeConflict: context.hasActiveMergeConflict }),
+    },
+  );
+  const machineActorsOnly = [...activeActors].every(
+    (actor) => actor === "worker" || actor === "planner",
+  );
+  const plannerOwnsWorkerPrerequisite =
+    activeActors.has("worker") &&
+    (workerRecovery.reason === "planning_required" ||
+      workerRecovery.reason === "issue_breakdown_application_required") &&
+    plannerRecoveryAvailable;
+  const selectedActor =
+    activeActors.has("planner") || plannerOwnsWorkerPrerequisite
+      ? "planner"
+      : activeActors.has("worker")
+        ? "worker"
+        : null;
+  const automaticallyActionable =
+    config.writeback.enabled &&
+    activeBlockers.length > 0 &&
+    machineActorsOnly &&
+    selectedActor !== null &&
+    (selectedActor === "planner"
+      ? plannerRecoveryAvailable
+      : workerRecovery.available);
+  const mode = automaticallyActionable ? "automated" : "external";
+  const nextActor = automaticallyActionable ? selectedActor : null;
+  const targetState = automaticallyActionable
+    ? config.writeback.dispatchState
+    : (config.reviewLoop.blockedStates[0] ?? null);
+  return {
+    mode,
+    nextActor,
+    targetState,
+    reason: automaticallyActionable
+      ? plannerOwnsWorkerPrerequisite
+        ? "machine-owned issue breakdown prerequisite routed to planner"
+        : `machine-owned recovery routed to ${nextActor}`
+      : "triage requires human or external action, or no durable machine route is available",
+  };
+}
+
+function issueTriagePlannerRecoveryAvailable(
+  context: IssueTriageRecoveryRouteContext,
+  config: ServiceConfig,
+): boolean {
+  if (
+    !config.issueBreakdown.enabled ||
+    !config.issueBreakdown.applyToLinear.enabled ||
+    !config.issueBreakdown.applyToLinear.autoApply ||
+    !isStateIn(
+      config.writeback.dispatchState,
+      config.tracker.activeStates,
+    ) ||
+    !context.issue.assignedToWorker ||
+    context.issue.hasChildren ||
+    context.issue.childrenTruncated === true ||
+    (context.issue.children?.length ?? 0) > 0 ||
+    (context.planningFailureCount ?? 0) >=
+      config.issueBreakdown.maxPlanningFailures
+  )
+    return false;
+  const labels = new Set(
+    context.issue.labels.map((label) => label.trim().toLowerCase()),
+  );
+  if (
+    config.agent.requireLabels.some(
+      (label) => !labels.has(label.trim().toLowerCase()),
+    )
+  )
+    return false;
+  if (
+    config.agent.excludeLabels.some((label) =>
+      labels.has(label.trim().toLowerCase()),
+    ) ||
+    config.agent.plannerExcludeLabels.some((label) =>
+      labels.has(label.trim().toLowerCase()),
+    )
+  )
+    return false;
+  const contract = parseIssueContract(context.issue.description);
+  return !(
+    contract.valid &&
+    contract.contract.delivery.mode === "accepted_artifact" &&
+    contract.contract.delivery.artifact === "expected_red_tests"
+  );
 }
 
 function formatIssueTriageBlockerWritebackLines(report: IssueTriageReportRecord): string[] {

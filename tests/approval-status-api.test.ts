@@ -815,7 +815,7 @@ describe("approval status API", () => {
     }
   }, 30_000);
 
-  it("preserves a live worker when pending audit writeback partially fails after Blocked transition", async () => {
+  it("preserves a live worker when pending audit comment failure holds the Blocked transition", async () => {
     config.writeback.enabled = true;
     config.writeback.mode = "live";
     config.writeback.dispatchState = "Todo";
@@ -891,7 +891,8 @@ describe("approval status API", () => {
     });
     try {
       await orchestrator.refreshNow();
-      await waitFor(() => currentState === "Blocked" && gatedProcessDueCompleted, "partial pending audit writeback");
+      await waitFor(() => gatedProcessDueCompleted, "partial pending audit writeback");
+      expect(currentState).toBe("Todo");
       await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
         phase: "blocked",
         blockedReason: PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON,
@@ -907,6 +908,22 @@ describe("approval status API", () => {
           }),
         ],
       });
+      await expect(
+        outboxStore.get(
+          "comment:issue-1:live-report-run:completion-report:idem-live:publication-approval-pending",
+        ),
+      ).resolves.toMatchObject({
+        status: "retrying",
+        lastError: "linear comment failed",
+      });
+      await expect(
+        outboxStore.get(
+          "transition:issue-1:live-report-run:completion-report:idem-live:publication-approval-pending:Blocked",
+        ),
+      ).resolves.toMatchObject({
+        status: "retrying",
+        lastError: expect.stringContaining("waiting for report writeback"),
+      });
       await expect(store.findPendingForRun("live-report-run")).resolves.toBeNull();
 
       await (
@@ -920,7 +937,7 @@ describe("approval status API", () => {
       expect(runningRun).toMatchObject({ status: "running" });
       expect(runningRun?.pendingApprovalRequestId ?? null).toBeNull();
       expect(runningRun?.cancellationRequestedAt ?? null).toBeNull();
-      expect(writer.transitions.map((transition) => transition.toState)).toEqual(["Todo", "Blocked"]);
+      expect(writer.transitions.map((transition) => transition.toState)).toEqual(["Todo"]);
     } finally {
       releaseGatedProcessDue();
       await waitFor(() => orchestrator.snapshot().counts.running === 0, "partial failure worker exit").catch(() => undefined);

@@ -18,6 +18,7 @@ export interface IssueBreakdownPlanMcpContextFile {
   activeRunId: string | null;
   role: "planner" | "worker";
   phase: "issue_breakdown";
+  sourceIssueTriageReportId?: string | null;
   workspacePath: string | null;
   workspace: Workspace;
 }
@@ -53,6 +54,8 @@ export async function submitIssueBreakdownPlanFromMcp(
       activeRunId: loadedContext.activeRunId,
       role: loadedContext.role,
       phase: loadedContext.phase,
+      sourceIssueTriageReportId:
+        loadedContext.sourceIssueTriageReportId ?? null,
     };
     const result = await service.submit_issue_breakdown_plan(issueBreakdownPlanInputFromMcp(input, context), context);
     return {

@@ -33,8 +33,10 @@ import type { IssueBreakdownFreshnessGuard } from "../src/core/writeback/Writeba
 import {
   ACCEPTED_ARTIFACT_WRITEBACK_NOT_CURRENT_REASON,
   FileWritebackOutboxStore,
+  ISSUE_BREAKDOWN_FINALIZATION_PENDING_REASON,
   ISSUE_BREAKDOWN_PLAN_STALE_REASON,
   SqliteWritebackOutboxStore,
+  WRITEBACK_IN_FLIGHT_LEASE_MS,
   WritebackProcessor,
 } from "../src/core/writeback/WritebackOutbox.js";
 import type { NewWritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
@@ -244,7 +246,7 @@ describe("FileWritebackOutboxStore", () => {
     expect(writer.comments).toHaveLength(0);
   });
 
-  it("terminally skips a review-verdict comment whose owner is no longer current", async () => {
+  it("delivers a delayed historical review-verdict comment after a newer verdict becomes current", async () => {
     const store = new FileWritebackOutboxStore(root);
     const writer = new FakeWriter();
     const operation: NewWritebackOperation = {
@@ -254,8 +256,8 @@ describe("FileWritebackOutboxStore", () => {
       lifecycleBinding: { kind: "review_verdict", recordId: "verdict-1" },
       payload: { body: "Old review", dedupeKey: "verdict-1:not-current" },
     };
-    const lifecycle = {
-      lastReviewVerdictId: "verdict-2",
+    let lifecycle = {
+      lastReviewVerdictId: "verdict-1",
       reviewVerdicts: [
         {
           id: "verdict-1",
@@ -271,14 +273,32 @@ describe("FileWritebackOutboxStore", () => {
       0,
       { get: async () => lifecycle },
     );
+    await store.markRetry(
+      await store.enqueueOnce(operation),
+      "transient tracker failure",
+      new Date().toISOString(),
+    );
 
-    const result = await processor.enqueueAndProcess(operation);
+    lifecycle = {
+      ...lifecycle,
+      lastReviewVerdictId: "verdict-2",
+      reviewVerdicts: [
+        ...lifecycle.reviewVerdicts,
+        {
+          id: "verdict-2",
+          writebackOperationKeys: [],
+          supersededAt: null,
+        },
+      ],
+    } as unknown as IssueLifecycleRecord;
+    await processor.processDue();
 
-    expect(result).toMatchObject({
-      status: "skipped",
-      lastError: "review-verdict writeback is no longer bound to the current verdict",
+    await expect(store.get(operation.idempotencyKey)).resolves.toMatchObject({
+      status: "succeeded",
     });
-    expect(writer.comments).toHaveLength(0);
+    expect(writer.comments).toEqual([
+      expect.objectContaining({ body: "Old review", dedupeKey: "verdict-1:not-current" }),
+    ]);
   });
 
   it("terminally skips a retrying bound report comment after its owner is superseded", async () => {
@@ -320,6 +340,169 @@ describe("FileWritebackOutboxStore", () => {
       lastError: "issue-triage-report writeback owner has been superseded",
     });
     expect(writer.comments).toHaveLength(0);
+  });
+
+  it("waits for the full triage report comment before executing its recovery transition", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter();
+    const commentKey = "comment:issue-1:triage:report-1";
+    const transitionKey = "transition:issue-1:triage:report-1:In Progress";
+    const lifecycle = {
+      issueTriageReports: [
+        {
+          id: "report-1",
+          writebackOperationKeys: [commentKey, transitionKey],
+          supersededAt: null,
+        },
+      ],
+    } as unknown as IssueLifecycleRecord;
+    const processor = new WritebackProcessor(
+      store,
+      writer,
+      new StructuredLogger(() => undefined),
+      0,
+      { get: async () => lifecycle },
+    );
+    await store.enqueueOnce({
+      idempotencyKey: commentKey,
+      kind: "comment",
+      issueId: "issue-1",
+      lifecycleBinding: { kind: "issue_triage_report", recordId: "report-1" },
+      payload: { body: "Full triage disposition", dedupeKey: "report-1" },
+    });
+    await store.enqueueOnce({
+      idempotencyKey: transitionKey,
+      kind: "transition",
+      issueId: "issue-1",
+      lifecycleBinding: { kind: "issue_triage_report", recordId: "report-1" },
+      payload: { fromStates: ["In Review"], toState: "In Progress" },
+    });
+
+    await processor.processDue({ idempotencyKeys: [transitionKey] });
+
+    await expect(store.get(transitionKey)).resolves.toMatchObject({
+      status: "retrying",
+      lastError: expect.stringContaining("waiting for report writeback"),
+    });
+    expect(writer.transitions).toHaveLength(0);
+
+    const comment = await store.get(commentKey);
+    if (!comment) throw new Error("missing triage report comment fixture");
+    await store.markSucceeded(comment, { status: "applied" });
+    await makeWritebackDue(store, transitionKey);
+    await processor.processDue({ idempotencyKeys: [transitionKey] });
+
+    await expect(store.get(transitionKey)).resolves.toMatchObject({ status: "succeeded" });
+    expect(writer.transitions).toHaveLength(1);
+  });
+
+  it("waits for the full review verdict comment before executing its bound transition", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter();
+    const commentKey = "comment:issue-1:review-verdict:verdict-1";
+    const transitionKey = "transition:issue-1:review-verdict:verdict-1:Ready to Merge";
+    const lifecycle = {
+      lastReviewVerdictId: "verdict-1",
+      reviewVerdicts: [
+        {
+          id: "verdict-1",
+          writebackOperationKeys: [commentKey, transitionKey],
+          supersededAt: null,
+        },
+      ],
+    } as unknown as IssueLifecycleRecord;
+    const processor = new WritebackProcessor(
+      store,
+      writer,
+      new StructuredLogger(() => undefined),
+      0,
+      { get: async () => lifecycle },
+    );
+    await store.enqueueOnce({
+      idempotencyKey: commentKey,
+      kind: "comment",
+      issueId: "issue-1",
+      lifecycleBinding: { kind: "review_verdict", recordId: "verdict-1" },
+      payload: { body: "Full review disposition", dedupeKey: "verdict-1" },
+    });
+    await store.enqueueOnce({
+      idempotencyKey: transitionKey,
+      kind: "transition",
+      issueId: "issue-1",
+      lifecycleBinding: { kind: "review_verdict", recordId: "verdict-1" },
+      payload: { fromStates: ["In Review"], toState: "Ready to Merge" },
+    });
+
+    await processor.processDue({ idempotencyKeys: [transitionKey] });
+
+    await expect(store.get(transitionKey)).resolves.toMatchObject({
+      status: "retrying",
+      lastError: expect.stringContaining("waiting for report writeback"),
+    });
+    expect(writer.transitions).toHaveLength(0);
+
+    const comment = await store.get(commentKey);
+    if (!comment) throw new Error("missing review verdict comment fixture");
+    await store.markSucceeded(comment, { status: "applied" });
+    await makeWritebackDue(store, transitionKey);
+    await processor.processDue({ idempotencyKeys: [transitionKey] });
+
+    await expect(store.get(transitionKey)).resolves.toMatchObject({ status: "succeeded" });
+    expect(writer.transitions).toHaveLength(1);
+  });
+
+  it("waits for the full completion report comment before executing its bound transition", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter();
+    const commentKey = "comment:issue-1:completion-report:report-1";
+    const transitionKey = "transition:issue-1:completion-report:report-1:In Review";
+    const lifecycle = {
+      completionReports: [
+        {
+          id: "report-1",
+          writebackOperationKeys: [commentKey, transitionKey],
+          supersededAt: null,
+        },
+      ],
+    } as unknown as IssueLifecycleRecord;
+    const processor = new WritebackProcessor(
+      store,
+      writer,
+      new StructuredLogger(() => undefined),
+      0,
+      { get: async () => lifecycle },
+    );
+    await store.enqueueOnce({
+      idempotencyKey: commentKey,
+      kind: "comment",
+      issueId: "issue-1",
+      lifecycleBinding: { kind: "completion_report", recordId: "report-1" },
+      payload: { body: "Full completion disposition", dedupeKey: "report-1" },
+    });
+    await store.enqueueOnce({
+      idempotencyKey: transitionKey,
+      kind: "transition",
+      issueId: "issue-1",
+      lifecycleBinding: { kind: "completion_report", recordId: "report-1" },
+      payload: { fromStates: ["In Progress"], toState: "In Review" },
+    });
+
+    await processor.processDue({ idempotencyKeys: [transitionKey] });
+
+    await expect(store.get(transitionKey)).resolves.toMatchObject({
+      status: "retrying",
+      lastError: expect.stringContaining("waiting for report writeback"),
+    });
+    expect(writer.transitions).toHaveLength(0);
+
+    const comment = await store.get(commentKey);
+    if (!comment) throw new Error("missing completion report comment fixture");
+    await store.markSucceeded(comment, { status: "applied" });
+    await makeWritebackDue(store, transitionKey);
+    await processor.processDue({ idempotencyKeys: [transitionKey] });
+
+    await expect(store.get(transitionKey)).resolves.toMatchObject({ status: "succeeded" });
+    expect(writer.transitions).toHaveLength(1);
   });
 
   it("executes only writebacks registered on the current completed accepted artifact", async () => {
@@ -1266,6 +1449,105 @@ describe("FileWritebackOutboxStore", () => {
     expect(writer.comments).toHaveLength(1);
   });
 
+  it("holds an already-enqueued legacy parent transition until relation and comment finalization succeeds", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter();
+    const config = testConfig(root);
+    const parentIssue = issue({ identifier: "ENG-1", labels: ["planning"], updatedAt: "2026-01-01T00:00:00.000Z" });
+    const planId = "issue-breakdown-plan:issue-1:legacy-plan-v1";
+    const relationKey = `issue-relation:issue-1:${planId}:0:parent`;
+    const commentKey = `comment:issue-1:issue-breakdown:${planId}:children`;
+    const transitionKey = `transition:issue-1:issue-breakdown:${planId}:In Review`;
+    const lifecycleStore = {
+      get: async () =>
+        lifecycleWithIssueBreakdownPlan({
+          planId,
+          operationKeys: [relationKey, commentKey, transitionKey],
+          issue: parentIssue,
+          config,
+          createdIssueRefs: [createdIssueRef()],
+        }),
+    };
+    await store.enqueueOnce({
+      idempotencyKey: relationKey,
+      kind: "issue_relation",
+      issueId: "issue-1",
+      runId: "run-plan-1",
+      payload: {
+        planId,
+        sourceIssueId: "child-1",
+        sourceIssueIdentifier: "TEST-2",
+        targetIssueId: "issue-1",
+        targetIssueIdentifier: "ENG-1",
+        type: "blocks",
+        dependency: "Blocks parent issue ENG-1",
+        dedupeKey: `issue-breakdown-parent-relation:${planId}:0`,
+        sourceProposedIssueIndex: 0,
+        targetProposedIssueIndex: -1,
+      },
+    });
+    await store.enqueueOnce({
+      idempotencyKey: commentKey,
+      kind: "comment",
+      issueId: "issue-1",
+      runId: "run-plan-1",
+      payload: {
+        body: "Created child issues",
+        dedupeKey: `issue-breakdown-children:${planId}`,
+        issueBreakdownPlanId: planId,
+      },
+    });
+    await store.enqueueOnce({
+      idempotencyKey: transitionKey,
+      kind: "transition",
+      issueId: "issue-1",
+      runId: "run-plan-1",
+      payload: {
+        fromStates: ["In Progress"],
+        toState: "In Review",
+        reason: "Legacy transition without explicit plan metadata",
+      },
+    });
+    const processor = new WritebackProcessor(
+      store,
+      writer,
+      new StructuredLogger(() => undefined),
+      300_000,
+      lifecycleStore,
+      false,
+      freshnessGuard(parentIssue, config),
+    );
+
+    await processor.processDue({ idempotencyKeys: [transitionKey] });
+
+    await expect(store.get(transitionKey)).resolves.toMatchObject({
+      status: "retrying",
+      lastError: expect.stringContaining(ISSUE_BREAKDOWN_FINALIZATION_PENDING_REASON),
+    });
+    expect(writer.transitions).toEqual([]);
+
+    const relation = await store.get(relationKey);
+    if (!relation) throw new Error("missing relation fixture");
+    await store.markSucceeded(relation, { status: "applied" });
+    await makeWritebackDue(store, transitionKey);
+    await processor.processDue({ idempotencyKeys: [transitionKey] });
+
+    await expect(store.get(transitionKey)).resolves.toMatchObject({
+      status: "retrying",
+      lastError: expect.stringContaining(commentKey),
+    });
+    expect(writer.transitions).toEqual([]);
+
+    const comment = await store.get(commentKey);
+    if (!comment) throw new Error("missing comment fixture");
+    await store.markSucceeded(comment, { status: "applied" });
+    await makeWritebackDue(store, transitionKey);
+    await processor.processDue({ idempotencyKeys: [transitionKey] });
+
+    await expect(store.get(transitionKey)).resolves.toMatchObject({ status: "succeeded" });
+    expect(writer.transitions).toHaveLength(1);
+  });
+
   it("does not treat ordinary comments as issue breakdown parent comments", async () => {
     const store = new FileWritebackOutboxStore(root);
     const writer = new FakeWriter();
@@ -1415,6 +1697,163 @@ describe("SqliteWritebackOutboxStore", () => {
     expect(claims.flat()).toHaveLength(1);
     expect(claims.flat()[0]).toMatchObject({ idempotencyKey: operation.idempotencyKey, status: "in_flight" });
     await expect(seedStore.get(operation.idempotencyKey)).resolves.toMatchObject({ status: "in_flight" });
+  });
+
+  it("recovers expired in-flight triage writebacks after a processor restart without stealing a live claim", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+      const commentKey = "comment:issue-1:triage:restart-report";
+      const transitionKey =
+        "transition:issue-1:triage:restart-report:In Progress";
+      const lifecycle = {
+        issueTriageReports: [
+          {
+            id: "restart-report",
+            writebackOperationKeys: [commentKey, transitionKey],
+            supersededAt: null,
+          },
+        ],
+      } as unknown as IssueLifecycleRecord;
+      const seedStore = track(new SqliteWritebackOutboxStore(root));
+      await seedStore.enqueueOnce({
+        idempotencyKey: commentKey,
+        kind: "comment",
+        issueId: "issue-1",
+        lifecycleBinding: {
+          kind: "issue_triage_report",
+          recordId: "restart-report",
+        },
+        payload: {
+          body: "Full triage disposition after restart",
+          dedupeKey: "restart-report",
+        },
+      });
+      await seedStore.enqueueOnce({
+        idempotencyKey: transitionKey,
+        kind: "transition",
+        issueId: "issue-1",
+        lifecycleBinding: {
+          kind: "issue_triage_report",
+          recordId: "restart-report",
+        },
+        payload: {
+          fromStates: ["In Review"],
+          toState: "In Progress",
+        },
+      });
+      await expect(seedStore.claimDue()).resolves.toHaveLength(2);
+
+      const recoveryStore = track(new SqliteWritebackOutboxStore(root));
+      const writer = new FakeWriter();
+      const processor = new WritebackProcessor(
+        recoveryStore,
+        writer,
+        new StructuredLogger(() => undefined),
+        300_000,
+        { get: async () => lifecycle },
+      );
+
+      await processor.processDue();
+
+      await expect(recoveryStore.get(commentKey)).resolves.toMatchObject({
+        status: "in_flight",
+      });
+      await expect(recoveryStore.get(transitionKey)).resolves.toMatchObject({
+        status: "in_flight",
+      });
+      expect(writer.comments).toHaveLength(0);
+      expect(writer.transitions).toHaveLength(0);
+
+      vi.advanceTimersByTime(WRITEBACK_IN_FLIGHT_LEASE_MS + 1);
+      await processor.processDue();
+
+      await expect(recoveryStore.get(commentKey)).resolves.toMatchObject({
+        status: "succeeded",
+        attempt: 1,
+      });
+      await expect(recoveryStore.get(transitionKey)).resolves.toMatchObject({
+        status: "succeeded",
+        attempt: 1,
+      });
+      expect(writer.comments).toHaveLength(1);
+      expect(writer.transitions).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("recovers an expired in-flight breakdown child creation through its durable plan guard", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+      const config = testConfig(root);
+      const parentIssue = issue({
+        identifier: "ENG-1",
+        labels: ["planning"],
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      });
+      const operationKey = "issue-create:issue-1:plan-1:0:restart-hash";
+      const operation: NewWritebackOperation = {
+        idempotencyKey: operationKey,
+        kind: "issue_create",
+        issueId: "issue-1",
+        runId: "run-plan-1",
+        payload: {
+          parentIssueId: "issue-1",
+          title: "Recovered child issue",
+          description: agentEligibleIssueContract(),
+          acceptanceCriteria: ["Done"],
+          requestedLabels: ["planning"],
+          dependencies: [],
+          dedupeKey: "issue-breakdown:plan-1:0:restart-hash",
+          payloadHash: "restart-hash",
+          planId: "plan-1",
+          proposedIssueIndex: 0,
+        },
+      };
+      const lifecycleStore = {
+        get: async () =>
+          lifecycleWithIssueBreakdownPlan({
+            operationKeys: [operationKey],
+            issue: parentIssue,
+            config,
+          }),
+      };
+      const seedStore = track(new SqliteWritebackOutboxStore(root));
+      await seedStore.enqueueOnce(operation);
+      await expect(seedStore.claimDue()).resolves.toMatchObject([
+        { idempotencyKey: operationKey, status: "in_flight" },
+      ]);
+
+      vi.advanceTimersByTime(WRITEBACK_IN_FLIGHT_LEASE_MS + 1);
+      const recoveryStore = track(new SqliteWritebackOutboxStore(root));
+      const writer = new FakeWriter();
+      const processor = new WritebackProcessor(
+        recoveryStore,
+        writer,
+        new StructuredLogger(() => undefined),
+        300_000,
+        lifecycleStore,
+        false,
+        freshnessGuard(parentIssue, config),
+      );
+
+      await processor.processDue();
+
+      await expect(recoveryStore.get(operationKey)).resolves.toMatchObject({
+        status: "succeeded",
+        attempt: 1,
+        resultEvidence: {
+          kind: "issue_create",
+          issueCreateStatus: "created",
+          issue: { id: "child-1", identifier: "TEST-2" },
+        },
+      });
+      expect(writer.issueCreates).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("closes the backing store through WritebackProcessor", async () => {
@@ -1670,6 +2109,7 @@ function createdIssueRefForOperation(operation: IssueCreateWriteback): IssueBrea
 }
 
 function lifecycleWithIssueBreakdownPlan(overrides: {
+  planId?: string;
   operationKeys: string[];
   issue: Issue;
   config: ServiceConfig;
@@ -1677,14 +2117,15 @@ function lifecycleWithIssueBreakdownPlan(overrides: {
   createdIssueRefs?: IssueBreakdownCreatedIssueRef[];
 }): IssueLifecycleRecord {
   const lifecycle = lifecycleWithReports({ lastCompletionReportId: "report-1", completionReports: [] });
+  const planId = overrides.planId ?? "plan-1";
   return {
     ...lifecycle,
     phase: "implementation",
     lastCompletionReportId: null,
-    lastIssueBreakdownPlanId: "plan-1",
+    lastIssueBreakdownPlanId: planId,
     issueBreakdownPlans: [
       {
-        id: "plan-1",
+        id: planId,
         idempotencyKey: "plan-key",
         requestHash: "request-hash",
         runId: "run-plan-1",
@@ -1767,4 +2208,10 @@ function createdIssueRef(): IssueBreakdownCreatedIssueRef {
     identifier: "TEST-2",
     url: "https://linear.test/TEST-2",
   };
+}
+
+async function makeWritebackDue(store: FileWritebackOutboxStore, idempotencyKey: string): Promise<void> {
+  const record = await store.get(idempotencyKey);
+  if (!record) throw new Error(`missing writeback fixture ${idempotencyKey}`);
+  await store.markRetry(record, record.lastError ?? "waiting for prerequisite", "2000-01-01T00:00:00.000Z");
 }

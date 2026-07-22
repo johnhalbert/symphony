@@ -19,6 +19,7 @@ import {
   planMergeGateRepairWritebacks,
   planPullRequestHandoffWritebacks,
   planReviewFailWritebacks,
+  planReviewFailureCeilingTriageWritebacks,
   planReviewBlockedWritebacks,
   planReviewPassWritebacks,
 } from "../src/core/writeback/TransitionPolicy.js";
@@ -599,6 +600,35 @@ describe("TransitionPolicy review-loop planners", () => {
     expect(commentBody(operations, 0)).not.toContain("Inspect the latest worker output and reviewer feedback");
   });
 
+  it("keeps a review ceiling in review while automated triage is pending", () => {
+    const config = reviewLoopConfig();
+    config.issueTriage.enabled = true;
+
+    const operations = planReviewFailureCeilingTriageWritebacks(
+      {
+        issue: issue({ state: "In Review" }),
+        runId: "review-run-3",
+        reason: "max reviewer failures reached (3/3)",
+        reviewRound: 3,
+        maxReviewRounds: 3,
+      },
+      config,
+    );
+
+    expect(operations).toHaveLength(1);
+    expect(operations[0]).toMatchObject({
+      idempotencyKey: "comment:issue-1:review-run-3:review-ceiling-triage",
+      kind: "comment",
+    });
+    expect(commentBody(operations, 0)).toContain(
+      "Status: paused in review, automated triage pending",
+    );
+    expect(commentBody(operations, 0)).toContain(
+      "Linear Blocked is reserved for work that cannot continue without external or human action",
+    );
+    expect(operations.some((operation) => operation.kind === "transition")).toBe(false);
+  });
+
   it("plans blocked escalation transitions from PR handoff states", () => {
     const config = reviewLoopConfig();
     config.tracker.handoffStates = ["Human Review"];
@@ -643,8 +673,11 @@ describe("TransitionPolicy review-loop planners", () => {
     expect(commentBody(operations, 0)).toContain("left the issue state unchanged");
   });
 
-  it("plans issue triage report comments", () => {
+  it("routes planner-owned triage when planner application is available", () => {
     const config = reviewLoopConfig();
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.issueBreakdown.applyToLinear.autoApply = true;
     const report: IssueTriageReportRecord = {
       id: "issue-triage-report:issue-1:triage-1",
       idempotencyKey: "triage-1",
@@ -682,7 +715,7 @@ describe("TransitionPolicy review-loop planners", () => {
       config,
     );
 
-    expect(operations).toHaveLength(1);
+    expect(operations).toHaveLength(2);
     expect(operations[0]).toMatchObject({
       idempotencyKey: "comment:issue-1:issue-triage:triage-1",
       kind: "comment",
@@ -693,20 +726,319 @@ describe("TransitionPolicy review-loop planners", () => {
       },
     });
     expect(commentBody(operations, 0)).toContain("## Symphony Issue Triage");
-    expect(commentBody(operations, 0)).toContain("Status: triage complete, human action required");
+    expect(commentBody(operations, 0)).toContain("Status: triage complete, automated recovery scheduled");
     expect(commentBody(operations, 0)).toContain("Blocked reason: max reviewer failures reached (3/3)");
     expect(commentBody(operations, 0)).toContain("### 1. under_specified_needs_decomposition");
     expect(commentBody(operations, 0)).toContain("Confidence: high");
     expect(commentBody(operations, 0)).toContain("Review failures exposed hidden sibling scope.");
     expect(commentBody(operations, 0)).toContain("- review-verdict:issue-1:verdict-3 found sibling path");
-    expect(commentBody(operations, 0)).toContain("Recommended human action:");
+    expect(commentBody(operations, 0)).toContain("Automated recovery action:");
     expect(commentBody(operations, 0)).toContain(report.recommendedAction);
-    expect(commentBody(operations, 0)).toContain("Operator next-action matrix:");
-    expect(commentBody(operations, 0)).toContain("| Action/status | Symphony reaction | When to use | Expected outcome |");
-    expect(commentBody(operations, 0)).toContain("| Leave in Blocked | Symphony does not dispatch more issue work.");
-    expect(commentBody(operations, 0)).toContain("| Move to In Progress | Symphony resets the blocked failure budget");
-    expect(commentBody(operations, 0)).toContain("| Move to Ready to Merge | Symphony resets the merge-gate failure budget");
-    expect(commentBody(operations, 0)).toContain("| CLI: agent run --stage worker --force --ignore-state | Symphony resets the blocked failure budget");
+    expect(commentBody(operations, 0)).toContain("Transitioning to In Progress");
+    expect(operations[1]).toMatchObject({
+      idempotencyKey:
+        "transition:issue-1:issue-triage:triage-1:automated-recovery:In_Progress",
+      kind: "transition",
+      payload: {
+        toState: "In Progress",
+        reason: "Symphony triage identified machine-owned recovery",
+      },
+    });
+
+    const unavailableConfig = reviewLoopConfig();
+    const unavailable = planIssueTriageReportWritebacks(
+      {
+        issue: issue({ state: "In Review" }),
+        report,
+        blockedReason: "max reviewer failures reached (3/3)",
+      },
+      unavailableConfig,
+    );
+    expect(commentBody(unavailable, 0)).toContain(
+      "Status: triage complete, human or external action required",
+    );
+    expect(unavailable[1]).toMatchObject({
+      kind: "transition",
+      payload: {
+        toState: "Blocked",
+        reason: "Symphony triage requires human or external action",
+      },
+    });
+  });
+
+  it("routes worker-owned triage when durable worker dispatch guardrails permit it", () => {
+    const config = reviewLoopConfig();
+    const report = workerRepairTriageReport("worker-available");
+
+    const operations = planIssueTriageReportWritebacks(
+      {
+        issue: issue({ state: "In Review" }),
+        report,
+        blockedReason: "max reviewer failures reached (3/3)",
+      },
+      config,
+    );
+
+    expect(operations).toHaveLength(2);
+    expect(commentBody(operations, 0)).toContain(
+      "Status: triage complete, automated recovery scheduled",
+    );
+    expect(operations[1]).toMatchObject({
+      kind: "transition",
+      payload: {
+        toState: "In Progress",
+        reason: "Symphony triage identified machine-owned recovery",
+      },
+    });
+  });
+
+  it("keeps worker-owned triage blocked when the issue is not assigned to a worker", () => {
+    const config = reviewLoopConfig();
+
+    const operations = planIssueTriageReportWritebacks(
+      {
+        issue: issue({ state: "In Review", assignedToWorker: false }),
+        report: workerRepairTriageReport("worker-unassigned"),
+        blockedReason: "max reviewer failures reached (3/3)",
+      },
+      config,
+    );
+
+    expect(commentBody(operations, 0)).toContain(
+      "Status: triage complete, human or external action required",
+    );
+    expect(operations[1]).toMatchObject({
+      kind: "transition",
+      payload: {
+        toState: "Blocked",
+        reason: "Symphony triage requires human or external action",
+      },
+    });
+  });
+
+  it("keeps worker-owned triage blocked when a worker exclusion label applies", () => {
+    const config = reviewLoopConfig();
+    config.agent.workerExcludeLabels = ["review-only"];
+
+    const operations = planIssueTriageReportWritebacks(
+      {
+        issue: issue({ state: "In Review", labels: ["Review-Only"] }),
+        report: workerRepairTriageReport("worker-excluded"),
+        blockedReason: "max reviewer failures reached (3/3)",
+      },
+      config,
+    );
+
+    expect(commentBody(operations, 0)).toContain(
+      "Status: triage complete, human or external action required",
+    );
+    expect(operations[1]).toMatchObject({
+      kind: "transition",
+      payload: {
+        toState: "Blocked",
+        reason: "Symphony triage requires human or external action",
+      },
+    });
+  });
+
+  it("keeps worker-owned triage blocked when issue breakdown planning must run first", () => {
+    const config = reviewLoopConfig();
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.planningLabels = ["planning"];
+
+    const operations = planIssueTriageReportWritebacks(
+      {
+        issue: issue({ state: "In Review", labels: ["Planning"] }),
+        report: workerRepairTriageReport("worker-planning-gated"),
+        blockedReason: "max reviewer failures reached (3/3)",
+      },
+      config,
+    );
+
+    expect(commentBody(operations, 0)).toContain(
+      "Status: triage complete, human or external action required",
+    );
+    expect(operations[1]).toMatchObject({
+      kind: "transition",
+      payload: {
+        toState: "Blocked",
+        reason: "Symphony triage requires human or external action",
+      },
+    });
+  });
+
+  it("selects planner recovery when a planning-labeled worker blocker has no fresh plan", () => {
+    const config = reviewLoopConfig();
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.planningLabels = ["planning"];
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.issueBreakdown.applyToLinear.autoApply = true;
+
+    const operations = planIssueTriageReportWritebacks(
+      {
+        issue: issue({ state: "In Review", labels: ["Planning"] }),
+        report: workerRepairTriageReport("worker-planner-prerequisite"),
+        blockedReason: "max reviewer failures reached (3/3)",
+        hasFreshIssueBreakdownPlan: false,
+      },
+      config,
+    );
+
+    expect(commentBody(operations, 0)).toContain(
+      "Status: triage complete, automated recovery scheduled",
+    );
+    expect(commentBody(operations, 0)).toContain(
+      "route planning before implementation",
+    );
+    expect(operations[1]).toMatchObject({
+      kind: "transition",
+      payload: {
+        toState: "In Progress",
+        reason: "Symphony triage identified machine-owned recovery",
+      },
+    });
+  });
+
+  it("routes planning-labeled worker recovery when an exact fresh breakdown plan already exists", () => {
+    const config = reviewLoopConfig();
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.planningLabels = ["planning"];
+
+    const operations = planIssueTriageReportWritebacks(
+      {
+        issue: issue({ state: "In Review", labels: ["Planning"] }),
+        report: workerRepairTriageReport("worker-planning-satisfied"),
+        blockedReason: "max reviewer failures reached (3/3)",
+        hasFreshIssueBreakdownPlan: true,
+      },
+      config,
+    );
+
+    expect(commentBody(operations, 0)).toContain(
+      "Status: triage complete, automated recovery scheduled",
+    );
+    expect(operations[1]).toMatchObject({
+      kind: "transition",
+      payload: {
+        toState: "In Progress",
+        reason: "Symphony triage identified machine-owned recovery",
+      },
+    });
+  });
+
+  it("does not route a worker onto a fresh plan owned by the Linear application workflow", () => {
+    const config = reviewLoopConfig();
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.planningLabels = ["planning"];
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.issueBreakdown.applyToLinear.autoApply = false;
+
+    const operations = planIssueTriageReportWritebacks(
+      {
+        issue: issue({ state: "In Review", labels: ["Planning"] }),
+        report: workerRepairTriageReport("worker-plan-application-required"),
+        blockedReason: "max reviewer failures reached (3/3)",
+        hasFreshIssueBreakdownPlan: true,
+        issueBreakdownPlanApplicationStatus: "not_requested",
+      },
+      config,
+    );
+
+    expect(commentBody(operations, 0)).toContain(
+      "Status: triage complete, human or external action required",
+    );
+    expect(operations[1]).toMatchObject({
+      kind: "transition",
+      payload: {
+        toState: "Blocked",
+        reason: "Symphony triage requires human or external action",
+      },
+    });
+  });
+
+  it("selects planner recovery for an auto-applied fresh Linear breakdown plan", () => {
+    const config = reviewLoopConfig();
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.planningLabels = ["planning"];
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.issueBreakdown.applyToLinear.autoApply = true;
+
+    const operations = planIssueTriageReportWritebacks(
+      {
+        issue: issue({ state: "In Review", labels: ["Planning"] }),
+        report: workerRepairTriageReport("worker-plan-auto-application"),
+        blockedReason: "max reviewer failures reached (3/3)",
+        hasFreshIssueBreakdownPlan: true,
+        issueBreakdownPlanApplicationStatus: "pending",
+      },
+      config,
+    );
+
+    expect(commentBody(operations, 0)).toContain(
+      "Status: triage complete, automated recovery scheduled",
+    );
+    expect(commentBody(operations, 0)).toContain(
+      "Symphony will reset the exhausted review budget and route planning before implementation",
+    );
+    expect(operations[1]).toMatchObject({
+      kind: "transition",
+      payload: {
+        toState: "In Progress",
+        reason: "Symphony triage identified machine-owned recovery",
+      },
+    });
+  });
+
+  it("moves an externally owned triage result to Blocked", () => {
+    const config = reviewLoopConfig();
+    const report: IssueTriageReportRecord = {
+      id: "issue-triage-report:issue-1:triage-operator",
+      idempotencyKey: "triage-operator",
+      requestHash: "request-hash-operator",
+      runId: "triage-run-operator",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      triggerFingerprint: "trigger-fingerprint-operator",
+      disposition: "manual_decision",
+      confidence: "high",
+      summary: "A product decision is required.",
+      evidence: ["The contract permits two incompatible outcomes."],
+      recommendedAction: "Choose the intended product behavior.",
+      blockers: [
+        {
+          kind: "manual_decision",
+          status: "active",
+          nextActor: "operator",
+          confidence: "high",
+          summary: "A product decision is required.",
+          evidence: ["The contract permits two incompatible outcomes."],
+          recommendedAction: "Choose the intended product behavior.",
+        },
+      ],
+      submittedAt: "2026-01-01T00:00:00.000Z",
+      writebackOperationKeys: [],
+    };
+
+    const operations = planIssueTriageReportWritebacks(
+      {
+        issue: issue({ state: "In Review" }),
+        report,
+        blockedReason: "max reviewer failures reached (3/3)",
+      },
+      config,
+    );
+
+    expect(operations).toHaveLength(2);
+    expect(commentBody(operations, 0)).toContain(
+      "Status: triage complete, human or external action required",
+    );
+    expect(operations[1]).toMatchObject({
+      kind: "transition",
+      payload: {
+        toState: "Blocked",
+        reason: "Symphony triage requires human or external action",
+      },
+    });
   });
 
   it("plans issue post-mortem report comments", () => {
@@ -1033,6 +1365,36 @@ function acceptedArtifactHandoffReport(reportId: string, idempotencyKey: string)
     branchName: "symphony/TEST-1",
     pullRequest: null,
     risks: [],
+  };
+}
+
+function workerRepairTriageReport(idSuffix: string): IssueTriageReportRecord {
+  return {
+    id: `issue-triage-report:issue-1:${idSuffix}`,
+    idempotencyKey: idSuffix,
+    requestHash: `request-hash-${idSuffix}`,
+    runId: `triage-run-${idSuffix}`,
+    issueId: "issue-1",
+    issueIdentifier: "TEST-1",
+    triggerFingerprint: `trigger-fingerprint-${idSuffix}`,
+    disposition: "implementation_repair",
+    confidence: "high",
+    summary: "The remaining defect is a bounded implementation repair.",
+    evidence: ["The latest reviewer finding is worker-owned."],
+    recommendedAction: "Repair the implementation and rerun review.",
+    blockers: [
+      {
+        kind: "implementation_unsatisfied_requirements",
+        status: "active",
+        nextActor: "worker",
+        confidence: "high",
+        summary: "The implementation does not satisfy one requirement.",
+        evidence: ["The latest reviewer finding reproduces the defect."],
+        recommendedAction: "Apply the bounded implementation repair.",
+      },
+    ],
+    submittedAt: "2026-01-01T00:00:00.000Z",
+    writebackOperationKeys: [],
   };
 }
 

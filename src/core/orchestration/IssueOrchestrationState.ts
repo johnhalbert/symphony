@@ -5,6 +5,7 @@ import type { IssueBaseRefObservation } from "../BaseRefVerification.js";
 import type { MergePolicyObservation } from "../merge/MergePolicyService.js";
 import type {
   IssueBreakdownPlanRecord,
+  IssueBreakdownPlanApplicationStatus,
   IssueAcceptedArtifactRecord,
   IssueBlockerProvenanceRecord,
   IssueCompletionReportRecord,
@@ -17,6 +18,7 @@ import type {
   IssuePreservedWorktreeStash,
   IssueReviewFeedbackRecord,
   IssueReviewVerdictRecord,
+  IssueTriageRecoveryDispositionRecord,
   IssueTriageReportRecord,
   IssueTriageBlockerRecord,
   IssueWorkspaceSeedRecord,
@@ -70,6 +72,7 @@ export type IssueTransitionKind =
   | "merge_policy_recover_already_merged_pull_request"
   | "complete_organizational_parent"
   | "reconcile_issue_triage_report_writeback"
+  | "reconcile_issue_breakdown_plan_application"
   | "reconcile_post_mortem_report_writeback"
   | "reconcile_completion_report_handoff"
   | "reconcile_completion_report_rejection"
@@ -207,7 +210,10 @@ export interface IssueCurrentFields {
   planningRetryDueAt: string | null;
   blockedReason: string | null;
   lastIssueBreakdownPlanId: string | null;
-  lastIssueBreakdownPlanApplicationStatus: string | null;
+  lastIssueBreakdownPlanApplicationStatus:
+    | IssueBreakdownPlanApplicationStatus
+    | null;
+  lastIssueBreakdownPlanSourceIssueTriageReportId: string | null;
   lastIssueBreakdownPlanIssueContentFingerprint: string | null;
   lastIssueBreakdownPlanConfigFingerprint: string | null;
   lastIssueBreakdownPlanSatisfiesCurrentValidation: boolean;
@@ -216,6 +222,7 @@ export interface IssueCurrentFields {
   lastIssueTriageReportId: string | null;
   lastIssueTriageReportTriggerFingerprint: string | null;
   lastIssueTriageReportWritebackOperationKeys: string[] | null;
+  lastIssueTriageRecoveryDisposition: IssueTriageRecoveryDispositionRecord | null;
   currentIssueTriageTriggerFingerprint: string | null;
   issueTriageCurrentTriggerReportIds: string[];
   latestIssueTriageReportBlockers: IssueTriageBlockerRecord[];
@@ -317,6 +324,16 @@ export interface IssueCurrentStateSnapshot extends IssueCurrentFields {
   manualStage: string | null;
   manualForceLabels: boolean;
   manualIgnoreState: boolean;
+  lastReviewVerdictDispositionWritebackStatus?:
+    | "not_required"
+    | "pending"
+    | "applied"
+    | "failed";
+  lastCompletionReportDispositionWritebackStatus?:
+    | "not_required"
+    | "pending"
+    | "applied"
+    | "failed";
   triggerRunId?: string | null;
   triggerReason?: string | null;
   retryAttempt?: number | null;

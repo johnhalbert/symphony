@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { ServiceConfig } from "./config/Config.js";
 import { SymphonyError } from "./errors.js";
+import { latestFreshIssueBreakdownPlan } from "./IssueBreakdownPlanService.js";
 import type {
   IssueTriageBlockerKind,
   IssueTriageBlockerNextActor,
@@ -10,13 +11,19 @@ import type {
   IssueTriageConfidence,
   IssueLifecycleRecord,
   IssueLifecycleStore,
+  IssueTriageRecoveryDispositionRecord,
   IssueTriageDisposition,
   IssueTriageReportRecord,
 } from "./persistence/IssueLifecycleStore.js";
 import { isSupersededLifecycleRecord } from "./persistence/IssueLifecycleStore.js";
 import type { RunTranscriptStore } from "./persistence/RunTranscriptStore.js";
 import type { Issue } from "./types.js";
-import { planIssueTriageReportWritebacks } from "./writeback/TransitionPolicy.js";
+import {
+  decideIssueTriageRecoveryDisposition,
+  decideIssueTriageRecoveryRoute,
+  planIssueTriageReportWritebacks,
+  type IssueTriageRecoveryRouteContext,
+} from "./writeback/TransitionPolicy.js";
 import type { WritebackOutboxStore } from "./writeback/WritebackOutbox.js";
 import { bindWritebackOperationToLifecycle } from "./writeback/WritebackOutbox.js";
 
@@ -201,15 +208,30 @@ export class IssueTriageService {
     }
     const triageEligible = context.manualDispatch === true
       ? shouldIssueTriageManualRun(existingLifecycle, this.options.config)
-      : shouldIssueTriageRun(existingLifecycle, this.options.config);
+      : shouldIssueTriageRun(
+          existingLifecycle,
+          this.options.config,
+          context.issue,
+        );
     if (!triageEligible) {
       throw new SymphonyError("invalid_request", "Issue triage is not currently eligible for this issue");
     }
 
-    const attemptsForTrigger = existingLifecycle.issueTriageReports.filter(
-      (report) => report.triggerFingerprint === parsed.triggerFingerprint && !isSupersededLifecycleRecord(report),
-    ).length;
-    if (context.manualDispatch !== true && attemptsForTrigger >= this.options.config.issueTriage.maxAttemptsPerTrigger) {
+    const attemptsForTrigger = issueTriageAutomaticAttemptsForTrigger(
+      existingLifecycle,
+      parsed.triggerFingerprint,
+    );
+    const retriageReason = issueTriageRecoveryRetriageReason(
+      existingLifecycle,
+      context.issue,
+      this.options.config,
+    );
+    if (
+      context.manualDispatch !== true &&
+      retriageReason === null &&
+      attemptsForTrigger >=
+        this.options.config.issueTriage.maxAttemptsPerTrigger
+    ) {
       throw new SymphonyError("conflict", "Issue triage report already exists for this blocked trigger", {
         triggerFingerprint: parsed.triggerFingerprint,
         attemptsForTrigger,
@@ -218,7 +240,7 @@ export class IssueTriageService {
     }
 
     const submittedAt = new Date().toISOString();
-    const reportBase: IssueTriageReportRecord = {
+    const reportDraft: IssueTriageReportRecord = {
       id: issueTriageReportIdFor(context.issue.id, parsed.idempotencyKey),
       idempotencyKey: parsed.idempotencyKey,
       requestHash,
@@ -239,12 +261,32 @@ export class IssueTriageService {
       supersededBy: null,
       supersededReason: null,
     };
+    const freshIssueBreakdownPlan = latestFreshIssueBreakdownPlan(
+      existingLifecycle,
+      context.issue,
+      this.options.config,
+    );
+    const writebackContext = {
+      issue: context.issue,
+      report: reportDraft,
+      blockedReason: existingLifecycle.blockedReason,
+      planningFailureCount: existingLifecycle.planningFailureCount,
+      incompleteTurnCount: existingLifecycle.incompleteTurnCount,
+      hasActiveMergeConflict:
+        existingLifecycle.mergeConflict?.status === "open",
+      hasFreshIssueBreakdownPlan: freshIssueBreakdownPlan !== null,
+      issueBreakdownPlanApplicationStatus:
+        freshIssueBreakdownPlan?.applicationStatus ?? null,
+    };
+    const reportBase: IssueTriageReportRecord = {
+      ...reportDraft,
+      recoveryDisposition: decideIssueTriageRecoveryDisposition(
+        writebackContext,
+        this.options.config,
+      ),
+    };
     const operations = planIssueTriageReportWritebacks(
-      {
-        issue: context.issue,
-        report: reportBase,
-        blockedReason: existingLifecycle.blockedReason,
-      },
+      { ...writebackContext, report: reportBase },
       this.options.config,
     );
     const writebackOperationKeys: string[] = [];
@@ -295,14 +337,117 @@ export function parseIssueTriageReport(input: unknown): IssueTriageReportInput {
 export function shouldIssueTriageRun(
   lifecycle: IssueLifecycleRecord | null | undefined,
   config: ServiceConfig,
+  issue?: Issue,
 ): lifecycle is IssueLifecycleRecord {
   if (!config.issueTriage.enabled || !lifecycle || !isIssueTriageLifecyclePhase(lifecycle)) return false;
   if (!isIssueTriageBlockedReason(lifecycle.blockedReason)) return false;
   const fingerprint = issueTriageTriggerFingerprint(lifecycle);
-  const attemptsForTrigger = lifecycle.issueTriageReports.filter(
-    (report) => report.triggerFingerprint === fingerprint && !isSupersededLifecycleRecord(report),
+  const attemptsForTrigger = issueTriageAutomaticAttemptsForTrigger(
+    lifecycle,
+    fingerprint,
+  );
+  return (
+    attemptsForTrigger < config.issueTriage.maxAttemptsPerTrigger ||
+    (issue !== undefined &&
+      issueTriageRecoveryRetriageReason(lifecycle, issue, config) !== null)
+  );
+}
+
+export function issueTriageReportCountsTowardAutomaticAttemptLimit(
+  report: IssueTriageReportRecord,
+): boolean {
+  return report.recoveryDisposition !== null &&
+    report.recoveryDisposition !== undefined;
+}
+
+export function issueTriageAutomaticAttemptsForTrigger(
+  lifecycle: IssueLifecycleRecord,
+  triggerFingerprint: string,
+): number {
+  return lifecycle.issueTriageReports.filter(
+    (report) =>
+      report.triggerFingerprint === triggerFingerprint &&
+      !isSupersededLifecycleRecord(report) &&
+      issueTriageReportCountsTowardAutomaticAttemptLimit(report),
   ).length;
-  return attemptsForTrigger < config.issueTriage.maxAttemptsPerTrigger;
+}
+
+export type IssueTriageRecoveryRetriageReason =
+  | "external_recovery_became_automated"
+  | "automated_recovery_route_changed"
+  | "automated_recovery_target_state_drift";
+
+export interface IssueTriageRecoveryRetriageContext
+  extends IssueTriageRecoveryRouteContext {
+  previousDisposition: IssueTriageRecoveryDispositionRecord | null;
+}
+
+export function issueTriageRecoveryRetriageReasonForContext(
+  context: IssueTriageRecoveryRetriageContext,
+  config: ServiceConfig,
+): IssueTriageRecoveryRetriageReason | null {
+  if (isStateIn(context.issue.state, config.tracker.terminalStates)) return null;
+  const previous = context.previousDisposition;
+  if (previous === null) return null;
+
+  const current = decideIssueTriageRecoveryRoute(context, config);
+  if (previous.mode === "external" && current.mode === "automated") {
+    return "external_recovery_became_automated";
+  }
+  if (
+    previous.mode === "automated" &&
+    current.mode === "automated" &&
+    (previous.nextActor !== current.nextActor ||
+      (previous.targetState === null || current.targetState === null
+        ? previous.targetState !== current.targetState
+        : !sameState(previous.targetState, current.targetState)))
+  ) {
+    return "automated_recovery_route_changed";
+  }
+  if (
+    previous.mode === "automated" &&
+    (previous.transitionStatus === "applied" ||
+      previous.transitionStatus === "not_required") &&
+    previous.targetState !== null &&
+    !sameState(context.issue.state, previous.targetState) &&
+    current.mode === "automated"
+  ) {
+    return "automated_recovery_target_state_drift";
+  }
+  return null;
+}
+
+/**
+ * Re-evaluates only Symphony's recovery route; it does not reinterpret the
+ * agent's blocker classification. A changed route can bypass the per-trigger
+ * attempt cap once, while an unchanged external result remains capped.
+ */
+export function issueTriageRecoveryRetriageReason(
+  lifecycle: IssueLifecycleRecord | null | undefined,
+  issue: Issue,
+  config: ServiceConfig,
+): IssueTriageRecoveryRetriageReason | null {
+  if (!lifecycle) return null;
+  const report = latestIssueTriageReportForFingerprint(
+    lifecycle,
+    issueTriageTriggerFingerprint(lifecycle),
+  );
+  if (!report) return null;
+  const freshPlan = latestFreshIssueBreakdownPlan(lifecycle, issue, config);
+  return issueTriageRecoveryRetriageReasonForContext(
+    {
+      issue,
+      blockers: report.blockers,
+      previousDisposition: report.recoveryDisposition ?? null,
+      planningFailureCount: lifecycle.planningFailureCount,
+      incompleteTurnCount: lifecycle.incompleteTurnCount,
+      hasActiveMergeConflict: lifecycle.mergeConflict?.status === "open",
+      hasFreshIssueBreakdownPlan: freshPlan !== null,
+      issueBreakdownPlanApplicationStatus:
+        freshPlan?.applicationStatus ?? null,
+    },
+    config,
+  );
 }
 
 export function shouldIssueTriageManualRun(
@@ -330,7 +475,10 @@ export function isReviewerBlockedTriageReason(reason: string | null | undefined)
 
 function isIssueTriageLifecyclePhase(lifecycle: IssueLifecycleRecord): boolean {
   if (lifecycle.phase === "blocked") return true;
-  return lifecycle.phase === "review" && isReviewerBlockedTriageReason(lifecycle.blockedReason);
+  return (
+    lifecycle.phase === "review" &&
+    isIssueTriageBlockedReason(lifecycle.blockedReason)
+  );
 }
 
 export function latestIssueTriageReportForFingerprint(
@@ -675,6 +823,14 @@ function normalizeString(value: string): string {
 
 function normalizeStringList(values: readonly string[]): string[] {
   return values.map((value) => normalizeString(value)).sort();
+}
+
+function isStateIn(state: string, states: readonly string[]): boolean {
+  return states.some((candidate) => sameState(state, candidate));
+}
+
+function sameState(left: string, right: string): boolean {
+  return left.trim().toLowerCase() === right.trim().toLowerCase();
 }
 
 function stableJson(value: unknown): string {

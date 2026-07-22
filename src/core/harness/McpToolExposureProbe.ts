@@ -1179,6 +1179,7 @@ async function writeRoleContexts(ctx: AgentRunContext): Promise<void> {
       issue: ctx.issue,
       activeRunId: null,
       role: "planner",
+      sourceIssueTriageReportId: ctx.sourceIssueTriageReportId ?? null,
       workspacePath: ctx.workspace.path,
       workspace: ctx.workspace,
       phase: "issue_breakdown",

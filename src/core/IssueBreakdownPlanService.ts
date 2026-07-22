@@ -47,6 +47,7 @@ export interface IssueBreakdownPlanActiveContext {
   activeRunId: string;
   role: "planner" | "worker";
   phase: "issue_breakdown";
+  sourceIssueTriageReportId?: string | null;
 }
 
 export interface IssueBreakdownPlanServiceOptions {
@@ -115,6 +116,8 @@ export class IssueBreakdownPlanService {
       runId: parsed.runId,
       issueId: context.issue.id,
       issueIdentifier: context.issue.identifier,
+      sourceIssueTriageReportId:
+        context.sourceIssueTriageReportId ?? null,
       finalDisposition: parsed.finalDisposition,
       summary: parsed.summary,
       proposedIssues: parsed.proposedIssues,
@@ -224,6 +227,13 @@ export function issueContentFingerprint(issue: Issue): string {
     .digest("hex");
 }
 
+export function issueContentFingerprintForBreakdownPlan(
+  issue: Issue,
+  plan: IssueBreakdownPlanRecord,
+): string {
+  return issueContentFingerprint(issueWithoutPlanCreatedBlockers(issue, plan));
+}
+
 export function issueBreakdownPlanFingerprintsMatch(
   plan: IssueBreakdownPlanRecord,
   issue: Issue,
@@ -233,7 +243,7 @@ export function issueBreakdownPlanFingerprintsMatch(
   if (plan.issueContentFingerprint.length === 0) return false;
   if (
     plan.issueContentFingerprint !==
-    issueContentFingerprint(issueWithoutPlanCreatedBlockers(issue, plan))
+    issueContentFingerprintForBreakdownPlan(issue, plan)
   ) {
     return false;
   }

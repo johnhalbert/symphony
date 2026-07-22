@@ -81,7 +81,9 @@ The current dogfood workflow has `github.pr_handoff.enabled: false`, so `Human R
 
 Reviewer pass uses the configured `Ready to Merge` Linear state in the current dogfood loop. The reviewer records a structured pass verdict with supporting evidence, such as a Linear comment or PR review, and Symphony transitions the issue from `In Review` to `Ready to Merge`.
 
-Review failures continue through the review loop. Policy exhaustion, repeated incomplete worker turns, or other human-required escalation moves the issue to `Blocked`.
+Review failures continue through the review loop. Reviewer-failure budget exhaustion pauses the lifecycle internally while the issue remains `In Review` for read-only triage. Triage returns worker- or planner-owned recovery to `In Progress` with a fresh budget; only human, external, or otherwise non-automatable results move to `Blocked`. Repeated incomplete worker turns and other escalation paths move to `Blocked` only when their configured policy requires operator intervention.
+
+The lifecycle store preserves structured recovery provenance on each triage report: automated versus external routing, selected actor, target state, transition operation key, and observed transition outcome. A triage-requested breakdown plan also stores its source report ID. Pending plan application is reconciled after restarts, and the parent transition cannot run ahead of its registered relation and summary writebacks.
 
 ## GitHub PR Review Feedback
 

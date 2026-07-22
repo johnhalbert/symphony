@@ -8,7 +8,7 @@ Submit an exhaustive `blockers` list. Include active blockers and downstream blo
 
 Lower-precedence PR, CI, merge, or review-gate blockers must not mask active implementation, validation, decomposition, or orchestration-context blockers. If the latest failed review is not superseded by a newer completion report, treat its unsatisfied findings as active.
 
-Prefer `under_specified_needs_decomposition` when review history shows scope discovery: repeated review failures across distinct sibling surfaces, hidden matrix axes, or reviewer discovery findings that suggest planner decomposition. Keep the latest concrete implementation defect as a separate blocker when useful, but do not collapse a broad scope-discovery pattern into another narrow repair loop.
+Use `under_specified_needs_decomposition` only when the current issue contract is genuinely ambiguous or contains multiple independently deliverable workstreams that should become blocking children. Repeated findings, distinct owned surfaces, or newly exercised matrix cases do not by themselves require decomposition when the written contract already owns the invariant and the remaining repair is bounded; classify those as implementation and validation repair so Symphony can resume the worker automatically.
 
 Do not classify an already-implemented current issue as `under_specified_needs_decomposition` merely because validation is waiting on behavior owned by an existing sibling issue. That is a sequencing or dependency-graph blocker: name the existing owner, recommend linking/waiting or correcting the dependency direction, and do not trigger child creation that repeats the current branch's completed work.
 

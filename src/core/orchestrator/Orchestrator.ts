@@ -11,6 +11,7 @@ import {
   type IssueBaseRefObservation,
 } from "../BaseRefVerification.js";
 import { SymphonyError, errorMessage } from "../errors.js";
+import { evaluateWorkerDispatchCapability } from "../IssueDispatchCapability.js";
 import {
   activateBlockerProvenancePatch,
   activeBlockerProvenance,
@@ -84,6 +85,7 @@ import {
   ISSUE_TRIAGE_BLOCKER_KINDS,
   ISSUE_TRIAGE_BLOCKER_NEXT_ACTORS,
   ISSUE_TRIAGE_BLOCKER_STATUSES,
+  issueTriageRecoveryRetriageReasonForContext,
   issueTriageTriggerFingerprint,
   isIssueTriageBlockedReason,
   isReviewerBlockedTriageReason,
@@ -198,6 +200,8 @@ import {
   type IssueWorkspaceSeedRecord,
   type IssueTriageBlockerKind,
   type IssueTriageBlockerRecord,
+  type IssueTriageReportWritebackStatus,
+  type IssueTriageRecoveryTransitionStatus,
   type IssueTriageReportRecord,
 } from "../persistence/IssueLifecycleStore.js";
 import {
@@ -468,6 +472,7 @@ export interface RunningEntry {
   issueBreakdownPlanAccepted: boolean;
   issueTriageReportAccepted: boolean;
   issuePostMortemReportAccepted: boolean;
+  automatedTriagePlannerRecoveryReportId: string | null;
   pullRequestHandoffAccepted: boolean;
   reviewVerdictAccepted: boolean;
   reviewEvidence: ReviewerDispatchEvidence | null;
@@ -539,6 +544,7 @@ interface OrchestratorTransitionContext {
   dispatch: DispatchTransitionScratch;
   baseRef: BaseRefTransitionScratch;
   reportWriteback: ReportWritebackTransitionScratch;
+  breakdownApplication: BreakdownApplicationTransitionScratch;
   publicationApproval: PublicationApprovalTransitionScratch;
   termination: TerminationTransitionScratch;
   retry: RetryTransitionScratch;
@@ -573,6 +579,20 @@ interface ReportWritebackTransitionScratch {
   postMortemReport?: IssuePostMortemReportRecord;
   operations?: NewWritebackOperation[];
   operationKeys?: string[];
+  writebacksApplied?: boolean;
+  writebackFailureReason?: string;
+  issueTriageReportWritebackStatus?: IssueTriageReportWritebackStatus;
+  issueTriageRecoveryTransitionStatus?: IssueTriageRecoveryTransitionStatus;
+}
+
+type DispositionWritebackStatus =
+  | "not_required"
+  | "pending"
+  | "applied"
+  | "failed";
+
+interface BreakdownApplicationTransitionScratch {
+  lifecycle?: IssueLifecycleRecord;
 }
 
 interface PublicationApprovalTransitionScratch {
@@ -1031,6 +1051,7 @@ export class Orchestrator {
   private readonly promptRenderer = new PromptRenderer();
   private pollTimer: NodeJS.Timeout | null = null;
   private ticking = false;
+  private activeTickSettled: Promise<void> | null = null;
   private stopped = false;
   private endedRuntimeSeconds = 0;
   private readonly running = new Map<string, RunningEntry>();
@@ -1148,6 +1169,19 @@ export class Orchestrator {
           clearTimeout(timer);
           this.pollTimer = null;
         },
+      });
+    }
+    const activeTickSettled = this.activeTickSettled;
+    if (activeTickSettled !== null) {
+      await runShutdownAction({
+        logger: this.options.logger,
+        progress,
+        action: {
+          id: "orchestrator.tick.wait",
+          label: "waiting for active orchestrator tick to settle",
+          component: "orchestrator",
+        },
+        run: () => activeTickSettled,
       });
     }
     const retries = [...this.retryAttempts.values()];
@@ -2772,6 +2806,7 @@ export class Orchestrator {
       issueBreakdownPlanAccepted: false,
       issueTriageReportAccepted: false,
       issuePostMortemReportAccepted: false,
+      automatedTriagePlannerRecoveryReportId: null,
       pullRequestHandoffAccepted: false,
       reviewVerdictAccepted: false,
       reviewEvidence: null,
@@ -3112,7 +3147,13 @@ export class Orchestrator {
   private async tick(): Promise<void> {
     if (this.ticking || this.stopped) return;
     this.ticking = true;
+    let settleTick!: () => void;
+    const activeTickSettled = new Promise<void>((resolve) => {
+      settleTick = resolve;
+    });
+    this.activeTickSettled = activeTickSettled;
     try {
+      await this.options.writeback?.processDue();
       await this.reconcileRunningIssues();
       await this.reconcileMergeQueueLease();
       const providerGate = await this.activeProviderDispatchGate();
@@ -3137,12 +3178,24 @@ export class Orchestrator {
       });
     } finally {
       this.ticking = false;
+      settleTick();
+      if (this.activeTickSettled === activeTickSettled) {
+        this.activeTickSettled = null;
+      }
       this.scheduleTick(this.config.polling.intervalMs);
     }
   }
 
   private async processTickIssueCandidates(): Promise<void> {
     const excludedIssueIds = await this.tickIssueCandidateExcludedIssueIds();
+    for (const issue of sortIssuesForDispatch(
+      await this.fetchLifecycleRecoveryIssueCandidates(excludedIssueIds),
+    )) {
+      excludedIssueIds.add(issue.id);
+      await this.processTickIssueCandidate(issue, {
+        refreshBeforeTransition: false,
+      });
+    }
     if (typeof this.options.tracker.fetchIssueCandidatePageByFilter === "function") {
       const processedPaged =
         await this.processPagedTickIssueCandidateLanes(excludedIssueIds);
@@ -3155,6 +3208,58 @@ export class Orchestrator {
     for (const issue of sortIssuesForDispatch(candidates)) {
       await this.processTickIssueCandidate(issue);
     }
+  }
+
+  private async fetchLifecycleRecoveryIssueCandidates(
+    excludedIssueIds: ReadonlySet<string>,
+  ): Promise<Issue[]> {
+    if (!this.options.lifecycleStore) return [];
+    let issueIds: string[];
+    try {
+      issueIds = (await this.options.lifecycleStore.list())
+        .filter((lifecycle) => this.lifecycleNeedsUnfilteredTickRecovery(lifecycle))
+        .map((lifecycle) => lifecycle.issueId)
+        .filter((issueId) => !excludedIssueIds.has(issueId));
+    } catch (error) {
+      this.options.logger.warn("lifecycle recovery candidate scan failed", {
+        error: errorMessage(error),
+      });
+      return [];
+    }
+    if (issueIds.length === 0) return [];
+    try {
+      return await this.options.tracker.fetchIssueStatesByIds(issueIds);
+    } catch (error) {
+      this.options.logger.warn("lifecycle recovery candidate refresh failed", {
+        issue_ids: issueIds,
+        error: errorMessage(error),
+      });
+      return [];
+    }
+  }
+
+  private lifecycleNeedsUnfilteredTickRecovery(
+    lifecycle: IssueLifecycleRecord,
+  ): boolean {
+    if (lifecycle.phase === "blocked" || lifecycle.blockedReason !== null)
+      return true;
+    const plan = lifecycle.lastIssueBreakdownPlanId
+      ? (lifecycle.issueBreakdownPlans.find(
+          (candidate) => candidate.id === lifecycle.lastIssueBreakdownPlanId,
+        ) ?? null)
+      : null;
+    if (
+      this.config.issueBreakdown.enabled &&
+      this.config.issueBreakdown.applyToLinear.enabled &&
+      this.config.issueBreakdown.applyToLinear.autoApply &&
+      plan !== null &&
+      plan.applicationStatus !== "stale" &&
+      (plan.applicationStatus !== "applied" || lifecycle.phase !== "review")
+    ) {
+      return true;
+    }
+    const triageReport = latestIssueTriageReport(lifecycle);
+    return triageReport?.recoveryDisposition?.transitionStatus === "pending";
   }
 
   private async reconcileMergeQueueLease(): Promise<void> {
@@ -4911,6 +5016,16 @@ export class Orchestrator {
         ],
       },
       {
+        kind: "reconcile_issue_breakdown_plan_application",
+        actions: [
+          {
+            id: "reconcile_issue_breakdown_plan_application",
+            execute: (context) =>
+              this.reconcileIssueBreakdownPlanApplicationAction(context),
+          },
+        ],
+      },
+      {
         kind: "reconcile_post_mortem_report_writeback",
         actions: [
           {
@@ -5850,6 +5965,12 @@ export class Orchestrator {
       manualDispatch,
       context.transition.historySnapshotId,
     );
+    entry.automatedTriagePlannerRecoveryReportId =
+      role === "planner" &&
+      runPhase === "issue_breakdown" &&
+      context.transition.reason === "triage_issue_breakdown_required"
+        ? nonEmptyString(context.transition.lastIssueTriageReportId)
+        : null;
     entry.dependencyArtifactSeed = context.dispatch.dependencyArtifactSeed ?? null;
     entry.dependencyArtifact = context.dispatch.dependencyArtifact ?? null;
     context.dispatch.entry = entry;
@@ -5940,7 +6061,14 @@ export class Orchestrator {
   ) {
     const lifecycle =
       (await this.options.lifecycleStore?.get(context.issue.id)) ?? null;
-    if (!lifecycle || lifecycle.phase !== "blocked") {
+    if (
+      !lifecycle ||
+      (lifecycle.phase !== "blocked" &&
+        !(
+          lifecycle.phase === "review" &&
+          isIssueTriageBlockedReason(lifecycle.blockedReason)
+        ))
+    ) {
       return {
         status: "skipped" as const,
         stop: true,
@@ -5951,7 +6079,13 @@ export class Orchestrator {
       lifecycle,
       issueTriageTriggerFingerprint(lifecycle),
     );
-    if (!report || report.writebackOperationKeys.length > 0) {
+    const recoveryOutcomeReady =
+      report?.recoveryDisposition?.reportWritebackStatus === "pending" ||
+      report?.recoveryDisposition?.transitionStatus === "pending";
+    if (
+      !report ||
+      (report.writebackOperationKeys.length > 0 && !recoveryOutcomeReady)
+    ) {
       return {
         status: "skipped" as const,
         stop: true,
@@ -5979,6 +6113,24 @@ export class Orchestrator {
         stop: true,
         message: "Issue triage report was not loaded",
       };
+    if (report.writebackOperationKeys.length > 0) {
+      context.reportWriteback.operations = [];
+      context.reportWriteback.operationKeys = [
+        ...report.writebackOperationKeys,
+      ];
+      return {
+        details: {
+          reportId: report.id,
+          operationKeys: context.reportWriteback.operationKeys,
+          recoveryOutcomeOnly: true,
+        },
+      };
+    }
+    const freshPlan = latestFreshIssueBreakdownPlan(
+      lifecycle,
+      context.issue,
+      this.config,
+    );
     const operations = planIssueTriageReportWritebacks(
       {
         issue: context.issue,
@@ -5987,6 +6139,12 @@ export class Orchestrator {
           lifecycle.blockedReason ??
           lifecycle.mergeConflict?.blockedReason ??
           null,
+        planningFailureCount: lifecycle.planningFailureCount,
+        incompleteTurnCount: lifecycle.incompleteTurnCount,
+        hasActiveMergeConflict: lifecycle.mergeConflict?.status === "open",
+        hasFreshIssueBreakdownPlan: freshPlan !== null,
+        issueBreakdownPlanApplicationStatus:
+          freshPlan?.applicationStatus ?? null,
       },
       this.config,
     );
@@ -6076,6 +6234,100 @@ export class Orchestrator {
     reason: string,
   ) {
     const operations = context.reportWriteback.operations ?? [];
+    const triageReport = context.reportWriteback.issueTriageReport;
+    const recovery = triageReport?.recoveryDisposition ?? null;
+    if (operations.length === 0 && recovery !== null && triageReport) {
+      const reportOutcome =
+        await this.issueTriageReportWritebackOutcome(triageReport);
+      context.reportWriteback.issueTriageReportWritebackStatus =
+        reportOutcome.status;
+      if (reportOutcome.status === "pending") {
+        return {
+          status: "skipped" as const,
+          stop: true,
+          message:
+            "Issue triage full report writeback is still pending; reconciliation will retry",
+          details: {
+            reportId: triageReport.id,
+            reportWritebackStatus: reportOutcome.status,
+          },
+        };
+      }
+      if (reportOutcome.status === "failed") {
+        context.reportWriteback.writebackFailureReason =
+          reportOutcome.reason ?? "issue triage full report writeback failed";
+        if (recovery.transitionStatus === "pending") {
+          context.reportWriteback.issueTriageRecoveryTransitionStatus =
+            "failed";
+        }
+        return {
+          details: {
+            reportId: triageReport.id,
+            reportWritebackStatus: reportOutcome.status,
+            transitionStatus:
+              context.reportWriteback.issueTriageRecoveryTransitionStatus ??
+              recovery.transitionStatus,
+            failureReason: context.reportWriteback.writebackFailureReason,
+          },
+        };
+      }
+      if (recovery.transitionStatus !== "pending") {
+        return {
+          details: {
+            reportId: triageReport.id,
+            reportWritebackStatus: reportOutcome.status,
+            transitionStatus: recovery.transitionStatus,
+          },
+        };
+      }
+      const operation = recovery.transitionOperationKey
+        ? await this.options.writeback?.getOperation(
+            recovery.transitionOperationKey,
+          )
+        : null;
+      if (operation?.status === "succeeded") {
+        context.reportWriteback.issueTriageRecoveryTransitionStatus =
+          "applied";
+        return {
+          details: {
+            operationKeys: context.reportWriteback.operationKeys ?? [],
+            recoveryOutcomeOnly: true,
+            reportWritebackStatus: reportOutcome.status,
+            transitionStatus: "applied",
+          },
+        };
+      }
+      if (
+        operation?.status === "skipped" ||
+        operation?.status === "dead_letter"
+      ) {
+        context.reportWriteback.writebackFailureReason =
+          operation.resultMessage ??
+          operation.lastError ??
+          `triage recovery transition ${operation.status}`;
+        context.reportWriteback.issueTriageRecoveryTransitionStatus =
+          "failed";
+        return {
+          details: {
+            operationKeys: context.reportWriteback.operationKeys ?? [],
+            recoveryOutcomeOnly: true,
+            reportWritebackStatus: reportOutcome.status,
+            transitionStatus: "failed",
+            failureReason: context.reportWriteback.writebackFailureReason,
+          },
+        };
+      }
+      return {
+        details: {
+          operationKeys: context.reportWriteback.operationKeys ?? [],
+          recoveryOutcomeOnly: true,
+          reportWritebackStatus: reportOutcome.status,
+          transitionStatus: "pending",
+          operationKey: recovery.transitionOperationKey,
+          operationStatus: operation?.status ?? "missing",
+        },
+      };
+    }
     if (operations.length === 0)
       return {
         status: "skipped" as const,
@@ -6087,6 +6339,19 @@ export class Orchestrator {
       reason,
       context.issue,
     );
+    context.reportWriteback.writebacksApplied = applied;
+    if (triageReport?.recoveryDisposition) {
+      context.reportWriteback.issueTriageReportWritebackStatus = applied
+        ? "applied"
+        : "pending";
+      if (
+        applied &&
+        triageReport.recoveryDisposition.transitionStatus === "pending"
+      ) {
+        context.reportWriteback.issueTriageRecoveryTransitionStatus =
+          "applied";
+      }
+    }
     return applied
       ? {
           details: {
@@ -6101,6 +6366,49 @@ export class Orchestrator {
             operationKeys: context.reportWriteback.operationKeys ?? [],
           },
         };
+  }
+
+  private async issueTriageReportWritebackOutcome(
+    report: IssueTriageReportRecord,
+  ): Promise<{
+    status: IssueTriageReportWritebackStatus;
+    reason?: string;
+  }> {
+    if (!this.options.writeback) return { status: "pending" };
+    const operations = await Promise.all(
+      report.writebackOperationKeys.map((operationKey) =>
+        this.options.writeback!.getOperation(operationKey),
+      ),
+    );
+    if (operations.some((operation) => operation === null)) {
+      return { status: "pending" };
+    }
+    const comments = operations.filter(
+      (operation) => operation?.kind === "comment",
+    );
+    if (comments.length === 0) {
+      return {
+        status: "failed",
+        reason: "issue triage full report comment is not registered",
+      };
+    }
+    const failed = comments.find(
+      (operation) =>
+        operation?.status === "skipped" ||
+        operation?.status === "dead_letter",
+    );
+    if (failed) {
+      return {
+        status: "failed",
+        reason:
+          failed.resultMessage ??
+          failed.lastError ??
+          `issue triage full report writeback ${failed.status}`,
+      };
+    }
+    return comments.every((operation) => operation?.status === "succeeded")
+      ? { status: "applied" }
+      : { status: "pending" };
   }
 
   private async markIssueTriageReportWritebackRecordedAction(
@@ -6123,7 +6431,32 @@ export class Orchestrator {
         lastIssueTriageReportId: lifecycle.lastIssueTriageReportId ?? report.id,
         issueTriageReports: lifecycle.issueTriageReports.map((candidate) =>
           candidate.id === report.id
-            ? { ...candidate, writebackOperationKeys: operationKeys }
+            ? {
+                ...candidate,
+                writebackOperationKeys: operationKeys,
+                ...(candidate.recoveryDisposition !== null &&
+                candidate.recoveryDisposition !== undefined
+                  ? {
+                      recoveryDisposition: {
+                        ...candidate.recoveryDisposition,
+                        reportWritebackStatus:
+                          context.reportWriteback
+                            .issueTriageReportWritebackStatus ??
+                          candidate.recoveryDisposition
+                            .reportWritebackStatus,
+                        transitionStatus:
+                          context.reportWriteback
+                            .issueTriageRecoveryTransitionStatus ??
+                          candidate.recoveryDisposition.transitionStatus,
+                        reason:
+                          context.reportWriteback.writebackFailureReason ===
+                          undefined
+                            ? candidate.recoveryDisposition.reason
+                            : `${candidate.recoveryDisposition.reason}; recovery writeback failed: ${context.reportWriteback.writebackFailureReason}`,
+                      },
+                    }
+                  : {}),
+              }
             : candidate,
         ),
       },
@@ -6794,6 +7127,21 @@ export class Orchestrator {
         status: "skipped" as const,
         message: "Review verdict did not pass",
       };
+    const visibility = await this.dispositionWritebackSnapshotPatchForIssue(
+      context.issue,
+    );
+    if (
+      visibility.lastReviewVerdictDispositionWritebackStatus !== "applied" &&
+      visibility.lastReviewVerdictDispositionWritebackStatus !==
+        "not_required"
+    ) {
+      return {
+        status: "skipped" as const,
+        stop: true,
+        message:
+          "Review verdict disposition is waiting for its full Linear writeback",
+      };
+    }
     if (verdict.passDisposition === "accepted_artifact") {
       return this.completeAcceptedArtifactAction(context);
     }
@@ -7516,16 +7864,270 @@ export class Orchestrator {
     }
   }
 
+  private async reconcileIssueBreakdownPlanApplicationAction(
+    context: OrchestratorTransitionContext,
+  ) {
+    const store = this.options.lifecycleStore;
+    if (!store) {
+      return {
+        status: "skipped" as const,
+        stop: true,
+        message: "Issue breakdown application requires lifecycle persistence",
+      };
+    }
+    const lifecycle = await store.get(context.issue.id);
+    if (!lifecycle) {
+      return {
+        status: "skipped" as const,
+        stop: true,
+        message: "No lifecycle exists for issue breakdown application",
+      };
+    }
+    context.breakdownApplication.lifecycle = lifecycle;
+    const latestPlan = lifecycle.lastIssueBreakdownPlanId
+      ? (lifecycle.issueBreakdownPlans.find(
+          (candidate) => candidate.id === lifecycle.lastIssueBreakdownPlanId,
+        ) ?? null)
+      : null;
+    const retrySkippedAfterOperatorResume =
+      latestPlan?.applicationStatus === "blocked" &&
+      lifecycle.phase === "blocked" &&
+      lifecycle.blockedReason?.startsWith(
+        "issue breakdown plan application blocked:",
+      ) === true &&
+      !isStateIn(context.issue.state, this.config.reviewLoop.blockedStates);
+    const application = await new IssueBreakdownPlanApplyService({
+      config: this.config,
+      lifecycleStore: store,
+      writeback: this.options.writeback,
+    }).applyLatestFreshPlan(context.issue, {
+      retrySkippedAfterOperatorResume,
+    });
+
+    if (application.status === "pending") {
+      return {
+        status: "skipped" as const,
+        stop: true,
+        message:
+          "Issue breakdown plan application is still pending; reconciliation will retry",
+        details: {
+          planId: application.plan.id,
+          applicationStatus: application.status,
+        },
+      };
+    }
+    if (
+      application.status === "no_fresh_plan" ||
+      application.status === "not_required" ||
+      application.status === "preview"
+    ) {
+      return {
+        status: "skipped" as const,
+        stop: true,
+        message:
+          "No applicable fresh issue breakdown plan remains to reconcile",
+        details: {
+          applicationStatus: application.status,
+          applicationReason:
+            "reason" in application ? application.reason : null,
+        },
+      };
+    }
+    if (application.status === "blocked") {
+      const latestLifecycle = (await store.get(context.issue.id)) ?? lifecycle;
+      const blockedReason = `issue breakdown plan application blocked: ${application.reason}`;
+      const blocked = await this.applyLifecycleBlocked(
+        context.issue,
+        latestLifecycle,
+        application.plan.runId,
+        blockedReason,
+        "Resolve the reported issue-breakdown application failure, then move the issue out of Blocked so Symphony can retry.",
+      );
+      context.breakdownApplication.lifecycle = blocked;
+      return {
+        details: {
+          planId: application.plan.id,
+          applicationStatus: application.status,
+          applicationReason: application.reason,
+          nextPhase: blocked.phase,
+          nextBlockedReason: blocked.blockedReason,
+        },
+      };
+    }
+
+    let refreshedIssue: Issue;
+    try {
+      const refreshed = await this.options.tracker.fetchIssueStatesByIds([
+        context.issue.id,
+      ]);
+      const latest = refreshed[0] ?? null;
+      if (latest === null) {
+        return {
+          status: "skipped" as const,
+          stop: true,
+          message:
+            "Applied issue breakdown plan is waiting for a current tracker state",
+          details: {
+            planId: application.plan.id,
+            applicationStatus: application.status,
+          },
+        };
+      }
+      refreshedIssue = latest;
+      context.issue = latest;
+    } catch (error) {
+      this.options.logger.warn(
+        "issue breakdown application tracker refresh failed",
+        {
+          issue_id: context.issue.id,
+          issue_identifier: context.issue.identifier,
+          plan_id: application.plan.id,
+          error: errorMessage(error),
+        },
+      );
+      return {
+        status: "skipped" as const,
+        stop: true,
+        message:
+          "Applied issue breakdown plan is waiting for a current tracker state",
+        details: {
+          planId: application.plan.id,
+          applicationStatus: application.status,
+        },
+      };
+    }
+
+    let latestLifecycle = (await store.get(context.issue.id)) ?? lifecycle;
+    const sourceReportId = application.plan.sourceIssueTriageReportId ?? null;
+    const sourceReport =
+      sourceReportId === null
+        ? null
+        : (latestLifecycle.issueTriageReports.find(
+            (report) => report.id === sourceReportId,
+          ) ?? null);
+    const currentTriagePlan =
+      sourceReportId !== null &&
+      latestLifecycle.lastIssueTriageReportId === sourceReportId;
+    const verifiedAutomatedPlannerRoute =
+      currentTriagePlan &&
+      sourceReport?.recoveryDisposition?.mode === "automated" &&
+      sourceReport.recoveryDisposition.nextActor === "planner";
+
+    if (currentTriagePlan && !verifiedAutomatedPlannerRoute) {
+      const blockedReason =
+        "issue breakdown plan application cannot verify its automated triage recovery provenance";
+      const blocked = await this.applyLifecycleBlocked(
+        refreshedIssue,
+        latestLifecycle,
+        application.plan.runId,
+        blockedReason,
+        "Inspect the linked triage report and plan provenance, then explicitly resume or re-run triage.",
+      );
+      context.breakdownApplication.lifecycle = blocked;
+      return {
+        details: {
+          planId: application.plan.id,
+          applicationStatus: application.status,
+          nextPhase: blocked.phase,
+          nextBlockedReason: blocked.blockedReason,
+        },
+      };
+    }
+
+    if (verifiedAutomatedPlannerRoute && sourceReport !== null) {
+      const updated = await this.resetFailureBudgetAfterOperatorAction(
+        refreshedIssue,
+        latestLifecycle,
+        "automated_triage_plan_recovery",
+      );
+      context.breakdownApplication.lifecycle = updated;
+      return {
+        details: {
+          planId: application.plan.id,
+          applicationStatus: application.status,
+          recoveryReportId: sourceReport.id,
+          nextPhase: updated.phase,
+          nextBlockedReason: updated.blockedReason,
+        },
+      };
+    }
+
+    const updated =
+      (await this.updateIssueLifecycleWithEvidence(
+        refreshedIssue,
+        {
+          phase: phaseForIssueState(refreshedIssue.state, this.config),
+          blockedReason:
+            latestLifecycle.blockedReason?.startsWith(
+              "issue breakdown plan application blocked:",
+            ) === true
+              ? null
+              : latestLifecycle.blockedReason,
+          planningFailureCount: 0,
+          planningDispatchRetryCount: 0,
+          lastPlanningFailureRunId: null,
+          lastPlanningFailureAt: null,
+        },
+        "issue_breakdown_plan_application_reconciliation",
+        application.plan.runId,
+      )) ?? latestLifecycle;
+    context.breakdownApplication.lifecycle = updated;
+    return {
+      details: {
+        planId: application.plan.id,
+        applicationStatus: application.status,
+        nextPhase: updated.phase,
+        nextBlockedReason: updated.blockedReason,
+      },
+    };
+  }
+
   private async updateLifecycleAfterOperatorResumeAction(
     context: OrchestratorTransitionContext,
   ) {
-    const lifecycle = await this.options.lifecycleStore?.get(context.issue.id);
+    let lifecycle = await this.options.lifecycleStore?.get(context.issue.id);
     if (!lifecycle)
       return {
         status: "skipped" as const,
         stop: true,
         message: "No lifecycle exists for operator resume reset",
       };
+    const lastIssueTriageReportId = lifecycle.lastIssueTriageReportId;
+    const triageReport = lastIssueTriageReportId
+      ? (lifecycle.issueTriageReports.find(
+          (report) => report.id === lastIssueTriageReportId,
+        ) ?? null)
+      : null;
+    if (
+      triageReport?.recoveryDisposition?.mode === "automated" &&
+      triageReport.recoveryDisposition.nextActor === "worker" &&
+      triageReport.recoveryDisposition.targetState !== null &&
+      (triageReport.recoveryDisposition.transitionStatus === "applied" ||
+        (triageReport.recoveryDisposition.transitionStatus === "pending" &&
+          isStateIn(context.issue.state, [
+            triageReport.recoveryDisposition.targetState,
+          ])))
+    ) {
+      lifecycle =
+        (await this.updateIssueLifecycleWithEvidence(
+          context.issue,
+          {
+            issueTriageReports: lifecycle.issueTriageReports.map((report) =>
+              report.id === triageReport.id && report.recoveryDisposition
+                ? {
+                    ...report,
+                    recoveryDisposition: {
+                      ...report.recoveryDisposition,
+                      transitionStatus: "applied",
+                    },
+                  }
+                : report,
+            ),
+          },
+          "issue_triage_recovery_transition_verified",
+          triageReport.runId,
+        )) ?? lifecycle;
+    }
     const reason =
       context.transition.reason === "manual_ignore_state_resume"
         ? "manual_ignore_state_resume"
@@ -9491,6 +10093,38 @@ export class Orchestrator {
             : null,
       },
       {
+        id: "orchestrator.reconcile_issue_breakdown_plan_application",
+        priority: issueTransitionRulesetPriority(
+          "reconcile_issue_breakdown_plan_application",
+        ),
+        evaluate: (snapshot) =>
+          this.rulesetShouldReconcileIssueBreakdownPlanApplication(snapshot)
+            ? {
+                transitionKind:
+                  "reconcile_issue_breakdown_plan_application",
+                reason: this.rulesetIsIssueBreakdownOperatorResume(snapshot)
+                  ? "issue_breakdown_plan_operator_resume"
+                  : "issue_breakdown_plan_application_reconciliation",
+              }
+            : null,
+      },
+      {
+        id: "orchestrator.block.failed_agent_disposition_writeback",
+        priority: 34,
+        evaluate: (snapshot) => {
+          const blockedReason =
+            this.rulesetFailedAgentDispositionWritebackReason(snapshot);
+          return blockedReason === null
+            ? null
+            : {
+                transitionKind: "block_issue",
+                reason: blockedReason,
+                blockedReason,
+                runId: snapshot.latestRunId ?? snapshot.issueId,
+              };
+        },
+      },
+      {
         id: "orchestrator.reset_merge_conflict_after_operator_resume",
         priority: 35,
         evaluate: (snapshot) =>
@@ -9523,13 +10157,14 @@ export class Orchestrator {
       {
         id: "orchestrator.reset_lifecycle_after_operator_resume",
         priority: 37,
-        evaluate: (snapshot) =>
-          this.rulesetShouldResetLifecycleAfterOperatorResume(snapshot)
-            ? {
-                transitionKind: "reset_lifecycle_after_operator_resume",
-                reason: "tracker_state_resume",
-              }
-            : null,
+        evaluate: (snapshot) => {
+          if (!this.rulesetShouldResetLifecycleAfterOperatorResume(snapshot))
+            return null;
+          return {
+            transitionKind: "reset_lifecycle_after_operator_resume",
+            reason: "tracker_state_resume",
+          };
+        },
       },
       {
         id: "orchestrator.recover_merge_gate_head_supersession",
@@ -9568,6 +10203,50 @@ export class Orchestrator {
                   snapshot.planningFailureCount,
                   this.config.issueBreakdown.maxPlanningFailures,
                 ),
+                runId: snapshot.latestRunId ?? snapshot.issueId,
+              }
+            : null,
+      },
+      {
+        id: "orchestrator.block.unavailable_issue_triage",
+        priority: 40,
+        evaluate: (snapshot) =>
+          this.rulesetShouldBlockUnavailableIssueTriage(snapshot)
+            ? {
+                transitionKind: "block_issue",
+                reason: this.rulesetIssueTriageUnavailableReason(snapshot),
+                blockedReason:
+                  this.rulesetIssueTriageUnavailableReason(snapshot),
+                runId: snapshot.latestRunId ?? snapshot.issueId,
+              }
+            : null,
+      },
+      {
+        id: "orchestrator.block.unavailable_automated_triage_worker",
+        priority: 40.25,
+        evaluate: (snapshot) =>
+          this.rulesetShouldBlockUnavailableAutomatedTriageWorker(snapshot)
+            ? {
+                transitionKind: "block_issue",
+                reason:
+                  "automated triage requires worker repair, but worker dispatch is unavailable under the current issue or workflow guardrails",
+                blockedReason:
+                  "automated triage requires worker repair, but worker dispatch is unavailable under the current issue or workflow guardrails",
+                runId: snapshot.latestRunId ?? snapshot.issueId,
+              }
+            : null,
+      },
+      {
+        id: "orchestrator.block.unavailable_automated_triage_planner",
+        priority: 40.5,
+        evaluate: (snapshot) =>
+          this.rulesetShouldBlockUnavailableAutomatedTriagePlanner(snapshot)
+            ? {
+                transitionKind: "block_issue",
+                reason:
+                  "automated triage requires planner decomposition, but the configured planner/application route is unavailable",
+                blockedReason:
+                  "automated triage requires planner decomposition, but the configured planner/application route is unavailable",
                 runId: snapshot.latestRunId ?? snapshot.issueId,
               }
             : null,
@@ -9796,6 +10475,7 @@ export class Orchestrator {
             snapshot.paused ||
             snapshot.claimed ||
             !snapshot.lifecyclePersistenceAvailable ||
+            !this.rulesetLastReviewVerdictDispositionVisible(snapshot) ||
             snapshot.phase !== "passed" ||
             !isStateIn(
               snapshot.trackerState,
@@ -10282,6 +10962,13 @@ export class Orchestrator {
       return false;
     if (isStateIn(snapshot.trackerState, this.config.tracker.terminalStates))
       return false;
+    if (
+      runPhase === "implementation" &&
+      snapshot.phase === "review" &&
+      !this.rulesetLastCompletionReportDispositionVisible(snapshot)
+    ) {
+      return false;
+    }
     if (snapshot.hasChildren) return false;
     if (this.rulesetBlockedByLifecycle(snapshot)) return false;
     if (
@@ -10336,6 +11023,8 @@ export class Orchestrator {
       return false;
     if (isStateIn(snapshot.trackerState, this.config.tracker.terminalStates))
       return false;
+    if (!this.rulesetLastReviewVerdictDispositionVisible(snapshot))
+      return false;
     if (this.rulesetBlockedByLifecycle(snapshot)) return false;
     if (!this.rulesetPassesLabelGuardrails(snapshot, "reviewer")) return false;
     if (
@@ -10366,11 +11055,15 @@ export class Orchestrator {
       return false;
     if (isStateIn(snapshot.trackerState, this.config.tracker.terminalStates))
       return false;
+    if (!this.rulesetLastReviewVerdictDispositionVisible(snapshot))
+      return false;
     if (snapshot.hasChildren) return false;
     if (!isIssueTriageBlockedReason(snapshot.blockedReason)) return false;
+    const retriageReason = this.rulesetIssueTriageRetriageReason(snapshot);
     if (
       snapshot.issueTriageCurrentTriggerReportIds.length >=
-      this.config.issueTriage.maxAttemptsPerTrigger
+        this.config.issueTriage.maxAttemptsPerTrigger &&
+      retriageReason === null
     )
       return false;
     return this.rulesetPassesLabelGuardrails(snapshot, "triage");
@@ -10423,7 +11116,8 @@ export class Orchestrator {
     }
     if (
       this.rulesetBlockedByLifecycle(snapshot) &&
-      !this.rulesetPlannerAllowedFromBlocked(snapshot)
+      !this.rulesetPlannerAllowedFromBlocked(snapshot) &&
+      !this.rulesetPlannerRequiredByMachineTriage(snapshot)
     )
       return false;
     if (
@@ -10541,10 +11235,17 @@ export class Orchestrator {
     if (snapshot.triggerType !== "orchestrator.tick") return false;
     if (!this.rulesetBlockedByLifecycle(snapshot)) return false;
     if (
-      isReviewerBlockedTriageReason(snapshot.blockedReason) &&
-      !isStateIn(snapshot.trackerState, this.config.tracker.activeStates)
+      isIssueTriageBlockedReason(snapshot.blockedReason) &&
+      isStateIn(snapshot.trackerState, this.config.reviewLoop.reviewStates)
     )
       return false;
+    if (this.rulesetHasAutomatedTriagePlannerIntent(snapshot)) return false;
+    if (this.rulesetHasAutomatedTriageWorkerIntent(snapshot)) {
+      return (
+        this.rulesetHasAutomatedTriageWorkerRoute(snapshot) &&
+        this.rulesetAutomatedTriageWorkerCapabilityAvailable(snapshot)
+      );
+    }
     if (isPendingPublicationApprovalReason(snapshot.blockedReason))
       return false;
     if (activeCarriedMergeConflict(snapshot) !== null) return false;
@@ -10560,6 +11261,117 @@ export class Orchestrator {
       return false;
     if (this.rulesetIsMergePolicyTrackedState(snapshot)) return false;
     return true;
+  }
+
+  private rulesetFailedAgentDispositionWritebackReason(
+    snapshot: IssueCurrentStateSnapshot,
+  ): string | null {
+    if (snapshot.triggerType !== "orchestrator.tick") return null;
+    if (!this.config.writeback.enabled) return null;
+    if (!snapshot.lifecyclePersistenceAvailable) return null;
+    if (this.config.reviewLoop.blockedStates.length === 0) return null;
+    if (snapshot.running || snapshot.paused) return null;
+    if (!snapshot.allowExistingClaim && snapshot.claimed) return null;
+    if (isStateIn(snapshot.trackerState, this.config.tracker.terminalStates))
+      return null;
+    if (isStateIn(snapshot.trackerState, this.config.reviewLoop.blockedStates))
+      return null;
+    const currentTriageReport =
+      snapshot.currentIssueTriageTriggerFingerprint !== null &&
+      snapshot.lastIssueTriageReportTriggerFingerprint ===
+        snapshot.currentIssueTriageTriggerFingerprint;
+    if (
+      currentTriageReport &&
+      snapshot.lastIssueTriageRecoveryDisposition?.reportWritebackStatus ===
+        "failed"
+    ) {
+      return "the full triage disposition could not be published to Linear; repair the writeback integration and retry the disposition";
+    }
+    if (
+      snapshot.lastReviewVerdictId !== null &&
+      snapshot.lastReviewVerdictDispositionWritebackStatus === "failed"
+    ) {
+      return "the full reviewer disposition could not be published to Linear; repair the writeback integration and retry the disposition";
+    }
+    if (
+      snapshot.phase === "review" &&
+      snapshot.lastCompletionReportId !== null &&
+      snapshot.lastCompletionReportDispositionWritebackStatus === "failed"
+    ) {
+      return "the full worker completion disposition could not be published to Linear; repair the writeback integration and retry the disposition";
+    }
+    return null;
+  }
+
+  private rulesetShouldReconcileIssueBreakdownPlanApplication(
+    snapshot: IssueCurrentStateSnapshot,
+  ): boolean {
+    if (snapshot.triggerType !== "orchestrator.tick") return false;
+    if (
+      !this.config.issueBreakdown.enabled ||
+      !this.config.issueBreakdown.applyToLinear.enabled ||
+      !this.config.issueBreakdown.applyToLinear.autoApply ||
+      !snapshot.lifecyclePersistenceAvailable
+    ) {
+      return false;
+    }
+    if (snapshot.running || snapshot.paused) return false;
+    if (!snapshot.allowExistingClaim && snapshot.claimed) return false;
+    if (isStateIn(snapshot.trackerState, this.config.tracker.terminalStates))
+      return false;
+    if (
+      !isStateIn(snapshot.trackerState, this.config.tracker.activeStates) &&
+      !isStateIn(snapshot.trackerState, this.config.reviewLoop.reviewStates) &&
+      !isStateIn(snapshot.trackerState, this.config.reviewLoop.blockedStates)
+    ) {
+      return false;
+    }
+    const persistedApplicationNeedsRecovery =
+      snapshot.lastIssueBreakdownPlanApplicationStatus === "pending" ||
+      snapshot.lastIssueBreakdownPlanApplicationStatus === "blocked";
+    if (
+      !this.rulesetHasFreshIssueBreakdownPlan(snapshot) &&
+      !persistedApplicationNeedsRecovery
+    ) {
+      return false;
+    }
+    if (
+      this.rulesetHasAutomatedTriagePlannerIntent(snapshot) &&
+      !this.rulesetHasTriageLinkedIssueBreakdownPlan(snapshot)
+    ) {
+      return false;
+    }
+    if (
+      snapshot.lastIssueBreakdownPlanApplicationStatus === "blocked" &&
+      snapshot.phase === "blocked" &&
+      snapshot.blockedReason?.startsWith(
+        "issue breakdown plan application blocked:",
+      ) === true &&
+      isStateIn(snapshot.trackerState, this.config.reviewLoop.blockedStates)
+    ) {
+      return false;
+    }
+    if (snapshot.lastIssueBreakdownPlanApplicationStatus !== "applied")
+      return true;
+    if (this.rulesetHasTriageLinkedFreshIssueBreakdownPlan(snapshot))
+      return true;
+    return (
+      snapshot.phase !==
+      phaseForIssueState(snapshot.trackerState, this.config)
+    );
+  }
+
+  private rulesetIsIssueBreakdownOperatorResume(
+    snapshot: IssueCurrentStateSnapshot,
+  ): boolean {
+    return (
+      snapshot.lastIssueBreakdownPlanApplicationStatus === "blocked" &&
+      snapshot.phase === "blocked" &&
+      snapshot.blockedReason?.startsWith(
+        "issue breakdown plan application blocked:",
+      ) === true &&
+      !isStateIn(snapshot.trackerState, this.config.reviewLoop.blockedStates)
+    );
   }
 
   private rulesetShouldRecoverMergeGateHeadSupersession(
@@ -10707,11 +11519,90 @@ export class Orchestrator {
     );
   }
 
+  private rulesetShouldBlockUnavailableIssueTriage(
+    snapshot: IssueCurrentStateSnapshot,
+  ): boolean {
+    if (snapshot.triggerType !== "orchestrator.tick") return false;
+    if (!snapshot.lifecyclePersistenceAvailable) return false;
+    if (
+      !isStateIn(snapshot.trackerState, this.config.reviewLoop.reviewStates) &&
+      !isStateIn(snapshot.trackerState, this.config.tracker.activeStates)
+    )
+      return false;
+    if (!isIssueTriageBlockedReason(snapshot.blockedReason)) return false;
+    if (snapshot.running || snapshot.paused) return false;
+    if (!snapshot.allowExistingClaim && snapshot.claimed) return false;
+    if (this.rulesetRetryBackoffActive(snapshot)) return false;
+    if (
+      snapshot.lastReviewVerdictId !== null &&
+      snapshot.lastReviewVerdictDispositionWritebackStatus === "failed"
+    ) {
+      return true;
+    }
+    if (this.rulesetIssueTriageRetriageReason(snapshot) !== null) return false;
+
+    const currentReport =
+      snapshot.currentIssueTriageTriggerFingerprint !== null &&
+      snapshot.lastIssueTriageReportTriggerFingerprint ===
+        snapshot.currentIssueTriageTriggerFingerprint
+        ? snapshot.lastIssueTriageRecoveryDisposition
+        : null;
+    if (currentReport !== null) {
+      return (
+        currentReport.reportWritebackStatus === "failed" ||
+        currentReport.transitionStatus === "failed"
+      );
+    }
+
+    if (!this.config.issueTriage.enabled) return true;
+    if (snapshot.hasChildren) return true;
+    if (!this.rulesetPassesLabelGuardrails(snapshot, "triage")) return true;
+    return (
+      snapshot.issueTriageCurrentTriggerReportIds.length >=
+      this.config.issueTriage.maxAttemptsPerTrigger
+    );
+  }
+
+  private rulesetIssueTriageUnavailableReason(
+    snapshot: IssueCurrentStateSnapshot,
+  ): string {
+    if (
+      snapshot.lastReviewVerdictId !== null &&
+      snapshot.lastReviewVerdictDispositionWritebackStatus === "failed"
+    ) {
+      return "the full reviewer disposition could not be published to Linear; repair the writeback integration and retry the disposition";
+    }
+    return "review failure ceiling reached, but automated issue triage is unavailable under the current issue or workflow guardrails";
+  }
+
+  private rulesetIssueTriageRetriageReason(
+    snapshot: IssueCurrentStateSnapshot,
+  ) {
+    return issueTriageRecoveryRetriageReasonForContext(
+      {
+        issue: snapshotAsIssue(snapshot),
+        blockers: snapshot.latestIssueTriageReportBlockers,
+        previousDisposition: snapshot.lastIssueTriageRecoveryDisposition,
+        planningFailureCount: snapshot.planningFailureCount,
+        hasFreshIssueBreakdownPlan:
+          this.rulesetHasFreshIssueBreakdownPlan(snapshot),
+        issueBreakdownPlanApplicationStatus:
+          snapshot.lastIssueBreakdownPlanApplicationStatus,
+        incompleteTurnCount: snapshot.incompleteTurnCount,
+        hasActiveMergeConflict:
+          snapshot.mergeConflict?.status === "open" ||
+          activeCarriedMergeConflict(snapshot) !== null,
+      },
+      this.config,
+    );
+  }
+
   private rulesetShouldBlockReviewerBlockedReview(
     snapshot: IssueCurrentStateSnapshot,
   ): boolean {
     if (snapshot.triggerType !== "orchestrator.tick") return false;
     if (!snapshot.lifecyclePersistenceAvailable) return false;
+    if (this.config.issueTriage.enabled) return false;
     if (snapshot.running || snapshot.paused) return false;
     if (!snapshot.allowExistingClaim && snapshot.claimed) return false;
     if (this.rulesetRetryBackoffActive(snapshot)) return false;
@@ -10744,9 +11635,16 @@ export class Orchestrator {
   ): boolean {
     if (isStateIn(snapshot.trackerState, this.config.reviewLoop.blockedStates))
       return true;
+    if (
+      isStateIn(snapshot.trackerState, this.config.tracker.activeStates) &&
+      isIssueTriageBlockedReason(snapshot.blockedReason) &&
+      this.rulesetIssueTriageRetriageReason(snapshot) !== null
+    ) {
+      return true;
+    }
     return (
       isStateIn(snapshot.trackerState, this.config.reviewLoop.reviewStates) &&
-      isReviewerBlockedTriageReason(snapshot.blockedReason)
+      isIssueTriageBlockedReason(snapshot.blockedReason)
     );
   }
 
@@ -10869,11 +11767,171 @@ export class Orchestrator {
       snapshot.currentIssueTriageTriggerFingerprint !== null &&
       snapshot.lastIssueTriageReportTriggerFingerprint ===
         snapshot.currentIssueTriageTriggerFingerprint &&
+      snapshot.lastIssueTriageRecoveryDisposition === null &&
       this.rulesetHasActiveIssueTriageBlocker(
         snapshot,
         "under_specified_needs_decomposition",
       )
     );
+  }
+
+  private rulesetPlannerRequiredByMachineTriage(
+    snapshot: IssueCurrentStateSnapshot,
+  ): boolean {
+    if (!isStateIn(snapshot.trackerState, this.config.tracker.activeStates))
+      return false;
+    return (
+      this.rulesetHasAutomatedTriagePlannerRoute(snapshot) &&
+      this.rulesetAutomatedTriagePlannerCapabilityAvailable(snapshot)
+    );
+  }
+
+  private rulesetHasAutomatedTriagePlannerRoute(
+    snapshot: IssueCurrentStateSnapshot,
+  ): boolean {
+    if (!this.rulesetHasAutomatedTriagePlannerIntent(snapshot)) return false;
+    const recovery = snapshot.lastIssueTriageRecoveryDisposition!;
+    return (
+      recovery.reportWritebackStatus === "applied" &&
+      recovery.targetState !== null &&
+      (recovery.transitionStatus === "applied" ||
+        recovery.transitionStatus === "not_required") &&
+      isStateIn(snapshot.trackerState, [recovery.targetState])
+    );
+  }
+
+  private rulesetHasAutomatedTriageWorkerRoute(
+    snapshot: IssueCurrentStateSnapshot,
+  ): boolean {
+    if (!this.rulesetHasAutomatedTriageWorkerIntent(snapshot)) return false;
+    const recovery = snapshot.lastIssueTriageRecoveryDisposition!;
+    return (
+      recovery.reportWritebackStatus === "applied" &&
+      recovery.targetState !== null &&
+      (recovery.transitionStatus === "applied" ||
+        recovery.transitionStatus === "not_required") &&
+      isStateIn(snapshot.trackerState, [recovery.targetState])
+    );
+  }
+
+  private rulesetHasAutomatedTriageWorkerIntent(
+    snapshot: IssueCurrentStateSnapshot,
+  ): boolean {
+    if (
+      snapshot.currentIssueTriageTriggerFingerprint === null ||
+      snapshot.lastIssueTriageReportTriggerFingerprint !==
+        snapshot.currentIssueTriageTriggerFingerprint
+    ) {
+      return false;
+    }
+    const recovery = snapshot.lastIssueTriageRecoveryDisposition;
+    return (
+      recovery?.mode === "automated" && recovery.nextActor === "worker"
+    );
+  }
+
+  private rulesetAutomatedTriageWorkerCapabilityAvailable(
+    snapshot: IssueCurrentStateSnapshot,
+  ): boolean {
+    return evaluateWorkerDispatchCapability(
+      snapshotAsIssue(snapshot),
+      this.config,
+      this.config.writeback.dispatchState,
+      {
+        hasFreshIssueBreakdownPlan:
+          this.rulesetHasFreshIssueBreakdownPlan(snapshot),
+        issueBreakdownPlanApplicationStatus:
+          snapshot.lastIssueBreakdownPlanApplicationStatus,
+        incompleteTurnCount: snapshot.incompleteTurnCount,
+        hasActiveMergeConflict:
+          snapshot.mergeConflict?.status === "open" ||
+          activeCarriedMergeConflict(snapshot) !== null,
+      },
+    ).available;
+  }
+
+  private rulesetHasAutomatedTriagePlannerIntent(
+    snapshot: IssueCurrentStateSnapshot,
+  ): boolean {
+    if (
+      snapshot.currentIssueTriageTriggerFingerprint === null ||
+      snapshot.lastIssueTriageReportTriggerFingerprint !==
+        snapshot.currentIssueTriageTriggerFingerprint
+    )
+      return false;
+    const recovery = snapshot.lastIssueTriageRecoveryDisposition;
+    return (
+      recovery?.mode === "automated" &&
+      recovery.nextActor === "planner"
+    );
+  }
+
+  private rulesetAutomatedTriagePlannerCapabilityAvailable(
+    snapshot: IssueCurrentStateSnapshot,
+  ): boolean {
+    return (
+      this.config.issueBreakdown.enabled &&
+      this.config.issueBreakdown.applyToLinear.enabled &&
+      this.config.issueBreakdown.applyToLinear.autoApply &&
+      this.config.writeback.enabled &&
+      snapshot.assignedToWorker &&
+      !snapshot.hasChildren &&
+      !descriptionDeclaresAcceptedArtifact(snapshot.description) &&
+      snapshot.planningFailureCount <
+        this.config.issueBreakdown.maxPlanningFailures &&
+      this.rulesetPassesLabelGuardrails(snapshot, "planner")
+    );
+  }
+
+  private rulesetHasTriageLinkedFreshIssueBreakdownPlan(
+    snapshot: IssueCurrentStateSnapshot,
+  ): boolean {
+    return (
+      this.rulesetHasFreshIssueBreakdownPlan(snapshot) &&
+      this.rulesetHasTriageLinkedIssueBreakdownPlan(snapshot)
+    );
+  }
+
+  private rulesetHasTriageLinkedIssueBreakdownPlan(
+    snapshot: IssueCurrentStateSnapshot,
+  ): boolean {
+    return (
+      snapshot.lastIssueBreakdownPlanId !== null &&
+      snapshot.lastIssueTriageReportId !== null &&
+      snapshot.lastIssueBreakdownPlanSourceIssueTriageReportId ===
+        snapshot.lastIssueTriageReportId
+    );
+  }
+
+  private rulesetShouldBlockUnavailableAutomatedTriagePlanner(
+    snapshot: IssueCurrentStateSnapshot,
+  ): boolean {
+    if (snapshot.triggerType !== "orchestrator.tick") return false;
+    if (this.rulesetIssueTriageRetriageReason(snapshot) !== null) return false;
+    if (!this.rulesetHasAutomatedTriagePlannerRoute(snapshot)) return false;
+    if (this.rulesetHasTriageLinkedFreshIssueBreakdownPlan(snapshot))
+      return false;
+    if (
+      !isStateIn(snapshot.trackerState, this.config.tracker.activeStates) &&
+      !isStateIn(snapshot.trackerState, this.config.reviewLoop.reviewStates)
+    )
+      return false;
+    return !this.rulesetAutomatedTriagePlannerCapabilityAvailable(snapshot);
+  }
+
+  private rulesetShouldBlockUnavailableAutomatedTriageWorker(
+    snapshot: IssueCurrentStateSnapshot,
+  ): boolean {
+    if (snapshot.triggerType !== "orchestrator.tick") return false;
+    if (this.rulesetIssueTriageRetriageReason(snapshot) !== null) return false;
+    if (!this.rulesetHasAutomatedTriageWorkerRoute(snapshot)) return false;
+    if (
+      !isStateIn(snapshot.trackerState, this.config.tracker.activeStates) &&
+      !isStateIn(snapshot.trackerState, this.config.reviewLoop.reviewStates)
+    ) {
+      return false;
+    }
+    return !this.rulesetAutomatedTriageWorkerCapabilityAvailable(snapshot);
   }
 
   private rulesetPlanningBackoffActive(
@@ -10915,6 +11973,8 @@ export class Orchestrator {
         snapshot.triggerSource === "transition" &&
         snapshot.transitionRequestContext?.kind === "merge_policy_chain");
     if (!triggerAllowed) return false;
+    if (!this.rulesetLastReviewVerdictDispositionVisible(snapshot))
+      return false;
     if (snapshot.mergePolicyMode !== "gated") return false;
     if (snapshotIsAcceptedArtifactDelivery(snapshot)) return false;
     if (!this.rulesetIsMergePolicyTrackedState(snapshot)) return false;
@@ -10938,6 +11998,8 @@ export class Orchestrator {
         snapshot.triggerSource === "transition" &&
         snapshot.transitionRequestContext?.kind === "merge_policy_chain");
     if (!triggerAllowed) return false;
+    if (!this.rulesetLastReviewVerdictDispositionVisible(snapshot))
+      return false;
     if (snapshot.mergePolicyMode !== "gated") return false;
     if (snapshotIsAcceptedArtifactDelivery(snapshot)) return false;
     if (!this.rulesetIsMergePolicySourceState(snapshot)) return false;
@@ -10970,6 +12032,27 @@ export class Orchestrator {
     return (
       snapshot.mergePolicyMode === "gated" &&
       isStateIn(snapshot.trackerState, snapshot.mergePolicySourceStates)
+    );
+  }
+
+  private rulesetLastReviewVerdictDispositionVisible(
+    snapshot: IssueCurrentStateSnapshot,
+  ): boolean {
+    if (snapshot.lastReviewVerdictId === null) return true;
+    return (
+      snapshot.lastReviewVerdictDispositionWritebackStatus === "applied" ||
+      snapshot.lastReviewVerdictDispositionWritebackStatus === "not_required"
+    );
+  }
+
+  private rulesetLastCompletionReportDispositionVisible(
+    snapshot: IssueCurrentStateSnapshot,
+  ): boolean {
+    if (snapshot.lastCompletionReportId === null) return true;
+    return (
+      snapshot.lastCompletionReportDispositionWritebackStatus === "applied" ||
+      snapshot.lastCompletionReportDispositionWritebackStatus ===
+        "not_required"
     );
   }
 
@@ -11076,8 +12159,10 @@ export class Orchestrator {
   ): boolean {
     if (!this.config.issueBreakdown.enabled) return false;
     if (!snapshot.assignedToWorker || snapshot.hasChildren) return false;
-    if (this.rulesetHasFreshIssueBreakdownPlan(snapshot)) return false;
     if (this.rulesetPlannerAllowedFromBlocked(snapshot)) return true;
+    if (this.rulesetPlannerRequiredByMachineTriage(snapshot))
+      return !this.rulesetHasTriageLinkedFreshIssueBreakdownPlan(snapshot);
+    if (this.rulesetHasFreshIssueBreakdownPlan(snapshot)) return false;
     if (this.rulesetHasPlanningLabel(snapshot)) return true;
     return snapshot.planningFailureCount > 0;
   }
@@ -11087,6 +12172,8 @@ export class Orchestrator {
   ): string {
     if (this.rulesetPlannerAllowedFromBlocked(snapshot))
       return "blocked_issue_breakdown_required";
+    if (this.rulesetPlannerRequiredByMachineTriage(snapshot))
+      return "triage_issue_breakdown_required";
     if (this.rulesetHasPlanningLabel(snapshot))
       return "issue_breakdown_required";
     return "planner_dispatch";
@@ -11236,27 +12323,29 @@ export class Orchestrator {
     snapshot: IssueCurrentStateSnapshot,
   ): boolean {
     if (snapshot.triggerType !== "orchestrator.tick") return false;
-    if (
-      !this.config.issueTriage.enabled ||
-      !snapshot.lifecyclePersistenceAvailable
-    )
-      return false;
+    if (!snapshot.lifecyclePersistenceAvailable) return false;
     if (
       snapshot.phase !== "blocked" &&
       !(
         snapshot.phase === "review" &&
-        isReviewerBlockedTriageReason(snapshot.blockedReason)
+        isIssueTriageBlockedReason(snapshot.blockedReason)
       )
     )
       return false;
     if (snapshot.lastIssueTriageReportId === null) return false;
     if (snapshot.lastIssueTriageReportWritebackOperationKeys === null)
       return false;
-    if (snapshot.lastIssueTriageReportWritebackOperationKeys.length > 0)
-      return false;
-    return (
+    const currentReport =
       snapshot.lastIssueTriageReportTriggerFingerprint ===
-      snapshot.currentIssueTriageTriggerFingerprint
+      snapshot.currentIssueTriageTriggerFingerprint;
+    if (!currentReport) return false;
+    if (snapshot.lastIssueTriageReportWritebackOperationKeys.length === 0)
+      return true;
+    return (
+      snapshot.lastIssueTriageRecoveryDisposition?.reportWritebackStatus ===
+        "pending" ||
+      snapshot.lastIssueTriageRecoveryDisposition?.transitionStatus ===
+      "pending"
     );
   }
 
@@ -11293,8 +12382,11 @@ export class Orchestrator {
     transitionPatch?: Partial<IssueTransitionRequest>;
   }): Promise<IssueHistorySnapshot | null> {
     try {
-      const mergeQueueSnapshotPatch =
-        await this.mergeQueueSnapshotPatchForIssue(input.issue);
+      const [mergeQueueSnapshotPatch, dispositionWritebackSnapshotPatch] =
+        await Promise.all([
+          this.mergeQueueSnapshotPatchForIssue(input.issue),
+          this.dispositionWritebackSnapshotPatchForIssue(input.issue),
+        ]);
       const snapshot = await this.issueCurrentStateBuilder.buildSnapshot(
         input.issue,
         this.issueRuntimeState(input.issue.id),
@@ -11314,6 +12406,7 @@ export class Orchestrator {
           manualIgnoreState: input.manualIgnoreState ?? false,
           snapshotPatch: {
             ...mergeQueueSnapshotPatch,
+            ...dispositionWritebackSnapshotPatch,
             ...(input.snapshotPatch ?? {}),
           },
         },
@@ -11349,6 +12442,79 @@ export class Orchestrator {
     if (this.config.mergePolicy.mode !== "gated") return {};
     const snapshot = await this.mergeQueueStore.getCurrent();
     return mergeQueueProjectionForIssue(issue, snapshot);
+  }
+
+  private async dispositionWritebackSnapshotPatchForIssue(
+    issue: Issue,
+  ): Promise<Partial<IssueCurrentStateSnapshot>> {
+    if (!this.config.writeback.enabled) {
+      return {
+        lastReviewVerdictDispositionWritebackStatus: "not_required",
+        lastCompletionReportDispositionWritebackStatus: "not_required",
+      };
+    }
+    const lifecycle = await this.options.lifecycleStore?.get(issue.id);
+    const verdict =
+      lifecycle?.lastReviewVerdictId === null ||
+      lifecycle?.lastReviewVerdictId === undefined
+        ? null
+        : (lifecycle.reviewVerdicts.find(
+            (candidate) => candidate.id === lifecycle.lastReviewVerdictId,
+          ) ?? null);
+    const completionReport =
+      lifecycle?.lastCompletionReportId === null ||
+      lifecycle?.lastCompletionReportId === undefined
+        ? null
+        : (lifecycle.completionReports.find(
+            (candidate) => candidate.id === lifecycle.lastCompletionReportId,
+          ) ?? null);
+    const [reviewStatus, completionStatus] = await Promise.all([
+      !verdict || verdict.finalDisposition === undefined
+        ? Promise.resolve<DispositionWritebackStatus>("not_required")
+        : this.registeredDispositionWritebackStatus(
+            verdict.writebackOperationKeys,
+            true,
+          ),
+      !completionReport || completionReport.finalDisposition === undefined
+        ? Promise.resolve<DispositionWritebackStatus>("not_required")
+        : this.registeredDispositionWritebackStatus(
+            completionReport.writebackOperationKeys,
+            false,
+          ),
+    ]);
+    return {
+      lastReviewVerdictDispositionWritebackStatus: reviewStatus,
+      lastCompletionReportDispositionWritebackStatus: completionStatus,
+    };
+  }
+
+  private async registeredDispositionWritebackStatus(
+    operationKeys: readonly string[],
+    commentsOnly: boolean,
+  ): Promise<DispositionWritebackStatus> {
+    if (!this.options.writeback) return "pending";
+    const operations = await Promise.all(
+      operationKeys.map((operationKey) =>
+        this.options.writeback!.getOperation(operationKey),
+      ),
+    );
+    if (operations.some((operation) => operation === null)) return "pending";
+    const required = commentsOnly
+      ? operations.filter((operation) => operation?.kind === "comment")
+      : operations;
+    if (required.length === 0) return "failed";
+    if (
+      required.some(
+        (operation) =>
+          operation?.status === "skipped" ||
+          operation?.status === "dead_letter",
+      )
+    ) {
+      return "failed";
+    }
+    return required.every((operation) => operation?.status === "succeeded")
+      ? "applied"
+      : "pending";
   }
 
   private async recordTrackerObservationSnapshot(input: {
@@ -11907,6 +13073,7 @@ export class Orchestrator {
       dispatch: {},
       baseRef: {},
       reportWriteback: {},
+      breakdownApplication: {},
       publicationApproval: {},
       termination: {},
       retry: {},
@@ -12676,6 +13843,7 @@ export class Orchestrator {
     reason:
       | "tracker_state_resume"
       | "manual_ignore_state_resume"
+      | "automated_triage_plan_recovery"
       | "merge_conflict_state_resume"
       | "merge_policy_source_state_resume",
     options: { reopenMergeConflict?: boolean } = {},
@@ -12776,7 +13944,7 @@ export class Orchestrator {
         runPhase === "issue_triage" &&
         (options.manualDispatch === true
           ? shouldIssueTriageManualRun(lifecycle, this.config)
-          : shouldIssueTriageRun(lifecycle, this.config));
+          : shouldIssueTriageRun(lifecycle, this.config, issue));
       return {
         blocked: !allowed,
         explanation: allowed
@@ -12826,23 +13994,44 @@ export class Orchestrator {
 
     const blockedByLifecycle =
       lifecycle.phase === "blocked" || lifecycle.blockedReason !== null;
+    const currentTriageReport = blockedByLifecycle
+      ? latestIssueTriageReportForFingerprint(
+          lifecycle,
+          issueTriageTriggerFingerprint(lifecycle),
+        )
+      : null;
+    const plannerAllowedFromAutomatedTriage =
+      role === "planner" &&
+      runPhase === "issue_breakdown" &&
+      blockedByLifecycle &&
+      isStateIn(issue.state, this.config.tracker.activeStates) &&
+      currentTriageReport?.recoveryDisposition?.mode === "automated" &&
+      currentTriageReport.recoveryDisposition.nextActor === "planner" &&
+      currentTriageReport.recoveryDisposition.targetState !== null &&
+      (currentTriageReport.recoveryDisposition.transitionStatus ===
+        "applied" ||
+        currentTriageReport.recoveryDisposition.transitionStatus ===
+          "not_required") &&
+      isStateIn(issue.state, [
+        currentTriageReport.recoveryDisposition.targetState,
+      ]);
     const plannerAllowedFromBlocked =
       role === "planner" &&
       runPhase === "issue_breakdown" &&
       blockedByLifecycle &&
-      isStateIn(issue.state, this.config.reviewLoop.blockedStates) &&
-      reportHasActiveTriageBlocker(
-        latestIssueTriageReportForFingerprint(
-          lifecycle,
-          issueTriageTriggerFingerprint(lifecycle),
-        ),
-        "under_specified_needs_decomposition",
-      );
+      ((isStateIn(issue.state, this.config.reviewLoop.blockedStates) &&
+        reportHasActiveTriageBlocker(
+          currentTriageReport,
+          "under_specified_needs_decomposition",
+        )) ||
+        plannerAllowedFromAutomatedTriage);
     let explanation: string | null = null;
     if (blockedByLifecycle) {
       if (plannerAllowedFromBlocked) {
         explanation =
-          "Lifecycle is blocked, but the latest triage report allows planner decomposition from blocked state.";
+          plannerAllowedFromAutomatedTriage
+            ? "Lifecycle is internally paused, but automated triage routed recovery to the planner."
+            : "Lifecycle is blocked, but the latest triage report allows planner decomposition from blocked state.";
       } else {
         if (isPendingPublicationApprovalReason(lifecycle.blockedReason)) {
           return {
@@ -13063,6 +14252,7 @@ export class Orchestrator {
       issueBreakdownPlanAccepted: false,
       issueTriageReportAccepted: false,
       issuePostMortemReportAccepted: false,
+      automatedTriagePlannerRecoveryReportId: null,
       pullRequestHandoffAccepted: false,
       reviewVerdictAccepted: false,
       reviewEvidence,
@@ -13239,7 +14429,9 @@ export class Orchestrator {
       await this.updateLifecycle(
         entry,
         entry.runPhase === "issue_breakdown"
-          ? { phase: phaseForIssueState(entry.issue.state, this.config) }
+          ? entry.automatedTriagePlannerRecoveryReportId !== null
+            ? {}
+            : { phase: phaseForIssueState(entry.issue.state, this.config) }
           : {
               phase:
                 entry.manualDispatch?.ignoreState === true
@@ -13682,7 +14874,7 @@ export class Orchestrator {
         (await this.options.lifecycleStore?.get(entry.issue.id)) ?? null;
       const triageEligible =
         entry.manualDispatch === null
-          ? shouldIssueTriageRun(lifecycle, this.config)
+          ? shouldIssueTriageRun(lifecycle, this.config, entry.issue)
           : shouldIssueTriageManualRun(lifecycle, this.config);
       if (!triageEligible) {
         this.options.logger.warn(
@@ -14645,18 +15837,38 @@ export class Orchestrator {
           (await this.reconcileIssueBreakdownPlanHandoff(entry));
         if (accepted) {
           await this.terminalizeAcceptedIssueBreakdownPlan(entry);
+          const persistedLifecycle =
+            (await this.options.lifecycleStore?.get(entry.issue.id)) ??
+            entry.lifecycle;
+          const currentPlan = persistedLifecycle?.lastIssueBreakdownPlanId
+            ? (persistedLifecycle.issueBreakdownPlans.find(
+                (plan) =>
+                  plan.id === persistedLifecycle.lastIssueBreakdownPlanId,
+              ) ?? null)
+            : null;
           await this.updateLifecycle(entry, {
             planningFailureCount: 0,
             planningDispatchRetryCount: 0,
             lastPlanningFailureRunId: null,
             lastPlanningFailureAt: null,
           });
+          if (
+            currentPlan?.applicationStatus === "blocked" &&
+            entry.lifecycle !== null
+          ) {
+            entry.lifecycle = await this.applyLifecycleBlocked(
+              entry.issue,
+              entry.lifecycle,
+              currentPlan.runId,
+              `issue breakdown plan application blocked: ${currentPlan.applicationBlockedReason ?? "unknown application failure"}`,
+              "Resolve the reported issue-breakdown application failure, then move the issue out of Blocked so Symphony can retry.",
+            );
+          }
           await this.clearIssueRetry(
             entry.issue,
             "issue_breakdown_accepted_cleared_retry",
             entry.activeRunId ?? entry.runId ?? issueId,
           );
-          this.completed.add(issueId);
           await this.releaseIssueClaim(
             entry.issue,
             "worker_exit_released_claim",
@@ -15795,7 +17007,11 @@ export class Orchestrator {
       config: this.config,
       turnNumber,
       ...(entry.runPhase === "issue_breakdown"
-        ? { runModeOverride: this.config.issueBreakdown.cursorMode }
+        ? {
+            runModeOverride: this.config.issueBreakdown.cursorMode,
+            sourceIssueTriageReportId:
+              entry.automatedTriagePlannerRecoveryReportId,
+          }
         : {}),
       ...(entry.handoffRepair === null
         ? {}
@@ -16489,7 +17705,7 @@ export class Orchestrator {
         issue_identifier: entry.issue.identifier,
         error: errorMessage(error),
       });
-      return true;
+      return false;
     }
   }
 
@@ -16553,6 +17769,8 @@ export class Orchestrator {
     lifecycle: IssueLifecycleRecord,
     runId: string,
     reason: string,
+    requiredAction =
+      "Inspect the latest run output and reviewer feedback, then move the issue out of the blocked state when Symphony should try again.",
   ): Promise<IssueLifecycleRecord> {
     const store = this.options.lifecycleStore;
     const blockedLifecycle =
@@ -16578,8 +17796,7 @@ export class Orchestrator {
             this.config.reviewLoop.failureLimits.reviewerFailures,
           lastCompletionReport: latestCompletionReport(blockedLifecycle),
           lastReviewVerdict: latestReviewVerdict(blockedLifecycle),
-          requiredAction:
-            "Inspect the latest run output and reviewer feedback, then move the issue out of the blocked state when Symphony should try again.",
+          requiredAction,
         },
         this.config,
       ),
@@ -17664,8 +18881,8 @@ export class Orchestrator {
       "",
       "Blocker guidance:",
       "- Submit an exhaustive blockers array; do not choose a single most-specific disposition.",
-      "- Use under_specified_needs_decomposition when hidden or under-specified scope should become smaller blocking child issues.",
-      "- Prefer under_specified_needs_decomposition when review history shows repeated sibling-scenario or hidden-matrix discovery under the same broad requirement.",
+      "- Use under_specified_needs_decomposition only when the current contract is genuinely ambiguous or contains multiple independently deliverable workstreams that should become blocking children.",
+      "- Repeated findings, distinct owned surfaces, or newly exercised matrix cases remain implementation/validation repair when the contract already owns the invariant and the remaining repair is bounded.",
       "- Use implementation_unsatisfied_requirements when the latest non-merge-gate review failure is active or worker behavior did not satisfy the issue contract.",
       "- A service-owned merge-gate verdict is not proof of unsatisfied implementation by itself. For current-head required-check failures, classify the concrete check, mergeability, conflict, infra, or operator blocker; mark implementation_unsatisfied_requirements active only when evidence shows worker-authored content caused the failure.",
       "- Use pr_review_gate only for review approval gates; mark it downstream when a higher-precedence active blocker still needs work.",
@@ -18483,6 +19700,8 @@ function issueTransitionRulesetPriority(kind: IssueTransitionKind): number {
       return 20;
     case "handoff_repair":
       return 30;
+    case "reconcile_issue_breakdown_plan_application":
+      return 32;
     case "retry_run":
       return 34;
     case "reset_merge_conflict_after_operator_resume":

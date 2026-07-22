@@ -51,7 +51,7 @@ State semantics:
 - `In Review` means awaiting independent reviewer-agent review, not human review.
 - `Ready to Merge` means the reviewer-agent pass was accepted and the issue is ready for human merge/release action.
 - Reviewer-approved merge automation is opt-in only. With the default/manual merge policy, Symphony stops at `Ready to Merge`; `merge_policy.mode: gated` must be configured before Symphony can merge the lifecycle-bound PR and transition Linear to `Done`.
-- `Blocked` means human-required escalation, including max review loops or max incomplete worker turns.
+- `Blocked` means human or external intervention is required. Max reviewer failures first pause in `In Review` for triage and automatically resume machine-owned repair; max incomplete worker turns remain an operator escalation under the current policy.
 - A passing review is recorded through structured reviewer verdict evidence, such as a Linear comment or PR review, before the issue leaves `In Review`.
 - Do not add a separate `Ready` or `Ready for Human` state for the current dogfood loop; use the configured `Ready to Merge` pass destination.
 

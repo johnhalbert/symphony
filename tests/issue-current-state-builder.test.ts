@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import sqlite3 from "sqlite3";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
   pendingPublicationHandoffForRun,
@@ -1496,8 +1496,9 @@ describe("IssueCurrentStateBuilder", () => {
       lastIssueTriageReportId: "triage-report-1",
       lastIssueTriageReportTriggerFingerprint: triageFingerprint,
       lastIssueTriageReportWritebackOperationKeys: ["history-triage-writeback"],
+      lastIssueTriageRecoveryDisposition: null,
       currentIssueTriageTriggerFingerprint: triageFingerprint,
-      issueTriageCurrentTriggerReportIds: ["triage-report-1"],
+      issueTriageCurrentTriggerReportIds: [],
       latestIssueTriageReportBlockers: [
         {
           summary: "History blocker",
@@ -2606,9 +2607,7 @@ describe("IssueCurrentStateBuilder", () => {
       const lifecycleStore = new FileIssueLifecycleStore(scenarioRoot);
       const runStore = new FileRunTranscriptStore(scenarioRoot);
       const historyStore = new MemoryIssueStateStore();
-      for (const run of scenario.runs) {
-        await startStoredRun(runStore, scenario.issue, run);
-      }
+      await startTimelineRuns(runStore, scenario.issue, scenario.runs);
       const lifecycle = await scenario.arrangeLifecycle({
         issue: scenario.issue,
         lifecycleStore,
@@ -2929,6 +2928,23 @@ async function startStoredRun(
       cancelFailed: false,
     },
   });
+}
+
+async function startTimelineRuns(
+  runStore: FileRunTranscriptStore,
+  issue: Issue,
+  runs: readonly StoredRunInput[],
+): Promise<void> {
+  const firstStartedAt = Date.parse("2026-01-01T00:00:00.000Z");
+  vi.useFakeTimers();
+  try {
+    for (const [index, run] of runs.entries()) {
+      vi.setSystemTime(new Date(firstStartedAt + index * 1_000));
+      await startStoredRun(runStore, issue, run);
+    }
+  } finally {
+    vi.useRealTimers();
+  }
 }
 
 async function startFailedWorkerRun(

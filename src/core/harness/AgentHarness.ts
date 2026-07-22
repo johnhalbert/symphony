@@ -52,6 +52,7 @@ export interface AgentRunContext {
   config: ServiceConfig;
   turnNumber: number;
   runModeOverride?: AgentRunMode | null;
+  sourceIssueTriageReportId?: string | null;
   operatorChat?: {
     conversationId: string;
     messageId: string;
