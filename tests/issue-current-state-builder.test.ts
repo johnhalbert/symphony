@@ -36,6 +36,10 @@ import {
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
 import { issueTriageTriggerFingerprint } from "../src/core/IssueTriageService.js";
 import {
+  buildDeclaredIssueSuccessionRecord,
+  buildIssueRelationshipState,
+} from "../src/core/IssueRelationshipService.js";
+import {
   runKindForPhase,
   type AgentRunKind,
   type AgentRunPhase,
@@ -43,6 +47,7 @@ import {
   type Issue,
   type TokenCounts,
 } from "../src/core/types.js";
+import { agentEligibleIssueContract } from "./helpers.js";
 
 describe("IssueCurrentStateBuilder", () => {
   let root: string;
@@ -117,6 +122,279 @@ describe("IssueCurrentStateBuilder", () => {
     expect(current.mergePolicyConfigFingerprint).toMatch(/^[a-f0-9]+$/);
   });
 
+  it("projects the current generalized relationship graph instead of a stale lifecycle copy", async () => {
+    const lifecycleStore = new FileIssueLifecycleStore(root);
+    const issueStateStore = new MemoryIssueStateStore();
+    const staleIssue = issueFixture({
+      description: agentEligibleIssueContract(),
+      blocks: [],
+      blockedBy: [],
+    });
+    const currentIssue = issueFixture({
+      description: agentEligibleIssueContract({
+        issueContractRelationships: {
+          blocks: ["TEST-2"],
+          blockedBy: ["TEST-0"],
+        },
+      }),
+      blocks: [{ id: "next-1", identifier: "TEST-2", state: "Todo" }],
+      blockedBy: [{ id: "dep-1", identifier: "TEST-0", state: "Done" }],
+    });
+    await lifecycleStore.ensureIssue(currentIssue, {
+      relationshipState: buildIssueRelationshipState(staleIssue),
+    });
+    const builder = new IssueCurrentStateBuilder({
+      config: builderConfig(root),
+      lifecycleStore,
+      runStore: undefined,
+      issueStateStore,
+      logger: silentLogger(),
+    });
+
+    const current = await builder.build(currentIssue, emptyRuntime());
+
+    expect(current.relationshipState).toMatchObject({
+      status: "valid",
+      contractBlocks: ["TEST-2"],
+      contractBlockedBy: ["TEST-0"],
+      trackerBlocks: [{ identifier: "TEST-2" }],
+      trackerBlockedBy: [{ identifier: "TEST-0" }],
+    });
+    expect(current.relationshipState?.edges).toHaveLength(2);
+  });
+
+  it("projects only the succession declared by the current Issue Contract", async () => {
+    const lifecycleStore = new FileIssueLifecycleStore(root);
+    const sourceIssue = issueFixture({
+      description: agentEligibleIssueContract({
+        issueContractContractVersion: "2026-07-23.source",
+        issueContractDelivery: {
+          mode: "accepted_artifact",
+          artifact: "expected_red_tests",
+        },
+        issueContractRelationships: {
+          blocks: ["TEST-2"],
+          blockedBy: [],
+          succession: {
+            id: "tdd-test-1-test-2",
+            purpose: "expected_red_implementation",
+            successor: { issue: "TEST-2" },
+          },
+        },
+      }),
+      blocks: [{ id: "issue-2", identifier: "TEST-2", state: "Todo" }],
+    });
+    const declared = buildDeclaredIssueSuccessionRecord(sourceIssue);
+    if (!declared) throw new Error("Expected a declared succession");
+    await lifecycleStore.ensureIssue(sourceIssue, {
+      succession: {
+        ...declared,
+        linearBlockVerified: true,
+        status: "integrated",
+        mergeCommitSha: "merge-sha",
+      },
+    });
+    const builder = new IssueCurrentStateBuilder({
+      config: builderConfig(root),
+      lifecycleStore,
+      runStore: undefined,
+      issueStateStore: new MemoryIssueStateStore(),
+      logger: silentLogger(),
+    });
+
+    const edgeRemoved = await builder.build(
+      {
+        ...sourceIssue,
+        blocks: [],
+      },
+      emptyRuntime(),
+    );
+    expect(edgeRemoved.relationshipState).toMatchObject({
+      status: "invalid",
+    });
+    expect(edgeRemoved.succession).toMatchObject({
+      id: "tdd-test-1-test-2",
+      role: "succeeded",
+      status: "declared",
+      linearBlockVerified: false,
+      mergeCommitSha: null,
+    });
+
+    const unrelatedEdgeDrift = await builder.build(
+      {
+        ...sourceIssue,
+        blocks: [
+          ...(sourceIssue.blocks ?? []),
+          { id: "issue-99", identifier: "TEST-99", state: "Todo" },
+        ],
+      },
+      emptyRuntime(),
+    );
+    expect(unrelatedEdgeDrift.relationshipState).toMatchObject({
+      status: "invalid",
+    });
+    expect(unrelatedEdgeDrift.succession).toMatchObject({
+      id: "tdd-test-1-test-2",
+      role: "succeeded",
+      status: "integrated",
+      linearBlockVerified: true,
+      mergeCommitSha: "merge-sha",
+    });
+
+    const removed = await builder.build(
+      {
+        ...sourceIssue,
+        description: agentEligibleIssueContract(),
+        blocks: [],
+      },
+      emptyRuntime(),
+    );
+    expect(removed.succession).toBeNull();
+
+    const replaced = await builder.build(
+      {
+        ...sourceIssue,
+        description: agentEligibleIssueContract({
+          issueContractContractVersion: "2026-07-23.replaced",
+          issueContractDelivery: {
+            mode: "accepted_artifact",
+            artifact: "expected_red_tests",
+          },
+          issueContractRelationships: {
+            blocks: ["TEST-2"],
+            blockedBy: [],
+            succession: {
+              id: "tdd-test-1-test-2-replaced",
+              purpose: "expected_red_implementation",
+              successor: { issue: "TEST-2" },
+            },
+          },
+        }),
+      },
+      emptyRuntime(),
+    );
+    expect(replaced.succession).toMatchObject({
+      id: "tdd-test-1-test-2-replaced",
+      role: "succeeded",
+      status: "declared",
+      mergeCommitSha: null,
+    });
+  });
+
+  it("rebuilds relationship fields from later tracker evidence without resurrecting integrated succession", async () => {
+    const lifecycleStore = new FileIssueLifecycleStore(root);
+    const sourceIssue = issueFixture({
+      description: agentEligibleIssueContract({
+        issueContractContractVersion: "2026-07-23.history-source",
+        issueContractDelivery: {
+          mode: "accepted_artifact",
+          artifact: "expected_red_tests",
+        },
+        issueContractRelationships: {
+          blocks: ["TEST-2"],
+          blockedBy: [],
+          succession: {
+            id: "tdd-test-1-test-2-history",
+            purpose: "expected_red_implementation",
+            successor: { issue: "TEST-2" },
+          },
+        },
+      }),
+      blocks: [{ id: "issue-2", identifier: "TEST-2", state: "Todo" }],
+    });
+    const declared = buildDeclaredIssueSuccessionRecord(sourceIssue);
+    if (!declared) throw new Error("Expected a declared succession");
+    const lifecycle = await lifecycleStore.ensureIssue(sourceIssue, {
+      relationshipState: buildIssueRelationshipState(sourceIssue),
+      succession: {
+        ...declared,
+        linearBlockVerified: true,
+        status: "integrated",
+        mergeCommitSha: "merge-sha",
+      },
+    });
+    const stateStore = new SqliteIssueStateStore(root);
+    try {
+      const builder = new IssueCurrentStateBuilder({
+        config: builderConfig(root),
+        lifecycleStore,
+        runStore: undefined,
+        issueStateStore: stateStore,
+        logger: silentLogger(),
+      });
+      const integratedCurrent = await builder.build(
+        sourceIssue,
+        emptyRuntime(),
+      );
+      await stateStore.ensureCurrent(integratedCurrent);
+      await stateStore.appendSnapshotOnly(
+        sourceIssue,
+        lifecycleEvidenceSnapshot(integratedCurrent, lifecycle),
+      );
+
+      const edgeRemovedIssue = {
+        ...sourceIssue,
+        blocks: [],
+        updatedAt: "2026-01-01T00:00:05.000Z",
+      };
+      const edgeRemovedCurrent = await builder.build(
+        edgeRemovedIssue,
+        emptyRuntime(),
+      );
+      const trackerSnapshot = trackerEvidenceSnapshot(
+        edgeRemovedCurrent,
+        edgeRemovedIssue,
+      );
+      await stateStore.appendSnapshotOnly(edgeRemovedIssue, {
+        ...trackerSnapshot,
+        snapshotId: "issue-snapshot:tracker-succession-edge-removed",
+        snapshotAt: "2026-01-01T00:00:05.000Z",
+        triggerId: "orchestrator.tick:tracker-succession-edge-removed",
+        triggerAt: "2026-01-01T00:00:05.000Z",
+        historySnapshotId:
+          "issue-history:tracker-succession-edge-removed",
+        transitionId:
+          "transition:record_evidence:tracker-succession-edge-removed",
+      });
+    } finally {
+      await stateStore.close();
+    }
+
+    const reopenedStateStore = new SqliteIssueStateStore(root);
+    try {
+      const historyBuilder = new IssueCurrentStateBuilder({
+        config: builderConfig(root),
+        lifecycleStore,
+        runStore: undefined,
+        issueStateStore: reopenedStateStore,
+        logger: silentLogger(),
+      });
+      const rebuilt =
+        await historyBuilder.rebuildHistoryBackedFieldsFromStoredHistory(
+          sourceIssue.id,
+          ["lifecycleReports"],
+        );
+
+      expect(rebuilt.fields.relationshipState).toMatchObject({
+        status: "invalid",
+        trackerBlocks: [],
+      });
+      expect(rebuilt.fields.succession).toMatchObject({
+        id: "tdd-test-1-test-2-history",
+        role: "succeeded",
+        status: "declared",
+        linearBlockVerified: false,
+        mergeCommitSha: null,
+      });
+      expect(rebuilt.sourceSnapshotIdsByGroup.lifecycleReports).toEqual([
+        "issue-history:lifecycle-evidence",
+        "issue-history:tracker-succession-edge-removed",
+      ]);
+    } finally {
+      await reopenedStateStore.close();
+    }
+  });
+
   it("projects only active preserved worktree stashes from lifecycle", async () => {
     const lifecycleStore = new FileIssueLifecycleStore(root);
     const builder = new IssueCurrentStateBuilder({
@@ -154,6 +432,7 @@ describe("IssueCurrentStateBuilder", () => {
       state: "Blocked",
       priority: 2,
       branchName: "feature/test-1",
+      blocks: [{ id: "next-1", identifier: "TEST-2", state: "Todo" }],
       blockedBy: [{ id: "dep-1", identifier: "TEST-0", state: "Todo" }],
       hasChildren: true,
     });
@@ -221,6 +500,7 @@ describe("IssueCurrentStateBuilder", () => {
       branchName: "feature/test-1",
       assignedToWorker: true,
       labels: ["planning"],
+      blocks: [{ id: "next-1", identifier: "TEST-2", state: "Todo" }],
       blockedBy: [{ id: "dep-1", identifier: "TEST-0", state: "Todo" }],
       hasChildren: true,
       phase: "blocked",
@@ -520,6 +800,7 @@ describe("IssueCurrentStateBuilder", () => {
       assigneeId: "worker-2",
       delegateId: "delegate-1",
       assignedToWorker: false,
+      blocks: [{ id: "next-1", identifier: "TEST-2", state: "In Progress" }],
       blockedBy: [{ id: "dep-1", identifier: "TEST-0", state: "Todo" }],
       hasChildren: true,
       updatedAt: "2026-01-01T00:00:01.000Z",
@@ -551,6 +832,7 @@ describe("IssueCurrentStateBuilder", () => {
       assigneeId: "worker-2",
       delegateId: "delegate-1",
       assignedToWorker: false,
+      blocks: [{ id: "next-1", identifier: "TEST-2", state: "In Progress" }],
       blockedBy: [{ id: "dep-1", identifier: "TEST-0", state: "Todo" }],
       hasChildren: true,
       trackerUpdatedAt: "2026-01-01T00:00:01.000Z",
@@ -988,6 +1270,22 @@ describe("IssueCurrentStateBuilder", () => {
       preparedAt: null,
       failureReason: null,
     };
+    const acceptedArtifactValidationFailure = {
+      version: 1 as const,
+      count: 1,
+      limit: 3,
+      category: "contract_or_head_drift" as const,
+      reason: "source_checkpoint_drift" as const,
+      signature: "store-failure-signature",
+      message: "Store checkpoint drift",
+      firstFailedAt: "2026-01-01T00:00:08.000Z",
+      lastFailedAt: "2026-01-01T00:00:08.000Z",
+      completionReportId: completionReport.id,
+      reviewVerdictId: passVerdict.id,
+      liveContractFingerprint: "live-contract",
+      reviewedContractFingerprint: "reviewed-contract",
+      sourceHeadSha: "source-head-sha",
+    };
     const lifecycle = await lifecycleStore.ensureIssue(issue, {
       phase: "passed",
       lastCompletionReportId: completionReport.id,
@@ -995,6 +1293,7 @@ describe("IssueCurrentStateBuilder", () => {
       completionReports: [completionReport],
       reviewVerdicts: [passVerdict],
       acceptedArtifact,
+      acceptedArtifactValidationFailure,
       workspaceSeed,
     });
     const historyStore = new MemoryIssueStateStore();
@@ -1007,6 +1306,10 @@ describe("IssueCurrentStateBuilder", () => {
     });
     const storeCurrent = await storeBuilder.build(issue, emptyRuntime());
     expect(storeCurrent.acceptedArtifact).toMatchObject({ id: "artifact-store" });
+    expect(storeCurrent.acceptedArtifactValidationFailure).toMatchObject({
+      count: 1,
+      signature: "store-failure-signature",
+    });
     expect(storeCurrent.workspaceSeed).toMatchObject({ id: "seed-store", status: "planned" });
     const historyCompletionReport = {
       ...completionReport,
@@ -1028,6 +1331,12 @@ describe("IssueCurrentStateBuilder", () => {
         id: "artifact-history",
         status: "completed_unmerged",
         completedAt: "2026-01-01T00:00:06.000Z",
+      },
+      acceptedArtifactValidationFailure: {
+        ...acceptedArtifactValidationFailure,
+        count: 2,
+        message: "History checkpoint drift",
+        lastFailedAt: "2026-01-01T00:00:09.000Z",
       },
       workspaceSeed: {
         ...workspaceSeed,
@@ -1078,6 +1387,11 @@ describe("IssueCurrentStateBuilder", () => {
     expect(current.acceptedArtifact).toMatchObject({
       id: "artifact-history",
       status: "completed_unmerged",
+    });
+    expect(current.acceptedArtifactValidationFailure).toMatchObject({
+      count: 2,
+      signature: "store-failure-signature",
+      message: "History checkpoint drift",
     });
     expect(current.workspaceSeed).toMatchObject({
       id: "seed-history",
@@ -3024,6 +3338,7 @@ function trackerEvidenceSnapshot(
     observedAssigneeId: observed.assigneeId,
     observedDelegateId: observed.delegateId,
     observedAssignedToWorker: observed.assignedToWorker,
+    observedBlocks: observed.blocks ?? [],
     observedBlockedBy: observed.blockedBy,
     observedHasChildren: observed.hasChildren === true,
     observedTrackerCreatedAt: observed.createdAt,
@@ -3101,7 +3416,11 @@ function lifecycleEvidenceSnapshot(
       latestCompletionReport,
       latestApprovalPassVerdict,
       acceptedArtifact: lifecycle.acceptedArtifact ?? null,
+      acceptedArtifactValidationFailure:
+        lifecycle.acceptedArtifactValidationFailure ?? null,
       workspaceSeed: lifecycle.workspaceSeed ?? null,
+      relationshipState: lifecycle.relationshipState ?? null,
+      succession: lifecycle.succession ?? null,
       merge: lifecycle.merge,
       mergeGate: lifecycle.mergeGate,
       mergeGateResults: lifecycle.mergeGateResults ?? [],
@@ -3138,7 +3457,11 @@ function lifecycleEvidenceSnapshot(
     lifecycleLatestCompletionReport: latestCompletionReport,
     lifecycleLatestApprovalPassVerdict: latestApprovalPassVerdict,
     lifecycleAcceptedArtifact: lifecycle.acceptedArtifact ?? null,
+    lifecycleAcceptedArtifactValidationFailure:
+      lifecycle.acceptedArtifactValidationFailure ?? null,
     lifecycleWorkspaceSeed: lifecycle.workspaceSeed ?? null,
+    lifecycleRelationshipState: lifecycle.relationshipState ?? null,
+    lifecycleSuccession: lifecycle.succession ?? null,
     lifecycleMerge: lifecycle.merge,
     lifecycleMergeGate: lifecycle.mergeGate,
     lifecycleMergeGateResults: lifecycle.mergeGateResults ?? [],

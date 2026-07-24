@@ -33,6 +33,14 @@ export interface TrackerIssueRelationInput {
   dependency: string;
 }
 
+export interface TrackerIssueDescriptionUpdateInput {
+  issueId: string;
+  description: string;
+  dedupeKey: string;
+  planId?: string;
+  expectedContractFingerprint?: string;
+}
+
 export interface TrackerIssueRef {
   id: string;
   identifier: string | null;
@@ -61,4 +69,7 @@ export interface TrackerWriter {
   createIssueComment(input: TrackerCommentInput): Promise<TrackerWriteResult>;
   createIssueFromPlan?(input: TrackerIssueCreateInput): Promise<TrackerWriteResult>;
   createIssueRelation?(input: TrackerIssueRelationInput): Promise<TrackerWriteResult>;
+  updateIssueDescription?(
+    input: TrackerIssueDescriptionUpdateInput,
+  ): Promise<TrackerWriteResult>;
 }

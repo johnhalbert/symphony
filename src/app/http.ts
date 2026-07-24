@@ -4161,6 +4161,13 @@ function trackerIssueContentDigest(issues: readonly Issue[]): string {
       assigneeId: issue.assigneeId,
       delegateId: issue.delegateId,
       labels: [...issue.labels].sort(compareString),
+      blocks: (issue.blocks ?? [])
+        .map((blocked) => ({
+          id: blocked.id,
+          identifier: blocked.identifier,
+          state: blocked.state,
+        }))
+        .sort((left, right) => compareString(left.identifier ?? left.id ?? "", right.identifier ?? right.id ?? "")),
       blockedBy: issue.blockedBy
         .map((blocker) => ({
           id: blocker.id,
@@ -7421,6 +7428,7 @@ function durableIssueStatusView(input: {
     assigneeId: null,
     delegateId: null,
     labels: [],
+    blocks: [],
     blockedBy: [],
     createdAt: null,
     updatedAt: null,
@@ -7834,6 +7842,8 @@ function reviewLoopStatus(input: {
       input.live?.runKind ?? (input.latestRun?.runPhase === undefined ? null : runKindForPhase(input.latestRun.runPhase)),
     reviewRound: lifecycle?.reviewRound ?? null,
     incompleteTurnCount: lifecycle?.incompleteTurnCount ?? null,
+    acceptedArtifactValidationFailure:
+      lifecycle?.acceptedArtifactValidationFailure ?? null,
     lastCompletionReport: latestCompletionReport(lifecycle),
     lastReviewVerdict: latestReviewVerdict(lifecycle),
     lastIssueTriageReport: latestIssueTriageReport(lifecycle),

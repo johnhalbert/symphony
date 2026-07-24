@@ -238,6 +238,11 @@ interface ReviewLoopConfig {
   reviewerPromptExtensions: string[];
   workerPromptExtensions: string[];
   maxReviewRounds: number;
+  failureLimits: {
+    reviewerFailures: number;
+    mergeGateFailures: number;
+    acceptedArtifactValidationFailures: number;
+  };
   maxIncompleteTurns: number;
   continuationHistoryThreshold: number;
   transcriptHistoryLimit: number;
@@ -375,6 +380,7 @@ interface Issue {
   delegateId: string | null;
   assignedToWorker: boolean;
   labels: string[];
+  blocks: IssueBlockerRef[];
   blockedBy: IssueBlockerRef[];
   createdAt: IsoDateTime | null;
   updatedAt: IsoDateTime | null;
@@ -392,6 +398,7 @@ interface IssueStatusView {
   assigneeId: string | null;
   delegateId: string | null;
   labels: string[];
+  blocks: IssueBlockerRef[];
   blockedBy: IssueBlockerRef[];
   createdAt: string | null;
   updatedAt: string | null;
@@ -538,7 +545,8 @@ Linear relationship rules:
 
 - `LinearIssueNode` becomes `Issue`.
 - Labels are lowercased in the normalized `Issue.labels`.
-- Inverse Linear relations of type `blocks` become `Issue.blockedBy`.
+- Outgoing Linear relations of type `blocks` become `Issue.blocks`; inverse
+  relations of the same type become `Issue.blockedBy`.
 - `tracker.assignee` and Linear `assignee` or `delegate` decide `Issue.assignedToWorker`.
 - Linear workflow state names must cover configured active, review, blocked, pass, merge, and terminal states for live operation.
 
@@ -580,6 +588,13 @@ interface TrackerIssueRelationInput {
   dedupeKey: string;
   planId?: string;
   dependency: string;
+}
+
+interface TrackerIssueDescriptionUpdateInput {
+  issueId: IssueId;
+  description: string;
+  dedupeKey: string;
+  planId?: string;
 }
 
 interface TrackerWriteEvidence {
@@ -1200,6 +1215,26 @@ interface IssueHandoffState {
   lastReviewerOutput: IssueReviewerOutputContract | null;
 }
 
+interface IssueAcceptedArtifactValidationFailureState {
+  version: 1;
+  count: number;
+  limit: number;
+  category: "contract_or_head_drift";
+  reason:
+    | "contract_or_review_drift"
+    | "pull_request_or_branch_drift"
+    | "source_checkpoint_drift";
+  signature: string;
+  message: string;
+  firstFailedAt: IsoDateTime;
+  lastFailedAt: IsoDateTime;
+  completionReportId: string | null;
+  reviewVerdictId: string | null;
+  liveContractFingerprint: string;
+  reviewedContractFingerprint: string | null;
+  sourceHeadSha: string | null;
+}
+
 interface IssueLifecycleRecord {
   issueId: IssueId;
   issueIdentifier: IssueIdentifier;
@@ -1225,6 +1260,9 @@ interface IssueLifecycleRecord {
   merge: IssueMergeMetadata | null;
   mergeConflict: IssueMergeConflictMetadata | null;
   mergeConflictResolutionReports: IssueMergeConflictResolutionReportRecord[];
+  acceptedArtifactValidationFailure?: IssueAcceptedArtifactValidationFailureState | null;
+  relationshipState?: IssueRelationshipState | null;
+  succession?: IssueSuccessionRecord | null;
   handoff: IssueHandoffState;
   createdAt: IsoDateTime;
   updatedAt: IsoDateTime;
@@ -1237,6 +1275,15 @@ Lifecycle relationships:
 - `summaryPointers` is the denormalized "latest known" bridge to workspaces, runs, git, PR, and CI.
 - `summaryReferences` points to transcript and status API locations that can rebuild context.
 - `handoff.memo` is the compact cross-turn memory used between worker and reviewer lanes.
+- `acceptedArtifactValidationFailure` tracks the active validation-failure streak independently of review rounds. Evidence supersession preserves it; a changed cause starts a new streak, and successful accepted-artifact completion clears it.
+- `relationshipState` is the normalized generalized ordering graph. It stores
+  contract `blocks`/`blockedBy`, tracker observations, canonical directed
+  `blocks` edges, synchronization status, and contract fingerprints.
+- `succession` is a separate bilateral expected-red/implementation binding
+  with its own identity, endpoints, contract fingerprints, Linear-edge
+  verification, artifact/seed references, and lifecycle status. A generalized
+  blocker edge never creates or selects succession.
+- A missing, invalid, or non-accepted-artifact live Issue Contract is operator-owned and uses an effective ceiling of one. Repairable review, branch, and checkpoint drift uses `failureLimits.acceptedArtifactValidationFailures`.
 - `reviewEvidence.lastWorkerEvidenceCursor` prevents workers from reusing stale PR review evidence.
 - Merge automation uses completion report + review approval + PR details + required checks to update `mergeGate`, `mergeConflict`, or `merge`.
 

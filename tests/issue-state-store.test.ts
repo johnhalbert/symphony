@@ -176,15 +176,17 @@ describe("SqliteIssueStateStore", () => {
     ]);
   });
 
-  it("defaults accepted artifact and workspace seed for legacy current-state caches", async () => {
+  it("defaults outgoing blocks and artifact fields for legacy current-state caches", async () => {
     const current = currentFields();
     const legacy = { ...current } as Partial<IssueCurrentFields>;
+    delete legacy.blocks;
     delete legacy.acceptedArtifact;
     delete legacy.workspaceSeed;
 
     const fileStore = new FileIssueStateStore(path.join(root, "file"));
     await fileStore.ensureCurrent(legacy as IssueCurrentFields);
     await expect(fileStore.getCurrent(current.issueId)).resolves.toMatchObject({
+      blocks: [],
       acceptedArtifact: null,
       workspaceSeed: null,
     });
@@ -193,6 +195,7 @@ describe("SqliteIssueStateStore", () => {
     stores.push(sqliteStore);
     await sqliteStore.ensureCurrent(legacy as IssueCurrentFields);
     await expect(sqliteStore.getCurrent(current.issueId)).resolves.toMatchObject({
+      blocks: [],
       acceptedArtifact: null,
       workspaceSeed: null,
     });
@@ -710,6 +713,7 @@ function currentFields(): IssueCurrentFields {
     delegateId: null,
     assignedToWorker: true,
     labels: [],
+    blocks: [],
     blockedBy: [],
     hasChildren: false,
     trackerCreatedAt: now,

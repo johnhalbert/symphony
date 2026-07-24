@@ -671,7 +671,11 @@ function sameWorkspaceSeedBinding(
     left.preparedBaseHeadSha === right.preparedBaseHeadSha &&
     left.targetBranch === right.targetBranch &&
     left.conflictedFiles.length === right.conflictedFiles.length &&
-    left.conflictedFiles.every((filePath, index) => filePath === right.conflictedFiles[index])
+    left.conflictedFiles.every((filePath, index) => filePath === right.conflictedFiles[index]) &&
+    (left.absorbedPaths ?? []).length === (right.absorbedPaths ?? []).length &&
+    (left.absorbedPaths ?? []).every(
+      (filePath, index) => filePath === (right.absorbedPaths ?? [])[index],
+    )
   );
 }
 

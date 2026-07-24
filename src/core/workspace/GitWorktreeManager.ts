@@ -149,6 +149,44 @@ export async function verifyGitWorktreeSeedBinding(
       inspectAcceptedArtifactWorktreePath(workspacePath, filePath),
   });
   if (failure !== null) throw seedManifestVerificationError(failure);
+  if (binding.absorbedPaths !== undefined) {
+    const preparedBaseHeadSha = await resolveExactCommit(
+      workspacePath,
+      binding.preparedBaseHeadSha,
+      "persisted accepted-artifact prepared base",
+      timeoutMs,
+    );
+    const preparedHeadSha = await resolveExactCommit(
+      workspacePath,
+      binding.preparedHeadSha,
+      "persisted accepted-artifact prepared head",
+      timeoutMs,
+    );
+    await verifyPreparedArtifactFiles(
+      workspacePath,
+      preparedHeadSha,
+      binding.fileManifest,
+      timeoutMs,
+    );
+    const absorbedPaths = await verifyPreparedArtifactDiff(
+      workspacePath,
+      preparedBaseHeadSha,
+      preparedHeadSha,
+      binding.fileManifest,
+      timeoutMs,
+    );
+    if (
+      absorbedPaths.length !== binding.absorbedPaths.length ||
+      absorbedPaths.some(
+        (filePath, index) => filePath !== binding.absorbedPaths?.[index],
+      )
+    ) {
+      throw new SymphonyError(
+        "workspace_error",
+        "Persisted accepted-artifact absorbed paths do not match the prepared checkpoint",
+      );
+    }
+  }
   return binding;
 }
 
@@ -319,7 +357,7 @@ export async function finalizeGitWorktreeSeedConflict(
     binding.fileManifest,
     timeoutMs,
   );
-  await verifyPreparedArtifactDiff(
+  const absorbedPaths = await verifyPreparedArtifactDiff(
     workspacePath,
     preparedBaseHeadSha,
     preparedHeadSha,
@@ -331,6 +369,7 @@ export async function finalizeGitWorktreeSeedConflict(
     preparedBaseHeadSha,
     preparedHeadSha,
     conflictedFiles: [],
+    absorbedPaths,
   };
 }
 
@@ -711,7 +750,7 @@ async function preparedSeedBinding(
     input.seed.fileManifest,
     input.timeoutMs,
   );
-  await verifyPreparedArtifactDiff(
+  const absorbedPaths = await verifyPreparedArtifactDiff(
     input.repoPath,
     input.preparedBaseHeadSha,
     preparedHeadSha,
@@ -724,6 +763,7 @@ async function preparedSeedBinding(
     preparedBaseHeadSha: input.preparedBaseHeadSha,
     preparedHeadSha,
     conflictedFiles: [],
+    absorbedPaths,
   };
 }
 
@@ -1582,7 +1622,7 @@ async function verifyPreparedArtifactDiff(
   preparedHeadSha: string,
   manifest: ArtifactFileManifestEntry[],
   timeoutMs: number,
-): Promise<void> {
+): Promise<string[]> {
   const actual = await sourceDiffManifest(
     repoPath,
     preparedBaseHeadSha,
@@ -1590,20 +1630,32 @@ async function verifyPreparedArtifactDiff(
     timeoutMs,
   );
   const expected = validatedManifestByPath(manifest);
-  if (actual.size !== expected.size) {
-    throw new SymphonyError(
-      "workspace_error",
-      "Prepared accepted-artifact diff contains changes outside its reviewed manifest",
-    );
-  }
   for (const [filePath, status] of actual) {
-    if (expected.get(filePath)?.status !== status) {
+    const reviewed = expected.get(filePath);
+    if (reviewed === undefined) {
+      throw new SymphonyError(
+        "workspace_error",
+        `Prepared accepted-artifact diff contains change outside its reviewed manifest: ${filePath}`,
+      );
+    }
+    if (reviewed.status !== status) {
       throw new SymphonyError(
         "workspace_error",
         `Prepared accepted-artifact diff changed the reviewed status of ${filePath}`,
       );
     }
   }
+  const absorbed = manifest.filter((entry) => !actual.has(entry.path));
+  if (absorbed.length > 0) {
+    await verifyManifestObjects(
+      repoPath,
+      preparedBaseHeadSha,
+      absorbed,
+      timeoutMs,
+      "prepared base absorption",
+    );
+  }
+  return absorbed.map((entry) => entry.path).sort();
 }
 
 function validatedManifestByPath(

@@ -19,6 +19,8 @@ import {
   createRuntimeTrackerClient,
   createRuntimeWritebackProcessor,
 } from "../../app/RuntimeDependencies.js";
+import { SqliteIssueStateStore } from "../orchestration/SqliteIssueStateStore.js";
+import { IssueLifecycleEvidenceRecorder } from "../orchestration/IssueLifecycleEvidenceRecorder.js";
 
 export const COMPLETION_REPORT_TOOL_NAME = "submit_completion_report";
 
@@ -47,6 +49,7 @@ export async function submitCompletionReportFromMcp(input: unknown, options: {
   workflowPath: string;
   contextFile: string;
   pullRequestPublisher?: CompletionReportPullRequestPublisher;
+  resolveIssuesByIds?: (issueIds: string[]) => Promise<Issue[]>;
 }): Promise<unknown> {
   const loadedContext = await readCompletionReportContext(options.contextFile);
   if (!loadedContext.activeRunId) {
@@ -55,12 +58,21 @@ export async function submitCompletionReportFromMcp(input: unknown, options: {
 
   const loader = new WorkflowLoader(options.workflowPath);
   let writebackOutbox: SqliteWritebackOutboxStore | null = null;
+  let issueStateStore: SqliteIssueStateStore | null = null;
   try {
     const loaded = await loader.load();
     const config = loaded.serviceConfig;
     const logger = new StructuredLogger(() => undefined);
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    issueStateStore = new SqliteIssueStateStore(config.workspace.stateDir);
+    const lifecycleEvidenceRecorder = new IssueLifecycleEvidenceRecorder({
+      config,
+      lifecycleStore,
+      runStore,
+      issueStateStore,
+      logger,
+    });
     writebackOutbox = new SqliteWritebackOutboxStore(config.workspace.stateDir);
     const writebackProcessor =
       config.writeback.enabled && (config.github.operatorApproval?.requiredForPublication ?? false)
@@ -86,8 +98,11 @@ export async function submitCompletionReportFromMcp(input: unknown, options: {
       runStore,
       ...(pullRequestPublisher === undefined ? {} : { pullRequestPublisher }),
       operatorApproval,
-      resolveIssuesByIds: (issueIds) =>
-        tracker.fetchIssueStatesByIds(issueIds),
+      resolveIssuesByIds:
+        options.resolveIssuesByIds ??
+        ((issueIds) => tracker.fetchIssueStatesByIds(issueIds)),
+      recordLifecycleEvidence: (input) =>
+        lifecycleEvidenceRecorder.record(input),
     });
     const context: CompletionReportActiveContext = {
       issue: loadedContext.issue,
@@ -112,6 +127,7 @@ export async function submitCompletionReportFromMcp(input: unknown, options: {
     };
   } finally {
     await writebackOutbox?.close();
+    await issueStateStore?.close();
     await loader.close();
   }
 }
@@ -121,6 +137,7 @@ export async function runCompletionReportMcpServer(options: {
   contextFile: string;
   input?: NodeJS.ReadStream;
   output?: NodeJS.WriteStream;
+  resolveIssuesByIds?: (issueIds: string[]) => Promise<Issue[]>;
 }): Promise<void> {
   await runSingleToolMcpServer({
     serverName: "symphony-completion-report",

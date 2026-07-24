@@ -101,6 +101,7 @@ export interface IssueLifecycleInspectionSummary {
   blockedReason: string | null;
   reviewRound: number;
   incompleteTurnCount: number;
+  acceptedArtifactValidationFailure: IssueLifecycleRecord["acceptedArtifactValidationFailure"] | null;
   planningFailureCount: number;
   planningDispatchRetryCount: number;
   lastIssueBreakdownPlanId: string | null;
@@ -533,6 +534,8 @@ function lifecycleSummary(lifecycle: IssueLifecycleRecord): IssueLifecycleInspec
     blockedReason: lifecycle.blockedReason,
     reviewRound: lifecycle.reviewRound,
     incompleteTurnCount: lifecycle.incompleteTurnCount,
+    acceptedArtifactValidationFailure:
+      lifecycle.acceptedArtifactValidationFailure ?? null,
     planningFailureCount: lifecycle.planningFailureCount,
     planningDispatchRetryCount: lifecycle.planningDispatchRetryCount,
     lastIssueBreakdownPlanId: lifecycle.lastIssueBreakdownPlanId,

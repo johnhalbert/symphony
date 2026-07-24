@@ -17,8 +17,19 @@ import {
 } from "../src/core/harness/CompletionReportMcpServer.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
+import type { Issue } from "../src/core/types.js";
 import { SqliteWritebackOutboxStore } from "../src/core/writeback/WritebackOutbox.js";
-import { issue } from "./helpers.js";
+import {
+  agentEligibleIssueContract,
+  issue as baseIssue,
+} from "./helpers.js";
+
+function issue(overrides: Partial<Issue> = {}): Issue {
+  return baseIssue({
+    description: agentEligibleIssueContract(),
+    ...overrides,
+  });
+}
 
 describe("completion report MCP handoff", () => {
   let root: string;
@@ -38,6 +49,10 @@ describe("completion report MCP handoff", () => {
     const stateDir = path.join(root, "state");
     const workflowPath = path.join(root, "WORKFLOW.md");
     const contextFile = path.join(root, "context.json");
+    const candidate = issue({
+      state: "In Progress",
+      branchName: "symphony/TEST-1",
+    });
     await writeFile(workflowPath, workflow(stateDir), "utf8");
     const runStore = new FileRunTranscriptStore(stateDir);
     await runStore.startRun({
@@ -57,7 +72,7 @@ describe("completion report MCP handoff", () => {
       baseRef: "main",
     });
     await writeCompletionReportMcpContext(contextFile, {
-      issue: issue({ state: "In Progress", branchName: "symphony/TEST-1" }),
+      issue: candidate,
       activeRunId: "run-1",
       role: "worker",
       token: null,
@@ -90,6 +105,7 @@ describe("completion report MCP handoff", () => {
       workflowPath,
       contextFile,
       pullRequestPublisher: publisher,
+      resolveIssuesByIds: issueResolver(candidate),
     });
 
     expect(result).toMatchObject({
@@ -145,6 +161,10 @@ describe("completion report MCP handoff", () => {
     const workflowPath = path.join(root, "WORKFLOW.md");
     const contextFile = path.join(root, "context.json");
     const workspace = await initPublishRepo(root, { remote: true });
+    const candidate = issue({
+      state: "In Progress",
+      branchName: "symphony/TEST-1",
+    });
     await writeFile(path.join(workspace, "feature.txt"), "changed\n", "utf8");
     await writeFile(workflowPath, workflowWithPublicationProfile(stateDir), "utf8");
     vi.stubEnv("GITHUB_PUBLICATION_TOKEN", "publication-token");
@@ -166,7 +186,7 @@ describe("completion report MCP handoff", () => {
       baseRef: "main",
     });
     await writeCompletionReportMcpContext(contextFile, {
-      issue: issue({ state: "In Progress", branchName: "symphony/TEST-1" }),
+      issue: candidate,
       activeRunId: "run-publication-profile",
       role: "worker",
       token: "handoff-token",
@@ -210,6 +230,7 @@ describe("completion report MCP handoff", () => {
     const result = await submitCompletionReportFromMcp(report("publication-profile-idem"), {
       workflowPath,
       contextFile,
+      resolveIssuesByIds: issueResolver(candidate),
     });
 
     expect(result).toMatchObject({
@@ -228,6 +249,10 @@ describe("completion report MCP handoff", () => {
     const stateDir = path.join(root, "state");
     const workflowPath = path.join(root, "WORKFLOW.md");
     const contextFile = path.join(root, "context.json");
+    const candidate = issue({
+      state: "In Progress",
+      branchName: "symphony/TEST-1",
+    });
     await writeFile(workflowPath, workflow(stateDir, false), "utf8");
     const runStore = new FileRunTranscriptStore(stateDir);
     await runStore.startRun({
@@ -247,7 +272,7 @@ describe("completion report MCP handoff", () => {
       baseRef: "main",
     });
     await writeCompletionReportMcpContext(contextFile, {
-      issue: issue({ state: "In Progress", branchName: "symphony/TEST-1" }),
+      issue: candidate,
       activeRunId: "run-stdio-1",
       role: "worker",
       sessionId: "agent-stdio:run-stdio-1",
@@ -270,6 +295,7 @@ describe("completion report MCP handoff", () => {
     const server = runCompletionReportMcpServer({
       workflowPath,
       contextFile,
+      resolveIssuesByIds: issueResolver(candidate),
       input: input as unknown as NodeJS.ReadStream,
       output: output as unknown as NodeJS.WriteStream,
     });
@@ -384,6 +410,16 @@ async function listWritebacks(stateDir: string) {
   } finally {
     await store.close();
   }
+}
+
+function issueResolver(
+  ...issues: Issue[]
+): (ids: string[]) => Promise<Issue[]> {
+  return async (ids) =>
+    issues.filter(
+      (candidate) =>
+        ids.includes(candidate.id) || ids.includes(candidate.identifier),
+    );
 }
 
 function workflow(stateDir: string, publishPullRequests = true): string {

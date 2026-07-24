@@ -11,6 +11,7 @@ import {
   planIssueBreakdownFinalizationWritebacks,
 } from "../src/core/IssueBreakdownPlanApplyService.js";
 import { IssueBreakdownPlanService, issueBreakdownPlanRequestHash } from "../src/core/IssueBreakdownPlanService.js";
+import { parseIssueContract } from "../src/core/IssueContractLint.js";
 import { issueTriageTriggerFingerprint } from "../src/core/IssueTriageService.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
 import type {
@@ -31,9 +32,21 @@ import type { NewWritebackOperation } from "../src/core/writeback/WritebackOutbo
 import { ISSUE_BREAKDOWN_PLAN_STALE_REASON } from "../src/core/writeback/WritebackOutbox.js";
 import type { Issue } from "../src/core/types.js";
 import type { ServiceConfig } from "../src/core/config/Config.js";
-import { agentEligibleIssueContract, issue, testConfig } from "./helpers.js";
+import {
+  agentEligibleIssueContract,
+  issue as baseIssue,
+  testConfig,
+} from "./helpers.js";
 
 type IssueCreateWriteback = Extract<NewWritebackOperation, { kind: "issue_create" }>;
+type IssueContractRelationshipsInput = NonNullable<
+  NonNullable<
+    Parameters<typeof agentEligibleIssueContract>[0]
+  >["issueContractRelationships"]
+>;
+type IssueContractSuccessionInput = NonNullable<
+  IssueContractRelationshipsInput["succession"]
+>;
 
 const FINAL_DISPOSITION =
   "Created a bounded implementation child with an explicit contract and validation plan.\n\nNo proposed issue, dependency, or planning caveat has been omitted.";
@@ -45,6 +58,44 @@ const FULL_FINAL_DISPOSITION = [
     (_, index) => `Evidence ${index + 1}: the complete proposed scope and dependency analysis is preserved verbatim.`,
   ),
 ].join("\n");
+
+function issue(overrides: Partial<Issue> = {}): Issue {
+  return baseIssue({
+    description: agentEligibleIssueContract(),
+    ...overrides,
+  });
+}
+
+function proposedIssueContract(
+  parentIdentifier: string,
+  options: {
+    dependentTitles?: string[];
+    dependencyTitles?: string[];
+    expectedRed?: boolean;
+    succession?: IssueContractSuccessionInput;
+  } = {},
+): string {
+  return agentEligibleIssueContract({
+    ...(options.expectedRed === true
+      ? {
+          issueContractDelivery: {
+            mode: "accepted_artifact" as const,
+            artifact: "expected_red_tests" as const,
+          },
+        }
+      : {}),
+    issueContractRelationships: {
+      blocks: [
+        parentIdentifier,
+        ...(options.dependentTitles ?? []),
+      ],
+      blockedBy: [...(options.dependencyTitles ?? [])],
+      ...(options.succession === undefined
+        ? {}
+        : { succession: options.succession }),
+    },
+  });
+}
 
 describe("IssueBreakdownPlanApplyService", () => {
   let root: string;
@@ -363,7 +414,7 @@ describe("IssueBreakdownPlanApplyService", () => {
         proposedIssues: [
           {
             title: "Build child",
-            description: agentEligibleIssueContract(),
+            description: proposedIssueContract(candidate.identifier),
             acceptanceCriteria: ["Done"],
             dependencies: [],
             labels: ["planning"],
@@ -461,9 +512,151 @@ describe("IssueBreakdownPlanApplyService", () => {
     expect(lifecycle?.issueBreakdownPlans[0]?.applicationStatus).toBe("applied");
     expect(writer.issueCreates).toHaveLength(2);
     expect(writer.issueRelations).toHaveLength(3);
+    expect(writer.descriptionUpdates).toHaveLength(3);
+    expect(
+      parsedRelationships(
+        writer.descriptionUpdates.find(
+          (update) => update.issueId === "child-1",
+        )?.description,
+      ),
+    ).toEqual({
+      blocks: ["TEST-1", "TEST-3"],
+      blockedBy: [],
+    });
+    expect(
+      parsedRelationships(
+        writer.descriptionUpdates.find(
+          (update) => update.issueId === "child-2",
+        )?.description,
+      ),
+    ).toEqual({
+      blocks: ["TEST-1"],
+      blockedBy: ["TEST-2"],
+    });
+    expect(
+      parsedRelationships(
+        writer.descriptionUpdates.find(
+          (update) => update.issueId === candidate.id,
+        )?.description,
+      ),
+    ).toEqual({
+      blocks: [],
+      blockedBy: ["TEST-2", "TEST-3"],
+    });
     expect(writer.comments).toHaveLength(2);
     expect(writer.transitions).toHaveLength(1);
     expect(records.every((record) => record.status === "succeeded")).toBe(true);
+  });
+
+  it("rewrites reciprocal structured succession endpoints to assigned Linear identifiers", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.writeback.enabled = true;
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    const candidate = issue({
+      labels: ["planning"],
+      updatedAt: "2026-01-02T00:00:00Z",
+    });
+    const successionId = "expected-red-to-implementation";
+    await new IssueBreakdownPlanService({
+      config,
+      lifecycleStore,
+    }).submit_issue_breakdown_plan(
+      {
+        runId: "run-plan-succession-rewrite",
+        issueId: candidate.id,
+        finalDisposition: FINAL_DISPOSITION,
+        summary:
+          "Create an expected-red artifact and its explicit implementation successor.",
+        proposedIssues: [
+          {
+            title: "Land expected-red tests",
+            description: proposedIssueContract(candidate.identifier, {
+              dependentTitles: ["Implement expected behavior"],
+              expectedRed: true,
+              succession: {
+                id: successionId,
+                purpose: "expected_red_implementation",
+                successor: { issue: "Implement expected behavior" },
+              },
+            }),
+            acceptanceCriteria: ["Expected-red tests are reviewed."],
+            dependencies: [],
+            labels: ["planning"],
+          },
+          {
+            title: "Implement expected behavior",
+            description: proposedIssueContract(candidate.identifier, {
+              dependencyTitles: ["Land expected-red tests"],
+              succession: {
+                id: successionId,
+                purpose: "expected_red_implementation",
+                succeeds: { issue: "Land expected-red tests" },
+              },
+            }),
+            acceptanceCriteria: ["The inherited tests pass."],
+            dependencies: ["Land expected-red tests"],
+            labels: ["planning"],
+          },
+        ],
+        idempotencyKey: "plan-succession-rewrite",
+      },
+      {
+        issue: candidate,
+        activeRunId: "run-plan-succession-rewrite",
+        role: "worker",
+        phase: "issue_breakdown",
+      },
+    );
+    const writeback = new CapturingWriteback();
+
+    const result = await new IssueBreakdownPlanApplyService({
+      config,
+      lifecycleStore,
+      writeback,
+    }).applyLatestFreshPlan(candidate);
+
+    expect(result.status).toBe("applied");
+    expect(
+      parsedRelationships(
+        writeback.descriptionUpdates.find(
+          (update) => update.issueId === "child-1",
+        )?.description,
+      ),
+    ).toEqual({
+      blocks: ["TEST-1", "TEST-3"],
+      blockedBy: [],
+      succession: {
+        id: successionId,
+        purpose: "expected_red_implementation",
+        successor: { issue: "TEST-3" },
+      },
+    });
+    expect(
+      parsedRelationships(
+        writeback.descriptionUpdates.find(
+          (update) => update.issueId === "child-2",
+        )?.description,
+      ),
+    ).toEqual({
+      blocks: ["TEST-1"],
+      blockedBy: ["TEST-2"],
+      succession: {
+        id: successionId,
+        purpose: "expected_red_implementation",
+        succeeds: { issue: "TEST-2" },
+      },
+    });
+    expect(
+      writeback.operations.filter(
+        (operation) =>
+          operation.kind === "issue_relation" &&
+          operation.payload.sourceIssueId === "child-1" &&
+          operation.payload.targetIssueId === "child-2",
+      ),
+    ).toHaveLength(1);
   });
 
   it("blocks all remaining finalization writes including transition after external parent drift", async () => {
@@ -534,7 +727,7 @@ describe("IssueBreakdownPlanApplyService", () => {
         finalDisposition: FINAL_DISPOSITION,
         summary: "Split into child issues.",
         proposedIssues: [
-          { title: "Build child", description: agentEligibleIssueContract(), acceptanceCriteria: ["Done"], dependencies: [], labels: [] },
+          { title: "Build child", description: proposedIssueContract(candidate.identifier), acceptanceCriteria: ["Done"], dependencies: [], labels: [] },
         ],
         idempotencyKey: "plan-1",
       },
@@ -614,38 +807,64 @@ describe("IssueBreakdownPlanApplyService", () => {
     expect(after?.lastIssueBreakdownPlanId).toBe(planB.id);
   });
 
-  it("writes the full disposition before unresolved dependency validation blocks application", async () => {
+  it("rejects unresolved dependencies before persistence or application writebacks", async () => {
     const config = testConfig(root);
     config.issueBreakdown.applyToLinear.enabled = true;
     config.writeback.enabled = true;
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
     const candidate = issue({ labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
-    await new IssueBreakdownPlanService({ config, lifecycleStore }).submit_issue_breakdown_plan(
-      {
-        runId: "run-plan-1",
-        issueId: candidate.id,
-        finalDisposition: FULL_FINAL_DISPOSITION,
-        summary: "Split into child issues.",
-        proposedIssues: [
-          { title: "Build child", description: agentEligibleIssueContract(), acceptanceCriteria: ["Done"], dependencies: ["Missing"], labels: [] },
-        ],
-        idempotencyKey: "plan-1",
-      },
-      { issue: candidate, activeRunId: "run-plan-1", role: "worker", phase: "issue_breakdown" },
-    );
     const writeback = new CapturingWriteback();
 
-    const result = await new IssueBreakdownPlanApplyService({ config, lifecycleStore, writeback }).applyLatestFreshPlan(candidate);
-    const lifecycle = await lifecycleStore.get(candidate.id);
+    await expect(
+      new IssueBreakdownPlanService({
+        config,
+        lifecycleStore,
+      }).submit_issue_breakdown_plan(
+        {
+          runId: "run-plan-1",
+          issueId: candidate.id,
+          finalDisposition: FULL_FINAL_DISPOSITION,
+          summary: "Split into child issues.",
+          proposedIssues: [
+            {
+              title: "Build child",
+              description: proposedIssueContract(candidate.identifier, {
+                dependencyTitles: ["Missing"],
+              }),
+              acceptanceCriteria: ["Done"],
+              dependencies: ["Missing"],
+              labels: [],
+            },
+          ],
+          idempotencyKey: "plan-1",
+        },
+        {
+          issue: candidate,
+          activeRunId: "run-plan-1",
+          role: "worker",
+          phase: "issue_breakdown",
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      message: expect.stringContaining(
+        "dependencies must name proposed issue titles: Missing",
+      ),
+    });
+
+    const result = await new IssueBreakdownPlanApplyService({
+      config,
+      lifecycleStore,
+      writeback,
+    }).applyLatestFreshPlan(candidate);
 
     expect(FULL_FINAL_DISPOSITION.length).toBeGreaterThan(10_000);
-    expect(result.status).toBe("blocked");
-    expect(writeback.operations).toHaveLength(1);
-    expect(writeback.operations[0]?.kind).toBe("comment");
-    expectExactDisposition(commentBody(writeback.operations[0]!), FULL_FINAL_DISPOSITION);
-    expect(writeback.operations.some((operation) => operation.kind === "issue_create")).toBe(false);
-    expect(lifecycle?.issueBreakdownPlans[0]?.applicationStatus).toBe("blocked");
-    expect(lifecycle?.issueBreakdownPlans[0]?.applicationBlockedReason).toContain("Missing");
+    expect(result).toMatchObject({
+      status: "no_fresh_plan",
+      reason: "no_fresh_plan",
+    });
+    expect(writeback.operations).toEqual([]);
+    await expect(lifecycleStore.get(candidate.id)).resolves.toBeNull();
   });
 
   it("keeps the full disposition durable when partial child creation blocks application", async () => {
@@ -690,7 +909,7 @@ describe("IssueBreakdownPlanApplyService", () => {
         proposedIssues: [
           {
             title: "Build child",
-            description: agentEligibleIssueContract(),
+            description: proposedIssueContract(candidate.identifier),
             acceptanceCriteria: ["Done"],
             dependencies: [],
             labels: ["planning"],
@@ -1222,8 +1441,19 @@ describe("IssueBreakdownPlanApplyService", () => {
   });
 });
 
-class CapturingWriteback implements Pick<WritebackProcessorType, "enqueueAndProcess"> {
+class CapturingWriteback
+  implements
+    Pick<
+      WritebackProcessorType,
+      "enqueueAndProcess" | "updateIssueDescription"
+    >
+{
   readonly operations: NewWritebackOperation[] = [];
+  readonly descriptionUpdates: Array<{
+    issueId: string;
+    description: string;
+    dedupeKey: string;
+  }> = [];
   private issueCreateIndex = 0;
 
   constructor(private readonly options: { failIssueCreateIndex?: number } = {}) {}
@@ -1271,7 +1501,11 @@ class CapturingWriteback implements Pick<WritebackProcessorType, "enqueueAndProc
       resultMessage: null,
       resultEvidence: {
         kind: "issue_create",
-        issue: { id: "child-1", identifier: "TEST-2", url: "https://linear.test/TEST-2" },
+        issue: {
+          id: `child-${issueCreateIndex + 1}`,
+          identifier: `TEST-${issueCreateIndex + 2}`,
+          url: `https://linear.test/TEST-${issueCreateIndex + 2}`,
+        },
         issueCreateStatus: "created",
         parentIssueId: operation.payload.parentIssueId,
         dedupeKey: operation.payload.dedupeKey,
@@ -1280,6 +1514,15 @@ class CapturingWriteback implements Pick<WritebackProcessorType, "enqueueAndProc
       },
     };
   }
+
+  async updateIssueDescription(input: {
+    issueId: string;
+    description: string;
+    dedupeKey: string;
+  }) {
+    this.descriptionUpdates.push(input);
+    return { status: "applied" as const };
+  }
 }
 
 class FakeWriter implements TrackerWriter {
@@ -1287,6 +1530,7 @@ class FakeWriter implements TrackerWriter {
   readonly comments: TrackerCommentInput[] = [];
   readonly issueCreates: TrackerIssueCreateInput[] = [];
   readonly issueRelations: TrackerIssueRelationInput[] = [];
+  readonly descriptionUpdates: Array<{ issueId: string; description: string }> = [];
 
   async transitionIssueState(input: TrackerTransitionInput): Promise<TrackerWriteResult> {
     this.transitions.push(input);
@@ -1319,6 +1563,15 @@ class FakeWriter implements TrackerWriter {
     this.issueRelations.push(input);
     return { status: "applied" };
   }
+
+  async updateIssueDescription(input: {
+    issueId: string;
+    description: string;
+    dedupeKey: string;
+  }): Promise<TrackerWriteResult> {
+    this.descriptionUpdates.push(input);
+    return { status: "applied" };
+  }
 }
 
 async function submitSingleChildPlan(
@@ -1342,7 +1595,7 @@ async function submitSingleChildPlan(
       proposedIssues: [
         {
           title: "Build child",
-          description: agentEligibleIssueContract(),
+          description: proposedIssueContract(candidate.identifier),
           acceptanceCriteria: ["Done"],
           dependencies: [],
           labels: ["planning"],
@@ -1475,14 +1728,18 @@ async function submitTwoChildPlan(
       proposedIssues: [
         {
           title: "Build child",
-          description: agentEligibleIssueContract(),
+          description: proposedIssueContract(candidate.identifier, {
+            dependentTitles: ["Build dependent child"],
+          }),
           acceptanceCriteria: ["Done"],
           dependencies: [],
           labels: ["planning"],
         },
         {
           title: "Build dependent child",
-          description: agentEligibleIssueContract(),
+          description: proposedIssueContract(candidate.identifier, {
+            dependencyTitles: ["Build child"],
+          }),
           acceptanceCriteria: ["Done"],
           dependencies: ["Build child"],
           labels: ["planning"],
@@ -1505,6 +1762,14 @@ function expectExactDisposition(body: string, expected: string): void {
   const markerIndex = body.indexOf(marker);
   expect(markerIndex).toBeGreaterThanOrEqual(0);
   expect(body.slice(markerIndex + marker.length)).toBe(expected);
+}
+
+function parsedRelationships(description: string | undefined) {
+  const parsed = parseIssueContract(description);
+  if (!parsed.valid || parsed.contract.schemaVersion !== 2) {
+    throw new Error("Expected a valid schema-v2 Issue Contract");
+  }
+  return parsed.contract.relationships;
 }
 
 function createdIssueRef(operation: IssueCreateWriteback): IssueBreakdownCreatedIssueRef {
@@ -1543,6 +1808,8 @@ function trackerWriterWithRelationEffect(
     transitionIssueState: (input) => writer.transitionIssueState(input),
     createIssueComment: (input) => writer.createIssueComment(input),
     createIssueFromPlan: (input) => writer.createIssueFromPlan(input),
+    updateIssueDescription: (input) =>
+      writer.updateIssueDescription(input),
     createIssueRelation: async (input) => {
       const result = await writer.createIssueRelation(input);
       onRelation(input);

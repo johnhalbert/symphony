@@ -144,7 +144,11 @@ function lifecycleEvidencePayload(
     latestCompletionReport: latestCurrentCompletionReport(lifecycle),
     latestApprovalPassVerdict: latestCurrentApprovalPassVerdict(lifecycle),
     acceptedArtifact: lifecycle.acceptedArtifact ?? null,
+    acceptedArtifactValidationFailure:
+      lifecycle.acceptedArtifactValidationFailure ?? null,
     workspaceSeed: lifecycle.workspaceSeed ?? null,
+    relationshipState: lifecycle.relationshipState ?? null,
+    succession: lifecycle.succession ?? null,
     merge: lifecycle.merge ?? null,
     mergeGate: lifecycle.mergeGate ?? null,
     mergeGateResults: lifecycle.mergeGateResults ?? [],

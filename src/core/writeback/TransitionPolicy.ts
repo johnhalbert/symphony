@@ -57,10 +57,13 @@ export interface BlockedEscalationWritebackContext {
   issue: Issue;
   runId: string;
   reason: string;
+  fromStates?: string[];
   incompleteTurnCount?: number;
   maxIncompleteTurns?: number;
   reviewRound?: number;
   maxReviewRounds?: number;
+  acceptedArtifactValidationFailureCount?: number;
+  maxAcceptedArtifactValidationFailures?: number;
   lastCompletionReport?: IssueCompletionReportRecord | null;
   lastReviewVerdict?: IssueReviewVerdictRecord | null;
   requiredAction?: string;
@@ -1004,6 +1007,7 @@ export function planBlockedEscalationWritebacks(
     ...config.tracker.handoffStates,
     ...config.reviewLoop.reviewStates,
     ...(config.mergePolicy.mode === "gated" && config.mergePolicy.conflictsState !== null ? [config.mergePolicy.conflictsState] : []),
+    ...(context.fromStates ?? []),
   ]);
   if (!isStateIn(context.issue.state, fromStates)) return [];
 
@@ -1033,6 +1037,14 @@ export function planBlockedEscalationWritebacks(
           "Counts:",
           `- Incomplete turns: ${formatCount(context.incompleteTurnCount, context.maxIncompleteTurns)}`,
           `- Review rounds: ${formatCount(context.reviewRound, context.maxReviewRounds)}`,
+          ...(context.acceptedArtifactValidationFailureCount === undefined
+            ? []
+            : [
+                `- Accepted-artifact validation failures: ${formatCount(
+                  context.acceptedArtifactValidationFailureCount,
+                  context.maxAcceptedArtifactValidationFailures,
+                )}`,
+              ]),
           "",
           "Last completion report:",
           ...formatCompletionReportSummary(context.lastCompletionReport ?? null),
@@ -2372,6 +2384,7 @@ function isIssueTriageEligibleBlockedReason(reason: string | null | undefined): 
     normalized.includes("max reviewer failures") ||
     normalized.includes("max review rounds") ||
     normalized.includes("max merge gate failures") ||
+    normalized.includes("max accepted-artifact validation failures") ||
     normalized.includes("merge gate required checks failed")
   );
 }

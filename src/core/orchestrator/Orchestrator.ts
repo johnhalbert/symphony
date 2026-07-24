@@ -1,6 +1,6 @@
 import { existsSync, promises as fs } from "node:fs";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import type { ServiceConfig } from "../config/Config.js";
 import {
@@ -105,9 +105,17 @@ import {
 } from "../IssuePostMortemService.js";
 import { PromptRenderer } from "../workflow/PromptRenderer.js";
 import {
+  issueReferenceMatches,
   parseIssueContract,
   summarizeIssueContractForPrompt,
 } from "../IssueContractLint.js";
+import {
+  buildIssueRelationshipState,
+  mergeIssueSuccessionProgress,
+  resolveIssueSuccessionAgreement,
+  sameIssueSuccessionBinding,
+  sameIssueSuccessionIdentity,
+} from "../IssueRelationshipService.js";
 import {
   DEFAULT_REVIEWER_REVIEW_LOOP_GUIDANCE,
   DEFAULT_WORKER_INVARIANT_REPAIR_GUIDANCE,
@@ -185,6 +193,8 @@ import {
   type IssueCompletionReportRejectionRecord,
   type IssueCompletionReportRecord,
   type IssueAcceptedArtifactRecord,
+  type IssueAcceptedArtifactValidationFailureReason,
+  type IssueAcceptedArtifactValidationFailureState,
   type IssueLifecyclePatch,
   type IssueLifecyclePhase,
   type IssueLifecycleRecord,
@@ -194,9 +204,11 @@ import {
   type IssueMergeConflictResolutionReportRecord,
   type IssueMergeGateState,
   type IssuePostMortemReportRecord,
+  type IssueRelationshipState,
   type IssueReviewerOutputContract,
   type IssueReviewVerdictRecord,
   type IssueReviewVerdictSubmissionRecord,
+  type IssueSuccessionRecord,
   type IssueWorkspaceSeedRecord,
   type IssueTriageBlockerKind,
   type IssueTriageBlockerRecord,
@@ -267,6 +279,7 @@ import {
 } from "../writeback/TransitionPolicy.js";
 import { createGitHubPullRequestClientForCapability } from "../../integrations/github/GitHubCredentialResolver.js";
 import {
+  AcceptedArtifactCompletionError,
   AcceptedArtifactService,
   classifyAcceptedArtifactCompletionError,
   type AcceptedArtifactGitHubClient,
@@ -739,7 +752,24 @@ type DependencyArtifactFreshness =
   | { status: "fresh" }
   | { status: "unavailable"; reason: string }
   | { status: "deferred"; reason: string }
-  | { status: "invalid"; reason: string };
+  | {
+      status: "invalid";
+      scope: "issue_contract" | "succession";
+      issue: Issue;
+      reason: string;
+    };
+
+type MissingLocalSuccessionReconciliation =
+  | { status: "cleared" }
+  | {
+      status: "invalid";
+      reason: string;
+      succession: IssueSuccessionRecord;
+    };
+
+type ResolvedIssueSuccessionAgreement = Awaited<
+  ReturnType<typeof resolveIssueSuccessionAgreement>
+>;
 
 interface LifecycleEvidenceInput {
   issue: Issue;
@@ -2916,6 +2946,19 @@ export class Orchestrator {
         pullRequestPublisher: publisher,
         resolveIssuesByIds: (issueIds) =>
           this.options.tracker.fetchIssueStatesByIds(issueIds),
+        recordLifecycleEvidence: (input) =>
+          this.recordLifecycleEvidenceSnapshot({
+            issue: input.issue,
+            lifecycle: input.lifecycle,
+            patch: input.patch,
+            ...(input.sourceId === undefined
+              ? {}
+              : { sourceId: input.sourceId }),
+            ...(input.reason === undefined ? {} : { reason: input.reason }),
+            ...(input.eventType === undefined
+              ? {}
+              : { eventType: input.eventType }),
+          }),
       }).resumeApprovedPublication({ approval: request, issue }),
     );
     if (!result) return false;
@@ -2959,6 +3002,19 @@ export class Orchestrator {
           : { writebackProcessor: this.options.writeback }),
         resolveIssuesByIds: (issueIds) =>
           this.options.tracker.fetchIssueStatesByIds(issueIds),
+        recordLifecycleEvidence: (input) =>
+          this.recordLifecycleEvidenceSnapshot({
+            issue: input.issue,
+            lifecycle: input.lifecycle,
+            patch: input.patch,
+            ...(input.sourceId === undefined
+              ? {}
+              : { sourceId: input.sourceId }),
+            ...(input.reason === undefined ? {} : { reason: input.reason }),
+            ...(input.eventType === undefined
+              ? {}
+              : { eventType: input.eventType }),
+          }),
       }).recordPublicationApprovalTerminal({ approval: request, issue }),
     );
     if (result.length > 0) {
@@ -4420,6 +4476,11 @@ export class Orchestrator {
                 mergeResult,
               );
               context.mergePolicy.recordedMerge = recorded;
+              await this.advanceSuccessionMilestone(
+                context.issue,
+                "integrated",
+                { mergeCommitSha: recorded.merge.mergeCommitSha },
+              );
               return { details: recorded.merge };
             },
           },
@@ -4556,6 +4617,11 @@ export class Orchestrator {
                 mergeResult,
               );
               context.mergePolicy.recordedMerge = recorded;
+              await this.advanceSuccessionMilestone(
+                context.issue,
+                "integrated",
+                { mergeCommitSha: recorded.merge.mergeCommitSha },
+              );
               return { details: recorded.merge };
             },
           },
@@ -5176,6 +5242,16 @@ export class Orchestrator {
             execute: (context) => this.loadReviewVerdictHandoffAction(context),
           },
           {
+            id: "validate_relationships_before_pass_verdict_handoff",
+            shouldExecute: (context) =>
+              (
+                context.handoffReconciliation.reviewVerdict ??
+                context.handoffReconciliation.reviewVerdictSubmission
+              )?.verdict === "pass",
+            execute: (context) =>
+              this.validateDependencyArtifactBeforeReviewOrMerge(context),
+          },
+          {
             id: "mark_review_verdict_handoff_accepted",
             execute: (context) =>
               this.markReviewVerdictHandoffAcceptedAction(context),
@@ -5498,168 +5574,301 @@ export class Orchestrator {
       };
     }
 
-    const targetLifecycle = await lifecycleStore.get(context.issue.id);
-    const blockerIds = uniqueNonEmptyStrings(
-      context.issue.blockedBy.map((blocker) => blocker.id),
+    let targetLifecycle = await lifecycleStore.get(context.issue.id);
+    const agreement = await resolveIssueSuccessionAgreement(
+      context.issue,
+      this.options.tracker,
     );
-    const blockerStates =
-      blockerIds.length === 0
-        ? []
-        : await this.options.tracker.fetchIssueStatesByIds(blockerIds);
-    const fetchedBlockerIds = new Set(blockerStates.map((blocker) => blocker.id));
-    const missingBlockerIds = blockerIds.filter(
-      (blockerId) => !fetchedBlockerIds.has(blockerId),
-    );
-    if (missingBlockerIds.length > 0) {
+    if (agreement.kind === "none") {
+      const reconciliation = await this.reconcileMissingLocalSuccession(
+        agreement.issue,
+        targetLifecycle,
+        agreement.relationshipState,
+        "issue relationships refreshed before dependency dispatch",
+      );
+      targetLifecycle = await lifecycleStore.get(agreement.issue.id);
+      if (reconciliation.status === "invalid") {
+        const reason =
+          `succession contract is not a valid bilateral agreement: ` +
+          reconciliation.reason;
+        await this.blockDependencyArtifactDispatch(
+          agreement.issue,
+          targetLifecycle,
+          reason,
+          "Restore matching structured succession declarations on both Issue Contracts, or remove the succession declaration from both endpoints; keep blocks/blockedBy as the independent Linear ordering graph; then move this issue out of Blocked.",
+        );
+        return { status: "skipped" as const, stop: true, message: reason };
+      }
+      if (targetLifecycle?.workspaceSeed) {
+        const reason = `persisted workspace seed ${targetLifecycle.workspaceSeed.artifactId} has no matching succession contract`;
+        await this.blockDependencyArtifactDispatch(
+          agreement.issue,
+          targetLifecycle,
+          reason,
+          "Restore the reciprocal succession contract, or discard the seeded worktree and durable workspace-seed record before continuing.",
+        );
+        return { status: "skipped" as const, stop: true, message: reason };
+      }
       context.dispatch.dependencyArtifactSeed = null;
       context.dispatch.dependencyArtifact = null;
       return {
         status: "skipped" as const,
-        stop: true,
-        message: `Dependency artifact resolution is waiting for fresh Linear state for: ${missingBlockerIds.join(", ")}`,
+        message: "No succession contract selects an accepted artifact",
       };
     }
-    const blockerStatesById = new Map(
-      blockerStates.map((blocker) => [blocker.id, blocker]),
-    );
-    const completedArtifactSourceIds = new Set(
-      blockerStates
-        .filter((blocker) =>
-          isStateIn(blocker.state, [this.config.mergePolicy.doneState]),
-        )
-        .map((blocker) => blocker.id),
-    );
 
-    const artifactsById = new Map<string, IssueAcceptedArtifactRecord>();
-    const invalidatedArtifacts: IssueAcceptedArtifactRecord[] = [];
-    const waitingArtifactSources: string[] = [];
-    for (const blockerId of blockerIds) {
-      const sourceIssue = blockerStatesById.get(blockerId);
-      if (!sourceIssue) continue;
-      const sourceLifecycle = await lifecycleStore.get(blockerId);
-      const artifact = sourceLifecycle?.acceptedArtifact ?? null;
+    if (agreement.kind === "invalid") {
+      const currentContract = parseIssueContract(
+        agreement.issue.description,
+      );
+      const explicitlyRemovedSuccession =
+        currentContract.valid &&
+        currentContract.contract.schemaVersion === 2 &&
+        currentContract.contract.relationships?.succession === undefined;
       if (
-        artifact?.status === "completed_unmerged" &&
-        !isSupersededLifecycleRecord(artifact)
+        explicitlyRemovedSuccession &&
+        agreement.succession === null
       ) {
-        const sourceContract = parseIssueContract(sourceIssue.description);
-        const sourceIsCurrent =
-          completedArtifactSourceIds.has(blockerId) &&
-          sourceContract.valid &&
-          sourceContract.fingerprint === artifact.contractFingerprint;
-        if (sourceIsCurrent) {
-          artifactsById.set(artifact.id, artifact);
-          continue;
-        }
-        invalidatedArtifacts.push(artifact);
-        if (this.acceptedArtifactSourceMayCompleteAgain(sourceIssue.state)) {
-          waitingArtifactSources.push(sourceIssue.identifier);
-        }
-      } else if (
-        artifact?.status === "completed_unmerged" &&
-        isSupersededLifecycleRecord(artifact)
-      ) {
-        invalidatedArtifacts.push(artifact);
-        if (this.acceptedArtifactSourceMayCompleteAgain(sourceIssue.state)) {
-          waitingArtifactSources.push(sourceIssue.identifier);
+        const reconciliation =
+          await this.reconcileMissingLocalSuccession(
+            agreement.issue,
+            targetLifecycle,
+            agreement.relationshipState,
+            "invalid issue relationships observed after a local succession declaration was removed",
+          );
+        targetLifecycle = await lifecycleStore.get(agreement.issue.id);
+        if (reconciliation.status === "invalid") {
+          const reason =
+            `succession contract is not a valid bilateral agreement: ` +
+            reconciliation.reason;
+          await this.blockDependencyArtifactDispatch(
+            agreement.issue,
+            targetLifecycle,
+            reason,
+            "Restore matching structured succession declarations on both Issue Contracts, or remove the succession declaration from both endpoints; separately reconcile relationships.blocks and relationships.blockedBy with Linear; then move this issue out of Blocked.",
+          );
+          return {
+            status: "skipped" as const,
+            stop: true,
+            message: reason,
+          };
         }
       }
+      const successionPatch: Pick<
+        IssueLifecyclePatch,
+        "succession"
+      > =
+        agreement.succession === null
+          ? explicitlyRemovedSuccession
+            ? { succession: null }
+            : {}
+          : {
+              succession:
+                agreement.succession.status === "invalid"
+                  ? preserveInvalidSuccessionEvidence(
+                      targetLifecycle?.succession ?? null,
+                      agreement.succession,
+                    )
+                  : mergeIssueSuccessionProgress(
+                      targetLifecycle?.succession,
+                      agreement.succession,
+                    ),
+            };
+      const updates: Promise<IssueLifecycleRecord | null>[] = [
+        this.updateIssueLifecycleWithEvidence(
+          agreement.issue,
+          {
+            relationshipState: agreement.relationshipState,
+            ...successionPatch,
+          },
+          "invalid issue relationships observed before dependency dispatch",
+          `relationships:${agreement.issue.id}`,
+        ),
+      ];
+      if (
+        agreement.succession?.status === "invalid" &&
+        agreement.counterpart !== null
+      ) {
+        const counterpartLifecycle = await lifecycleStore.get(
+          agreement.counterpart.id,
+        );
+        const counterpartObserved: IssueSuccessionRecord = {
+          ...agreement.succession,
+          role:
+            agreement.succession.role === "succeeded"
+              ? "successor"
+              : "succeeded",
+        };
+        updates.push(
+          this.updateIssueLifecycleWithEvidence(
+            agreement.counterpart,
+            {
+              relationshipState: buildIssueRelationshipState(
+                agreement.counterpart,
+              ),
+              succession: preserveInvalidSuccessionEvidence(
+                counterpartLifecycle?.succession ?? null,
+                counterpartObserved,
+              ),
+            },
+            `succession ${agreement.succession.id} is not a valid bilateral agreement`,
+            `succession:${agreement.succession.id}:invalid`,
+          ),
+        );
+      }
+      await Promise.all(updates);
+      targetLifecycle = await lifecycleStore.get(agreement.issue.id);
+      const successionInvalid =
+        agreement.succession?.status === "invalid" ||
+        validationErrorsContainSuccessionIssue(agreement.errors);
+      const reason = successionInvalid
+        ? `succession contract is not a valid bilateral agreement: ${agreement.errors.join("; ")}`
+        : `issue relationship contract does not match Linear: ${agreement.errors.join("; ")}`;
+      if (successionInvalid) {
+        await this.blockDependencyArtifactDispatch(
+          agreement.issue,
+          targetLifecycle,
+          reason,
+          "Make both Issue Contracts declare the same succession id, purpose, and opposite endpoints; keep the matching Linear blocks/blocked-by edge; then move this issue out of Blocked.",
+        );
+      } else {
+        await this.blockRelationshipContractDispatch(
+          agreement.issue,
+          targetLifecycle,
+          reason,
+        );
+      }
+      return { status: "skipped" as const, stop: true, message: reason };
     }
+
+    const processingSucceededIssue =
+      agreement.sourceIssue.id === context.issue.id;
+    const sourceSuccession = {
+      ...agreement.succession,
+      role: "succeeded" as const,
+    };
+    const targetSuccession = {
+      ...agreement.succession,
+      role: "successor" as const,
+    };
+    const [sourceLifecycle, successorLifecycle] = await Promise.all([
+      lifecycleStore.get(agreement.sourceIssue.id),
+      lifecycleStore.get(agreement.targetIssue.id),
+    ]);
+    const durableSourceSuccession = mergeIssueSuccessionProgress(
+      sourceLifecycle?.succession,
+      sourceSuccession,
+    );
+    const durableTargetSuccession = mergeIssueSuccessionProgress(
+      successorLifecycle?.succession,
+      targetSuccession,
+    );
+    await Promise.all([
+      this.updateIssueLifecycleWithEvidence(
+        agreement.sourceIssue,
+        {
+          relationshipState: buildIssueRelationshipState(
+            agreement.sourceIssue,
+          ),
+          succession: durableSourceSuccession,
+        },
+        `succession ${agreement.succession.id} agreement refreshed`,
+        `succession:${agreement.succession.id}:agreed`,
+      ),
+      this.updateIssueLifecycleWithEvidence(
+        agreement.targetIssue,
+        {
+          relationshipState: buildIssueRelationshipState(
+            agreement.targetIssue,
+          ),
+          succession: durableTargetSuccession,
+        },
+        `succession ${agreement.succession.id} agreement refreshed`,
+        `succession:${agreement.succession.id}:agreed`,
+      ),
+    ]);
+    if (processingSucceededIssue) {
+      context.dispatch.dependencyArtifactSeed = null;
+      context.dispatch.dependencyArtifact = null;
+      return {
+        status: "skipped" as const,
+        message: `Succession agreement ${agreement.succession.id} is valid; this issue produces the artifact and does not consume it`,
+      };
+    }
+
+    const sourceIssue = agreement.sourceIssue;
+    targetLifecycle = await lifecycleStore.get(context.issue.id);
+    const artifact = sourceLifecycle?.acceptedArtifact ?? null;
+    const sourceDone = isStateIn(sourceIssue.state, [
+      this.config.mergePolicy.doneState,
+    ]);
+    const artifactIsCurrent =
+      artifact?.status === "completed_unmerged" &&
+      !isSupersededLifecycleRecord(artifact) &&
+      sourceDone &&
+      artifact.successionId === agreement.succession.id &&
+      artifact.contractFingerprint === agreement.sourceContract.fingerprint;
     const existingSeed = targetLifecycle?.workspaceSeed ?? null;
-    if (
-      existingSeed !== null &&
-      !blockerIds.includes(existingSeed.sourceIssueId)
-    ) {
-      const reason = `persisted workspace seed ${existingSeed.artifactId} no longer has a direct Linear dependency on ${existingSeed.sourceIssueIdentifier}`;
+
+    if (!artifactIsCurrent || artifact === null) {
+      context.dispatch.dependencyArtifactSeed = null;
+      context.dispatch.dependencyArtifact = null;
+      if (this.acceptedArtifactSourceMayCompleteAgain(sourceIssue.state)) {
+        return {
+          status: "skipped" as const,
+          stop: true,
+          message: `Waiting for fresh accepted-artifact evidence from succession source ${sourceIssue.identifier}`,
+        };
+      }
+      const reason = sourceDone
+        ? artifact !== null && isSupersededLifecycleRecord(artifact)
+          ? `succession source ${sourceIssue.identifier} has superseded accepted-artifact evidence: ${artifact.id}`
+          : artifact !== null &&
+              artifact.successionId !== agreement.succession.id
+            ? `accepted artifact ${artifact.id} is not bound to succession ${agreement.succession.id}`
+            : `succession source ${sourceIssue.identifier} has no current completed accepted-artifact checkpoint`
+        : `succession source ${sourceIssue.identifier} is ${sourceIssue.state}, not ${this.config.mergePolicy.doneState}`;
       await this.blockDependencyArtifactDispatch(
         context.issue,
         targetLifecycle,
         reason,
-        `Restore the direct blocked-by relationship to ${existingSeed.sourceIssueIdentifier}, or discard this issue's seeded worktree and durable workspace-seed record before continuing.`,
+        `Reopen ${sourceIssue.identifier} and produce a fresh reviewed checkpoint for succession ${agreement.succession.id}, or remove the reciprocal succession contract; then move this issue out of Blocked.`,
       );
       return { status: "skipped" as const, stop: true, message: reason };
     }
+
+    const checkpointedSourceSuccession = mergeIssueSuccessionProgress(
+      durableSourceSuccession,
+      {
+        ...sourceSuccession,
+        status: "checkpointed",
+        artifactId: artifact.id,
+        updatedAt: new Date().toISOString(),
+      },
+    );
+    await this.updateIssueLifecycleWithEvidence(
+      sourceIssue,
+      { succession: checkpointedSourceSuccession },
+      `succession ${agreement.succession.id} checkpoint reconciled`,
+      artifact.id,
+    );
+
     if (
       existingSeed !== null &&
-      !completedArtifactSourceIds.has(existingSeed.sourceIssueId)
+      (existingSeed.sourceIssueId !== sourceIssue.id ||
+        existingSeed.artifactId !== artifact.id ||
+        existingSeed.successionId !== agreement.succession.id)
     ) {
-      context.dispatch.dependencyArtifactSeed = null;
-      context.dispatch.dependencyArtifact = null;
-      const source = blockerStatesById.get(existingSeed.sourceIssueId);
-      if (
-        source &&
-        !this.acceptedArtifactSourceMayCompleteAgain(source.state)
-      ) {
-        const reason = `accepted-artifact source ${existingSeed.sourceIssueIdentifier} is ${source.state}, not ${this.config.mergePolicy.doneState}`;
-        await this.blockDependencyArtifactDispatch(
-          context.issue,
-          targetLifecycle,
-          reason,
-          `Move ${existingSeed.sourceIssueIdentifier} back into active work to produce a fresh accepted artifact, or remove the dependency and discard this issue's seeded worktree; then move this issue out of Blocked.`,
-        );
-        return { status: "skipped" as const, stop: true, message: reason };
-      }
-      return {
-        status: "skipped" as const,
-        stop: true,
-        message: `Accepted-artifact source ${existingSeed.sourceIssueIdentifier} is not in ${this.config.mergePolicy.doneState}; waiting for it to complete again`,
-      };
-    }
-
-    const artifacts = [...artifactsById.values()];
-    if (artifacts.length === 0) {
-      if (invalidatedArtifacts.length > 0) {
-        const invalidated = invalidatedArtifacts
-          .map((artifact) => artifact.id)
-          .sort()
-          .join(", ");
-        if (waitingArtifactSources.length > 0) {
-          context.dispatch.dependencyArtifactSeed = null;
-          context.dispatch.dependencyArtifact = null;
-          return {
-            status: "skipped" as const,
-            stop: true,
-            message: `Waiting for fresh accepted-artifact evidence from: ${[
-              ...new Set(waitingArtifactSources),
-            ].join(", ")}`,
-          };
-        }
-        const reason = `direct dependency has only superseded accepted-artifact evidence: ${invalidated}`;
-        await this.blockDependencyArtifactDispatch(
-          context.issue,
-          targetLifecycle,
-          reason,
-          "Reopen the accepted-artifact source and produce a fresh reviewed checkpoint, or remove the dependency if this successor should no longer consume it; then move this issue out of Blocked.",
-        );
-        return { status: "skipped" as const, stop: true, message: reason };
-      }
-      if (existingSeed !== null) {
-        const reason = `persisted workspace seed ${existingSeed.artifactId} has no matching completed accepted-artifact checkpoint`;
-        await this.blockDependencyArtifactDispatch(
-          context.issue,
-          targetLifecycle,
-          reason,
-          `Inspect ${existingSeed.sourceIssueIdentifier}, restore its completed accepted-artifact checkpoint, or discard this issue's seeded worktree and durable workspace-seed record before continuing.`,
-        );
-        return { status: "skipped" as const, stop: true, message: reason };
-      }
-      context.dispatch.dependencyArtifactSeed = null;
-      context.dispatch.dependencyArtifact = null;
-      return {
-        status: "skipped" as const,
-        message: "No completed accepted-artifact dependency applies",
-      };
-    }
-    if (artifacts.length > 1) {
-      const reason = `multiple accepted artifacts require integration before dispatch: ${artifacts
-        .map((artifact) => artifact.id)
-        .sort()
-        .join(", ")}`;
-      await this.blockDependencyArtifactDispatch(context.issue, targetLifecycle, reason);
+      const reason = `persisted workspace seed ${existingSeed.artifactId} conflicts with succession ${agreement.succession.id} artifact ${artifact.id}`;
+      await this.blockDependencyArtifactDispatch(
+        context.issue,
+        targetLifecycle,
+        reason,
+        "Discard the stale seeded worktree and durable workspace-seed record before continuing with the declared succession.",
+      );
       return { status: "skipped" as const, stop: true, message: reason };
     }
 
-    const artifact = artifacts[0]!;
     const configuredBaseRef = nonEmptyString(this.config.workspace.source.baseRef);
     if (
       configuredBaseRef === null ||
@@ -5677,29 +5886,10 @@ export class Orchestrator {
       );
       return { status: "skipped" as const, stop: true, message: reason };
     }
-    const targetContract = parseIssueContract(context.issue.description);
-    if (
-      !targetContract.valid ||
-      targetContract.contract.delivery.mode !== "merge"
-    ) {
-      const contractReason = targetContract.valid
-        ? `delivery mode is ${targetContract.contract.delivery.mode}`
-        : targetContract.errors.join("; ");
-      const reason = `accepted-artifact successor must have a valid merge-delivery Issue Contract: ${contractReason}`;
-      await this.blockDependencyArtifactDispatch(
-        context.issue,
-        targetLifecycle,
-        reason,
-        "Correct this issue's fenced JSON Issue Contract to use `delivery: { \"mode\": \"merge\" }`, then move it out of Blocked.",
-      );
-      return { status: "skipped" as const, stop: true, message: reason };
-    }
-    if (existingSeed !== null && existingSeed.artifactId !== artifact.id) {
-      const reason = `persisted workspace seed ${existingSeed.artifactId} conflicts with dependency artifact ${artifact.id}`;
-      await this.blockDependencyArtifactDispatch(context.issue, targetLifecycle, reason);
-      return { status: "skipped" as const, stop: true, message: reason };
-    }
-    const seed = acceptedArtifactWorkspaceSeed(artifact, this.config);
+    const seed = {
+      ...acceptedArtifactWorkspaceSeed(artifact, this.config),
+      successionId: agreement.succession.id,
+    };
     const targetBranch = await this.options.workspaceManager.resolveBranchNameForIssue(
       context.issue,
     );
@@ -5710,6 +5900,7 @@ export class Orchestrator {
       kind: "accepted_artifact",
       status: "planned",
       artifactId: artifact.id,
+      successionId: agreement.succession.id,
       sourceIssueId: artifact.sourceIssueId,
       sourceIssueIdentifier: artifact.sourceIssueIdentifier,
       repositoryFingerprint: artifact.repositoryFingerprint,
@@ -5721,17 +5912,35 @@ export class Orchestrator {
       preparedHeadSha: null,
       targetBranch,
       conflictedFiles: [],
+      absorbedPaths: [],
       plannedAt,
       preparedAt: null,
       failureReason: null,
     };
     assertWorkspaceSeedMatchesArtifact(seedRecord, seed, targetBranch);
+    const boundSuccession = mergeIssueSuccessionProgress(
+      durableTargetSuccession,
+      {
+      ...targetSuccession,
+      status: "checkpointed" as const,
+      artifactId: artifact.id,
+      workspaceSeedId: seedRecord.id,
+      updatedAt: new Date().toISOString(),
+      },
+    );
     if (existingSeed === null) {
       await this.updateIssueLifecycleWithEvidence(
         context.issue,
-        { workspaceSeed: seedRecord },
+        { workspaceSeed: seedRecord, succession: boundSuccession },
         "accepted_artifact_seed_planned",
         artifact.id,
+      );
+    } else {
+      await this.updateIssueLifecycleWithEvidence(
+        context.issue,
+        { succession: boundSuccession },
+        "accepted_artifact_succession_bound",
+        agreement.succession.id,
       );
     }
     context.dispatch.dependencyArtifactSeed = seed;
@@ -5747,12 +5956,298 @@ export class Orchestrator {
     };
   }
 
+  private async persistSuccessionAgreementObservation(
+    agreement: ResolvedIssueSuccessionAgreement,
+    currentLifecycle: IssueLifecycleRecord | null,
+    reason: string,
+  ): Promise<void> {
+    if (
+      agreement.kind === "none" ||
+      agreement.succession === null
+    ) {
+      await this.updateIssueLifecycleWithEvidence(
+        agreement.issue,
+        { relationshipState: agreement.relationshipState },
+        reason,
+        `relationships:${agreement.issue.id}`,
+      );
+      return;
+    }
+
+    const localObserved =
+      agreement.succession.status === "invalid"
+        ? preserveInvalidSuccessionEvidence(
+            currentLifecycle?.succession ?? null,
+            agreement.succession,
+          )
+        : mergeIssueSuccessionProgress(
+            currentLifecycle?.succession,
+            agreement.succession,
+          );
+    const counterpart =
+      agreement.kind === "agreed"
+        ? agreement.sourceIssue.id === agreement.issue.id
+          ? agreement.targetIssue
+          : agreement.sourceIssue
+        : agreement.counterpart;
+    const updates: Promise<IssueLifecycleRecord | null>[] = [
+      this.updateIssueLifecycleWithEvidence(
+        agreement.issue,
+        {
+          relationshipState: agreement.relationshipState,
+          succession: localObserved,
+        },
+        reason,
+        `succession:${localObserved.id}:${localObserved.status}`,
+      ),
+    ];
+    if (counterpart !== null) {
+      const counterpartLifecycle =
+        await this.options.lifecycleStore?.get(counterpart.id);
+      const counterpartObserved: IssueSuccessionRecord = {
+        ...localObserved,
+        role:
+          localObserved.role === "succeeded"
+            ? "successor"
+            : "succeeded",
+      };
+      updates.push(
+        this.updateIssueLifecycleWithEvidence(
+          counterpart,
+          {
+            relationshipState:
+              buildIssueRelationshipState(counterpart),
+            succession:
+              counterpartObserved.status === "invalid"
+                ? preserveInvalidSuccessionEvidence(
+                    counterpartLifecycle?.succession ?? null,
+                    counterpartObserved,
+                  )
+                : mergeIssueSuccessionProgress(
+                    counterpartLifecycle?.succession,
+                    counterpartObserved,
+                  ),
+          },
+          reason,
+          `succession:${counterpartObserved.id}:${counterpartObserved.status}`,
+        ),
+      );
+    }
+    await Promise.all(updates);
+  }
+
+  /**
+   * Absence of a local succession declaration is only ordinary when the
+   * previously named counterpart has also stopped naming this issue. A
+   * persisted bilateral binding is the lookup key here; blocker adjacency is
+   * never interpreted as succession.
+   */
+  private async reconcileMissingLocalSuccession(
+    issue: Issue,
+    lifecycle: IssueLifecycleRecord | null,
+    relationshipState: IssueRelationshipState,
+    reason: string,
+  ): Promise<MissingLocalSuccessionReconciliation> {
+    const lifecycleStore = this.options.lifecycleStore;
+    const durable = lifecycle?.succession ?? null;
+    if (!lifecycleStore || durable === null) {
+      await this.updateIssueLifecycleWithEvidence(
+        issue,
+        { relationshipState, succession: null },
+        reason,
+        `relationships:${issue.id}`,
+      );
+      return { status: "cleared" };
+    }
+
+    const counterpartReference =
+      durable.role === "succeeded"
+        ? durable.successorIssue
+        : durable.succeededIssue;
+    const counterpartLookup =
+      counterpartReference.id ?? counterpartReference.identifier;
+    let counterpartIssues: Issue[];
+    try {
+      counterpartIssues =
+        await this.options.tracker.fetchIssueStatesByIds([
+          counterpartLookup,
+        ]);
+    } catch (error) {
+      throw new SymphonyError(
+        "tracker_error",
+        `Succession ${durable.id} could not refresh counterpart ${counterpartReference.identifier} before reconciling a removed declaration: ${errorMessage(error)}`,
+      );
+    }
+    const counterpart =
+      counterpartIssues.find(
+        (candidate) =>
+          (counterpartReference.id !== null &&
+            candidate.id === counterpartReference.id) ||
+          candidate.identifier.toLowerCase() ===
+            counterpartReference.identifier.toLowerCase(),
+      ) ?? null;
+    if (counterpart === null) {
+      throw new SymphonyError(
+        "tracker_error",
+        `Succession ${durable.id} counterpart ${counterpartReference.identifier} was not returned before reconciling a removed declaration`,
+      );
+    }
+
+    const counterpartLifecycle = await lifecycleStore.get(counterpart.id);
+    const parsedCounterpart = parseIssueContract(counterpart.description);
+    const counterpartDeclaration =
+      parsedCounterpart.valid &&
+      parsedCounterpart.contract.schemaVersion === 2
+        ? parsedCounterpart.contract.relationships?.succession
+        : undefined;
+    const counterpartDeclarationReference =
+      counterpartDeclaration?.successor?.issue ??
+      counterpartDeclaration?.succeeds?.issue ??
+      null;
+    const counterpartStillNamesIssue =
+      counterpartDeclarationReference !== null &&
+      issueReferenceMatches(counterpartDeclarationReference, issue);
+
+    if (
+      parsedCounterpart.valid &&
+      parsedCounterpart.contract.schemaVersion === 2 &&
+      !counterpartStillNamesIssue
+    ) {
+      const updates: Promise<IssueLifecycleRecord | null>[] = [
+        this.updateIssueLifecycleWithEvidence(
+          issue,
+          { relationshipState, succession: null },
+          reason,
+          `succession:${durable.id}:removed`,
+        ),
+      ];
+      if (
+        counterpartLifecycle?.succession &&
+        sameIssueSuccessionIdentity(
+          durable,
+          counterpartLifecycle.succession,
+        )
+      ) {
+        updates.push(
+          this.updateIssueLifecycleWithEvidence(
+            counterpart,
+            {
+              relationshipState:
+                buildIssueRelationshipState(counterpart),
+              succession: null,
+            },
+            `succession ${durable.id} was removed from both Issue Contracts`,
+            `succession:${durable.id}:removed`,
+          ),
+        );
+      }
+      await Promise.all(updates);
+      return { status: "cleared" };
+    }
+
+    let errors: string[];
+    let observed: IssueSuccessionRecord;
+    if (counterpartStillNamesIssue) {
+      const counterpartAgreement = await resolveIssueSuccessionAgreement(
+        counterpart,
+        this.options.tracker,
+      );
+      if (counterpartAgreement.kind === "none") {
+        throw new SymphonyError(
+          "conflict",
+          `Succession ${durable.id} changed while its removed declaration was being reconciled; retry against the latest Issue Contracts`,
+        );
+      }
+      if (counterpartAgreement.kind === "agreed") {
+        throw new SymphonyError(
+          "conflict",
+          `Succession ${durable.id} was restored while its removed declaration was being reconciled; retry against the latest Issue Contracts`,
+        );
+      }
+      errors = [
+        `Issue ${issue.identifier} removed its local succession declaration while ${counterpart.identifier} still names it`,
+        ...counterpartAgreement.errors,
+      ];
+      observed =
+        counterpartAgreement.succession ??
+        invalidSuccessionObservation(
+          durable,
+          issue,
+          counterpart,
+          errors,
+        );
+    } else {
+      errors = [
+        `Issue ${issue.identifier} removed its local succession declaration, but counterpart ${counterpart.identifier} does not have a valid schema-v2 Issue Contract; bilateral removal cannot be confirmed`,
+      ];
+      observed = invalidSuccessionObservation(
+        durable,
+        issue,
+        counterpart,
+        errors,
+      );
+    }
+
+    const localRole = issueMatchesSuccessionEndpoint(
+      issue,
+      observed.succeededIssue,
+    )
+      ? "succeeded"
+      : "successor";
+    const counterpartRole =
+      localRole === "succeeded" ? "successor" : "succeeded";
+    const localObserved: IssueSuccessionRecord = {
+      ...observed,
+      role: localRole,
+      status: "invalid",
+      validationErrors: [...errors],
+      updatedAt: new Date().toISOString(),
+    };
+    const counterpartObserved: IssueSuccessionRecord = {
+      ...localObserved,
+      role: counterpartRole,
+    };
+    const localInvalid = preserveInvalidSuccessionEvidence(
+      durable,
+      localObserved,
+    );
+    const counterpartInvalid = preserveInvalidSuccessionEvidence(
+      counterpartLifecycle?.succession ?? null,
+      counterpartObserved,
+    );
+    await Promise.all([
+      this.updateIssueLifecycleWithEvidence(
+        issue,
+        {
+          relationshipState,
+          succession: localInvalid,
+        },
+        `succession ${localInvalid.id} became unilateral`,
+        `succession:${localInvalid.id}:invalid`,
+      ),
+      this.updateIssueLifecycleWithEvidence(
+        counterpart,
+        {
+          relationshipState: buildIssueRelationshipState(counterpart),
+          succession: counterpartInvalid,
+        },
+        `succession ${counterpartInvalid.id} became unilateral`,
+        `succession:${counterpartInvalid.id}:invalid`,
+      ),
+    ]);
+    return {
+      status: "invalid",
+      reason: errors.join("; "),
+      succession: localInvalid,
+    };
+  }
+
   private async blockDependencyArtifactDispatch(
     issue: Issue,
     lifecycle: IssueLifecycleRecord | null,
     reason: string,
     requiredAction =
-      "Create or select one integration issue that combines these accepted artifacts, then leave this issue blocked by only that integration issue.",
+      "Restore the explicit reciprocal succession contract and its independent Linear block edge, or remove the stale workspace seed before moving this issue out of Blocked.",
   ): Promise<void> {
     const runId = `accepted-artifact-seed:${issue.id}`;
     await this.updateIssueLifecycleWithEvidence(
@@ -5782,6 +6277,129 @@ export class Orchestrator {
       "accepted artifact dependency integration required",
       issue,
     );
+  }
+
+  private async blockRelationshipContractDispatch(
+    issue: Issue,
+    lifecycle: IssueLifecycleRecord | null,
+    reason: string,
+    requiredAction =
+      "Make the Issue Contract relationships.blocks and relationships.blockedBy arrays exactly match the Linear ordering edges; do not add succession unless this is an explicit expected-red implementation pair; then move this issue out of Blocked.",
+  ): Promise<void> {
+    const runId = `issue-relationship-contract:${issue.id}`;
+    await this.updateIssueLifecycleWithEvidence(
+      issue,
+      { phase: "blocked", blockedReason: reason },
+      "issue_relationship_contract_requires_reconciliation",
+      runId,
+    );
+    await this.applyWritebacks(
+      planBlockedEscalationWritebacks(
+        {
+          issue,
+          runId,
+          reason,
+          ...(lifecycle === null
+            ? {}
+            : { incompleteTurnCount: lifecycle.incompleteTurnCount }),
+          maxIncompleteTurns: this.config.reviewLoop.maxIncompleteTurns,
+          ...(lifecycle === null ? {} : { reviewRound: lifecycle.reviewRound }),
+          maxReviewRounds: this.config.reviewLoop.failureLimits.reviewerFailures,
+          lastCompletionReport: latestCompletionReportFromLifecycle(lifecycle),
+          lastReviewVerdict: latestReviewVerdictFromLifecycle(lifecycle),
+          requiredAction,
+        },
+        this.config,
+      ),
+      "issue relationship contract reconciliation required",
+      issue,
+    );
+  }
+
+  private async advanceSuccessionMilestone(
+    issue: Issue,
+    status: Exclude<IssueSuccessionRecord["status"], "invalid">,
+    links: {
+      artifactId?: string | null;
+      workspaceSeedId?: string | null;
+      mergeCommitSha?: string | null;
+    } = {},
+  ): Promise<void> {
+    const lifecycleStore = this.options.lifecycleStore;
+    if (!lifecycleStore) return;
+    const lifecycle = await lifecycleStore.get(issue.id);
+    const current = lifecycle?.succession ?? null;
+    if (!current || current.status === "invalid") return;
+    const updatedAt = new Date().toISOString();
+    const observedCurrent: IssueSuccessionRecord = {
+      ...current,
+      status,
+      ...links,
+      updatedAt,
+    };
+    const counterpartId =
+      current.role === "succeeded"
+        ? current.successorIssue.id
+        : current.succeededIssue.id;
+    if (!counterpartId) {
+      throw new SymphonyError(
+        "conflict",
+        `Succession ${current.id} cannot advance to ${status} without a resolved counterpart issue id`,
+      );
+    }
+    let counterpartIssues: Issue[];
+    try {
+      counterpartIssues =
+        await this.options.tracker.fetchIssueStatesByIds([counterpartId]);
+    } catch (error) {
+      throw new SymphonyError(
+        "tracker_error",
+        `Succession ${current.id} could not refresh counterpart ${counterpartId} before advancing to ${status}: ${errorMessage(error)}`,
+      );
+    }
+    const counterpart = counterpartIssues.find(
+      (candidate) => candidate.id === counterpartId,
+    );
+    if (!counterpart) {
+      throw new SymphonyError(
+        "tracker_error",
+        `Succession ${current.id} counterpart ${counterpartId} was not returned before advancing to ${status}`,
+      );
+    }
+    const counterpartLifecycle = await lifecycleStore.get(counterpartId);
+    const counterpartRole =
+      current.role === "succeeded" ? "successor" : "succeeded";
+    const observedCounterpart: IssueSuccessionRecord = {
+      ...current,
+      role: counterpartRole,
+      status,
+      ...links,
+      updatedAt,
+    };
+    await Promise.all([
+      this.updateIssueLifecycleWithEvidence(
+        issue,
+        {
+          succession: mergeIssueSuccessionProgress(
+            current,
+            observedCurrent,
+          ),
+        },
+        `succession ${current.id} advanced to ${status}`,
+        `succession:${current.id}:${status}`,
+      ),
+      this.updateIssueLifecycleWithEvidence(
+        counterpart,
+        {
+          succession: mergeIssueSuccessionProgress(
+            counterpartLifecycle?.succession,
+            observedCounterpart,
+          ),
+        },
+        `succession ${current.id} advanced to ${status}`,
+        `succession:${current.id}:${status}`,
+      ),
+    ]);
   }
 
   private async planWorkerDispatchWritebackAction(
@@ -7163,7 +7781,13 @@ export class Orchestrator {
     const latestIssues = await this.options.tracker.fetchIssueStatesByIds([
       context.issue.id,
     ]);
-    const issue = latestIssues[0] ?? context.issue;
+    const issue = latestIssues[0];
+    if (!issue) {
+      throw new SymphonyError(
+        "tracker_unavailable",
+        "Accepted-artifact completion could not load the current source issue",
+      );
+    }
     const lifecycle = await lifecycleStore.get(issue.id);
     const verdict =
       context.handoffReconciliation.reviewVerdict ??
@@ -7194,11 +7818,24 @@ export class Orchestrator {
           ? {}
           : { writebackProcessor: this.options.writeback }),
         client: this.acceptedArtifactGitHubClient(),
+        resolveIssuesByIds: (issueIds) =>
+          this.options.tracker.fetchIssueStatesByIds(issueIds),
       });
       const result = await service.completeAcceptedArtifact({
         issue,
         workspacePath: lifecycle?.summaryPointers.workspacePath ?? null,
       });
+      await this.advanceSuccessionMilestone(issue, "checkpointed", {
+        artifactId: result.artifact.id,
+      });
+      if (lifecycle?.acceptedArtifactValidationFailure) {
+        await this.updateIssueLifecycleWithEvidence(
+          issue,
+          { acceptedArtifactValidationFailure: null },
+          "accepted_artifact_validation_failures_cleared",
+          result.artifact.id,
+        );
+      }
       const refreshed = await this.options.tracker.fetchIssueStatesByIds([
         issue.id,
       ]);
@@ -7248,7 +7885,11 @@ export class Orchestrator {
       ) {
         await this.updateIssueLifecycleWithEvidence(
           latest,
-          { phase: "terminal", blockedReason: null },
+          {
+            phase: "terminal",
+            blockedReason: null,
+            acceptedArtifactValidationFailure: null,
+          },
           "accepted_artifact_completed_unmerged",
           result.artifact.id,
         );
@@ -7267,16 +7908,45 @@ export class Orchestrator {
     } catch (error) {
       const category = classifyAcceptedArtifactCompletionError(error);
       if (category === "contract_or_head_drift") {
-        await this.returnAcceptedArtifactToImplementation(
+        const failure = await this.recordAcceptedArtifactValidationFailure(
           issue,
           lifecycle,
           verdict,
-          errorMessage(error),
+          error,
+        );
+        if (failure.state.count >= failure.state.limit) {
+          const blockedReason = await this.blockAcceptedArtifactValidationFailure(
+            issue,
+            failure.lifecycle,
+            verdict,
+            failure.state,
+          );
+          return {
+            status: "skipped" as const,
+            stop: true,
+            message: blockedReason,
+            details: {
+              disposition: "blocked",
+              reason: failure.state.message,
+              validationFailureCount: failure.state.count,
+              validationFailureLimit: failure.state.limit,
+              validationFailureReason: failure.state.reason,
+            },
+          };
+        }
+        await this.returnAcceptedArtifactToImplementation(
+          issue,
+          failure.lifecycle,
+          verdict,
+          failure.state.message,
         );
         return {
           details: {
             disposition: "returned_to_implementation",
-            reason: errorMessage(error),
+            reason: failure.state.message,
+            validationFailureCount: failure.state.count,
+            validationFailureLimit: failure.state.limit,
+            validationFailureReason: failure.state.reason,
           },
         };
       }
@@ -7477,12 +8147,11 @@ export class Orchestrator {
     const currentLifecycle =
       lifecycle ?? (await this.options.lifecycleStore?.get(issue.id)) ?? null;
     const seed = currentLifecycle?.workspaceSeed ?? null;
-    if (!seed) return { status: "fresh" };
     let liveIssues: Issue[];
     try {
       liveIssues = await this.options.tracker.fetchIssueStatesByIds([
         issue.id,
-        seed.sourceIssueId,
+        ...(seed === null ? [] : [seed.sourceIssueId]),
       ]);
     } catch (error) {
       return {
@@ -7491,24 +8160,259 @@ export class Orchestrator {
       };
     }
     const liveTarget = liveIssues.find((candidate) => candidate.id === issue.id);
-    const liveSource = liveIssues.find(
-      (candidate) => candidate.id === seed.sourceIssueId,
-    );
-    if (!liveTarget || !liveSource) {
+    if (!liveTarget) {
       return {
         status: "unavailable",
-        reason:
-          "Live target or accepted-artifact source state was not returned",
+        reason: "Live issue state was not returned",
       };
     }
+    let relationshipState = buildIssueRelationshipState(liveTarget);
+    const parsedContract = parseIssueContract(liveTarget.description);
+    const declaredSuccession =
+      parsedContract.valid
+        ? parsedContract.contract.relationships?.succession
+        : undefined;
+    const explicitlyNoSuccession =
+      parsedContract.valid &&
+      parsedContract.contract.schemaVersion === 2 &&
+      declaredSuccession === undefined;
+    let agreement: Awaited<
+      ReturnType<typeof resolveIssueSuccessionAgreement>
+    > | null = null;
+    if (declaredSuccession !== undefined) {
+      try {
+        agreement = await resolveIssueSuccessionAgreement(
+          liveTarget,
+          this.options.tracker,
+        );
+        relationshipState = agreement.relationshipState;
+        await this.persistSuccessionAgreementObservation(
+          agreement,
+          currentLifecycle,
+          "issue succession refreshed before review or merge",
+        );
+      } catch (error) {
+        await this.updateIssueLifecycleWithEvidence(
+          liveTarget,
+          { relationshipState },
+          "issue relationship graph refreshed while succession was unavailable",
+          `relationships:${liveTarget.id}`,
+        );
+        this.options.logger.warn(
+          "succession refresh failed while validating issue relationship graph",
+          {
+            issue_id: liveTarget.id,
+            issue_identifier: liveTarget.identifier,
+            error: errorMessage(error),
+          },
+        );
+      }
+    } else if (explicitlyNoSuccession) {
+      let absenceAgreement: Awaited<
+        ReturnType<typeof resolveIssueSuccessionAgreement>
+      >;
+      try {
+        absenceAgreement = await resolveIssueSuccessionAgreement(
+          liveTarget,
+          this.options.tracker,
+        );
+      } catch (error) {
+        return {
+          status: "unavailable",
+          reason: `Live incoming succession refresh failed: ${errorMessage(error)}`,
+        };
+      }
+      relationshipState = absenceAgreement.relationshipState;
+      if (
+        absenceAgreement.kind === "invalid" &&
+        absenceAgreement.succession?.status === "invalid"
+      ) {
+        await this.persistSuccessionAgreementObservation(
+          absenceAgreement,
+          currentLifecycle,
+          `succession ${absenceAgreement.succession.id} is not a valid bilateral agreement`,
+        );
+        return {
+          status: "invalid",
+          scope: "succession",
+          issue: liveTarget,
+          reason: `The succession agreement became invalid: ${absenceAgreement.errors.join("; ")}`,
+        };
+      }
+      if (absenceAgreement.kind === "invalid") {
+        await this.updateIssueLifecycleWithEvidence(
+          absenceAgreement.issue,
+          { relationshipState },
+          "invalid issue relationships observed while checking for incoming succession",
+          `relationships:${absenceAgreement.issue.id}`,
+        );
+        return {
+          status: "invalid",
+          scope: "issue_contract",
+          issue: liveTarget,
+          reason:
+            relationshipState.status === "legacy"
+              ? "Issue Contract must use schemaVersion 2 with explicit relationships before review or merge"
+              : relationshipState.status === "invalid"
+                ? `Issue relationship contract changed or no longer matches Linear: ${relationshipState.validationErrors.join("; ")}`
+                : `The issue relationship graph could not be validated: ${absenceAgreement.errors.join("; ")}`,
+        };
+      }
+      if (absenceAgreement.kind === "agreed") {
+        return {
+          status: "unavailable",
+          reason:
+            "The Issue Contract changed while its absent succession declaration was being validated",
+        };
+      }
+      let reconciliation: MissingLocalSuccessionReconciliation;
+      try {
+        reconciliation = await this.reconcileMissingLocalSuccession(
+          liveTarget,
+          currentLifecycle,
+          relationshipState,
+          "issue relationships refreshed before review or merge",
+        );
+      } catch (error) {
+        return {
+          status: "unavailable",
+          reason: `Live succession removal reconciliation failed: ${errorMessage(error)}`,
+        };
+      }
+      if (reconciliation.status === "invalid") {
+        return {
+          status: "invalid",
+          scope: "succession",
+          issue: liveTarget,
+          reason:
+            `The succession agreement became invalid: ` +
+            reconciliation.reason,
+        };
+      }
+    } else {
+      await this.updateIssueLifecycleWithEvidence(
+        liveTarget,
+        { relationshipState },
+        "invalid or legacy Issue Contract observed before review or merge",
+        `relationships:${liveTarget.id}`,
+      );
+    }
+    if (relationshipState.status !== "valid") {
+      const successionInvalid =
+        validationErrorsContainSuccessionIssue(
+          relationshipState.validationErrors,
+        );
+      return {
+        status: "invalid",
+        scope: successionInvalid ? "succession" : "issue_contract",
+        issue: liveTarget,
+        reason:
+          relationshipState.status === "legacy"
+            ? "Issue Contract must use schemaVersion 2 with explicit relationships before review or merge"
+            : successionInvalid
+              ? `The succession contract is invalid: ${relationshipState.validationErrors.join("; ")}`
+              : `Issue relationship contract changed or no longer matches Linear: ${relationshipState.validationErrors.join("; ")}`,
+      };
+    }
+    const currentReport = latestCompletionReportFromLifecycle(currentLifecycle);
     if (
-      !liveTarget.blockedBy.some(
-        (blocker) => blocker.id === seed.sourceIssueId,
-      )
+      currentReport !== null &&
+      currentReport.contractSnapshot?.fingerprint !==
+        relationshipState.contractFingerprint
     ) {
       return {
         status: "invalid",
-        reason: `The direct dependency on ${seed.sourceIssueIdentifier} was removed after workspace seeding`,
+        scope: "issue_contract",
+        issue: liveTarget,
+        reason:
+          "Issue Contract changed after the accepted completion report; restart implementation against the current contract",
+      };
+    }
+    if (declaredSuccession !== undefined && agreement === null) {
+      try {
+        agreement = await resolveIssueSuccessionAgreement(
+          liveTarget,
+          this.options.tracker,
+        );
+      } catch (error) {
+        return {
+          status: "unavailable",
+          reason: `Live succession refresh failed: ${errorMessage(error)}`,
+        };
+      }
+      await this.persistSuccessionAgreementObservation(
+        agreement,
+        currentLifecycle,
+        "issue succession refreshed before review or merge",
+      );
+    }
+    if (declaredSuccession !== undefined) {
+      if (agreement === null) {
+        return {
+          status: "unavailable",
+          reason: "Live succession agreement was not resolved",
+        };
+      }
+      if (agreement.kind !== "agreed") {
+        const successionInvalid =
+          agreement.kind === "none" ||
+          (agreement.kind === "invalid" &&
+            agreement.succession?.status === "invalid");
+        return {
+          status: "invalid",
+          scope: successionInvalid ? "succession" : "issue_contract",
+          issue: liveTarget,
+          reason:
+            agreement.kind === "invalid"
+              ? successionInvalid
+                ? `The succession agreement became invalid: ${agreement.errors.join("; ")}`
+                : `The issue relationship graph became invalid: ${agreement.errors.join("; ")}`
+              : "The declared succession agreement is no longer present",
+        };
+      }
+    }
+    if (seed === null) {
+      if (
+        agreement?.kind === "agreed" &&
+        agreement.targetIssue.id === liveTarget.id
+      ) {
+        return {
+          status: "invalid",
+          scope: "succession",
+          issue: liveTarget,
+          reason:
+            "Declared implementation successor has no durable prepared accepted-artifact workspace seed",
+        };
+      }
+      return { status: "fresh" };
+    }
+    const liveSource =
+      agreement?.kind === "agreed"
+        ? agreement.sourceIssue
+        : liveIssues.find(
+            (candidate) => candidate.id === seed.sourceIssueId,
+          );
+    if (!liveSource) {
+      return {
+        status: "unavailable",
+        reason:
+          "Live accepted-artifact source state was not returned",
+      };
+    }
+    if (
+      agreement?.kind !== "agreed" ||
+      agreement.targetIssue.id !== liveTarget.id ||
+      agreement.sourceIssue.id !== seed.sourceIssueId ||
+      seed.successionId !== agreement.succession.id ||
+      (currentLifecycle?.succession !== null &&
+        currentLifecycle?.succession !== undefined &&
+        currentLifecycle.succession.id !== agreement.succession.id)
+    ) {
+      return {
+        status: "invalid",
+        scope: "succession",
+        issue: liveTarget,
+        reason: `Workspace seed ${seed.artifactId} is no longer selected by a reciprocal succession agreement with ${seed.sourceIssueIdentifier}`,
       };
     }
     if (
@@ -7517,7 +8421,12 @@ export class Orchestrator {
       const reason = `Accepted-artifact source ${seed.sourceIssueIdentifier} is ${liveSource.state}, not ${this.config.mergePolicy.doneState}`;
       return this.acceptedArtifactSourceMayCompleteAgain(liveSource.state)
         ? { status: "deferred", reason }
-        : { status: "invalid", reason };
+        : {
+            status: "invalid",
+            scope: "succession",
+            issue: liveTarget,
+            reason,
+          };
     }
     const sourceContract = parseIssueContract(liveSource.description);
     const sourceLifecycle =
@@ -7529,11 +8438,14 @@ export class Orchestrator {
       isSupersededLifecycleRecord(artifact) ||
       artifact.status !== "completed_unmerged" ||
       artifact.id !== seed.artifactId ||
+      artifact.successionId !== agreement.succession.id ||
       artifact.sourceHeadSha !== seed.sourceHeadSha ||
       sourceContract.fingerprint !== artifact.contractFingerprint
     ) {
       return {
         status: "invalid",
+        scope: "succession",
+        issue: liveTarget,
         reason: `Workspace seed ${seed.artifactId} no longer matches the current reviewed checkpoint for ${seed.sourceIssueIdentifier}`,
       };
     }
@@ -7556,7 +8468,29 @@ export class Orchestrator {
         message: freshness.reason,
       };
     }
+    if (
+      freshness.status === "invalid" &&
+      freshness.scope === "issue_contract"
+    ) {
+      await this.blockRelationshipContractDispatch(
+        freshness.issue,
+        lifecycle ?? null,
+        freshness.reason,
+        "Restore the live schema-v2 Issue Contract and Linear relationship graph to the exact contract accepted by the completion report, or restart implementation against the current contract; only declare succession for an explicit expected-red implementation pair; then move this issue out of Blocked.",
+      );
+      return {
+        status: "skipped" as const,
+        stop: true,
+        message: freshness.reason,
+      };
+    }
     if (!lifecycle?.workspaceSeed) {
+      await this.blockDependencyArtifactDispatch(
+        freshness.status === "invalid" ? freshness.issue : context.issue,
+        lifecycle ?? null,
+        freshness.reason,
+        "Restore the reciprocal succession contract and its independent Linear block edge, then prepare the accepted-artifact workspace seed before moving this issue out of Blocked.",
+      );
       return {
         status: "skipped" as const,
         stop: true,
@@ -7571,10 +8505,10 @@ export class Orchestrator {
       );
     } else {
       await this.blockDependencyArtifactDispatch(
-        context.issue,
+        freshness.issue,
         lifecycle,
         freshness.reason,
-        `Reconcile or discard the workspace seeded from ${lifecycle.workspaceSeed.sourceIssueIdentifier}, restore a direct dependency on a current ${this.config.mergePolicy.doneState} accepted artifact, then move this issue out of Blocked.`,
+        `Reconcile or discard the workspace seeded from ${lifecycle.workspaceSeed.sourceIssueIdentifier}, restore the reciprocal succession contract and its independent Linear block edge to a current ${this.config.mergePolicy.doneState} accepted artifact, then move this issue out of Blocked.`,
       );
     }
     return {
@@ -7766,6 +8700,164 @@ export class Orchestrator {
       this.config,
       "github.merge",
     );
+  }
+
+  private async recordAcceptedArtifactValidationFailure(
+    issue: Issue,
+    lifecycle: IssueLifecycleRecord | null,
+    verdict: IssueReviewVerdictRecord,
+    error: unknown,
+  ): Promise<{
+    lifecycle: IssueLifecycleRecord;
+    state: IssueAcceptedArtifactValidationFailureState;
+  }> {
+    const current =
+      (await this.options.lifecycleStore?.get(issue.id)) ?? lifecycle;
+    if (!current) {
+      throw new SymphonyError(
+        "conflict",
+        "Accepted-artifact validation failure could not be recorded without lifecycle state",
+      );
+    }
+    const report = latestCurrentCompletionReport(current);
+    const reason = acceptedArtifactValidationFailureReason(error);
+    const message = errorMessage(error);
+    const liveContractFingerprint = acceptedArtifactLiveContractFingerprint(
+      issue.description,
+    );
+    const reviewedContractFingerprint =
+      report?.contractSnapshot?.fingerprint ?? null;
+    const sourceHeadSha = report?.pullRequest?.headSha ?? null;
+    const signature = acceptedArtifactValidationFailureSignature({
+      reason,
+      liveContractFingerprint,
+      reviewedContractFingerprint,
+      sourceHeadSha,
+    });
+    const completionReportId = report?.id ?? current.lastCompletionReportId;
+    const previous = current.acceptedArtifactValidationFailure ?? null;
+    const sameCause = previous?.signature === signature;
+    const sameObservation =
+      sameCause &&
+      previous.completionReportId === completionReportId &&
+      previous.reviewVerdictId === verdict.id;
+    const configuredLimit =
+      this.config.reviewLoop.failureLimits
+        .acceptedArtifactValidationFailures;
+    const limit =
+      reason === "contract_or_review_drift" &&
+      !descriptionDeclaresAcceptedArtifact(issue.description)
+        ? 1
+        : configuredLimit;
+    if (sameObservation && previous.limit === limit) {
+      return { lifecycle: current, state: previous };
+    }
+    const now = new Date().toISOString();
+    const state: IssueAcceptedArtifactValidationFailureState = {
+      version: 1,
+      count: sameObservation
+        ? previous.count
+        : sameCause
+          ? previous.count + 1
+          : 1,
+      limit,
+      category: "contract_or_head_drift",
+      reason,
+      signature,
+      message,
+      firstFailedAt: sameCause ? previous.firstFailedAt : now,
+      lastFailedAt: sameObservation ? previous.lastFailedAt : now,
+      completionReportId,
+      reviewVerdictId: verdict.id,
+      liveContractFingerprint,
+      reviewedContractFingerprint,
+      sourceHeadSha,
+    };
+    const updated = await this.updateIssueLifecycleWithEvidence(
+      issue,
+      { acceptedArtifactValidationFailure: state },
+      "accepted_artifact_validation_failure_recorded",
+      verdict.id,
+    );
+    if (!updated) {
+      throw new SymphonyError(
+        "conflict",
+        "Accepted-artifact validation failure was not persisted",
+      );
+    }
+    return { lifecycle: updated, state };
+  }
+
+  private async blockAcceptedArtifactValidationFailure(
+    issue: Issue,
+    lifecycle: IssueLifecycleRecord,
+    verdict: IssueReviewVerdictRecord,
+    failure: IssueAcceptedArtifactValidationFailureState,
+  ): Promise<string> {
+    const blockedReason =
+      `max accepted-artifact validation failures reached ` +
+      `(${failure.count}/${failure.limit}): ${failure.message}`;
+    const superseded =
+      (await this.supersedeAcceptedArtifactEvidence(issue, lifecycle, {
+        reason: blockedReason,
+        sourceId: verdict.id,
+        nextPhase: "blocked",
+        ...(lifecycle.acceptedArtifact == null
+          ? {}
+          : { expectedArtifactId: lifecycle.acceptedArtifact.id }),
+        ...(lifecycle.lastCompletionReportId === null
+          ? {}
+          : {
+              expectedCompletionReportId:
+                lifecycle.lastCompletionReportId,
+            }),
+        expectedReviewVerdictId: verdict.id,
+      })) ?? lifecycle;
+    const blockedLifecycle =
+      (await this.updateIssueLifecycleWithEvidence(
+        issue,
+        {
+          phase: "blocked",
+          blockedReason,
+          acceptedArtifactValidationFailure: failure,
+        },
+        "accepted_artifact_validation_failures_exhausted",
+        verdict.id,
+      )) ?? superseded;
+    const runId = `accepted-artifact-validation:${failure.count}:${failure.signature.slice(0, 16)}`;
+    const completionReport =
+      blockedLifecycle.completionReports.find(
+        (candidate) => candidate.id === failure.completionReportId,
+      ) ?? null;
+    const reviewVerdict =
+      blockedLifecycle.reviewVerdicts.find(
+        (candidate) => candidate.id === failure.reviewVerdictId,
+      ) ?? null;
+    await this.applyWritebacks(
+      planBlockedEscalationWritebacks(
+        {
+          issue,
+          runId,
+          reason: blockedReason,
+          fromStates: acceptedArtifactCompletionSourceStates(this.config),
+          incompleteTurnCount: blockedLifecycle.incompleteTurnCount,
+          maxIncompleteTurns: this.config.reviewLoop.maxIncompleteTurns,
+          reviewRound: blockedLifecycle.reviewRound,
+          maxReviewRounds:
+            this.config.reviewLoop.failureLimits.reviewerFailures,
+          acceptedArtifactValidationFailureCount: failure.count,
+          maxAcceptedArtifactValidationFailures: failure.limit,
+          lastCompletionReport: completionReport,
+          lastReviewVerdict: reviewVerdict,
+          requiredAction:
+            "Repair the canonical Issue Contract or the reviewed pull-request/branch checkpoint named above, then move the issue out of Blocked and submit a fresh completion report and review.",
+        },
+        this.config,
+      ),
+      "accepted artifact validation failure ceiling",
+      issue,
+    );
+    return blockedReason;
   }
 
   private async returnAcceptedArtifactToImplementation(
@@ -8693,6 +9785,19 @@ export class Orchestrator {
       operatorApproval: this.options.operatorApproval,
       resolveIssuesByIds: (issueIds) =>
         this.options.tracker.fetchIssueStatesByIds(issueIds),
+      recordLifecycleEvidence: (input) =>
+        this.recordLifecycleEvidenceSnapshot({
+          issue: input.issue,
+          lifecycle: input.lifecycle,
+          patch: input.patch,
+          ...(input.sourceId === undefined
+            ? {}
+            : { sourceId: input.sourceId }),
+          ...(input.reason === undefined ? {} : { reason: input.reason }),
+          ...(input.eventType === undefined
+            ? {}
+            : { eventType: input.eventType }),
+        }),
     });
     return true;
   }
@@ -12543,6 +13648,7 @@ export class Orchestrator {
         assigneeId: input.issue.assigneeId,
         delegateId: input.issue.delegateId,
         assignedToWorker: input.issue.assignedToWorker,
+        blocks: input.issue.blocks ?? [],
         blockedBy: input.issue.blockedBy,
         hasChildren: input.issue.hasChildren === true,
         children: (input.issue.children ?? []).map((child) => ({ ...child })),
@@ -12859,6 +13965,12 @@ export class Orchestrator {
         latestApprovalPassVerdict: latestCurrentApprovalPassVerdict(
           input.lifecycle,
         ),
+        acceptedArtifact: input.lifecycle.acceptedArtifact ?? null,
+        acceptedArtifactValidationFailure:
+          input.lifecycle.acceptedArtifactValidationFailure ?? null,
+        workspaceSeed: input.lifecycle.workspaceSeed ?? null,
+        relationshipState: input.lifecycle.relationshipState ?? null,
+        succession: input.lifecycle.succession ?? null,
         merge: input.lifecycle.merge ?? null,
         mergeGate: input.lifecycle.mergeGate ?? null,
         mergeGateResults: input.lifecycle.mergeGateResults ?? [],
@@ -14403,6 +15515,7 @@ export class Orchestrator {
               preparedHeadSha: null,
               targetBranch: workspace.seed.targetBranch,
               conflictedFiles: [...workspace.seed.conflictedFiles],
+              absorbedPaths: [],
               preparedAt: null,
               failureReason:
                 "Accepted-artifact seed rebase requires automated worker conflict resolution",
@@ -14414,6 +15527,7 @@ export class Orchestrator {
               preparedHeadSha: workspace.seed.preparedHeadSha,
               targetBranch: workspace.seed.targetBranch,
               conflictedFiles: [],
+              absorbedPaths: [...(workspace.seed.absorbedPaths ?? [])],
               preparedAt: planned.preparedAt ?? new Date().toISOString(),
               failureReason: null,
             };
@@ -14452,6 +15566,12 @@ export class Orchestrator {
                 : { workspaceSeed: preparedWorkspaceSeed }),
             },
       );
+      if (preparedWorkspaceSeed?.status === "prepared") {
+        await this.advanceSuccessionMilestone(entry.issue, "seeded", {
+          artifactId: preparedWorkspaceSeed.artifactId,
+          workspaceSeedId: preparedWorkspaceSeed.id,
+        });
+      }
       if (entry.runPhase !== "issue_breakdown" && !seedConflictPending) {
         await this.options.workspaceManager.beforeRun(workspace.path);
         await this.recordWorkspaceEvidenceSnapshot(
@@ -14559,9 +15679,14 @@ export class Orchestrator {
             preparedHeadSha: finalizedSeed.preparedHeadSha,
             targetBranch: finalizedSeed.targetBranch,
             conflictedFiles: [],
+            absorbedPaths: [...(finalizedSeed.absorbedPaths ?? [])],
             preparedAt: new Date().toISOString(),
             failureReason: null,
           },
+        });
+        await this.advanceSuccessionMilestone(entry.issue, "seeded", {
+          artifactId: finalizedSeed.artifactId,
+          workspaceSeedId: planned.id,
         });
         await this.recordWorkspaceEvidenceSnapshot(
           entry,
@@ -17536,7 +18661,7 @@ export class Orchestrator {
           entry.issue,
           lifecycle,
           dependencyFreshness.reason,
-          `Reconcile or discard the workspace seeded from ${lifecycle.workspaceSeed.sourceIssueIdentifier}, restore a direct dependency on a current ${this.config.mergePolicy.doneState} accepted artifact, then move this issue out of Blocked.`,
+          `Reconcile or discard the workspace seeded from ${lifecycle.workspaceSeed.sourceIssueIdentifier}, restore the reciprocal succession contract and its independent Linear block edge to a current ${this.config.mergePolicy.doneState} accepted artifact, then move this issue out of Blocked.`,
         );
         entry.lifecycle = await store.get(entry.issue.id);
       } else {
@@ -17962,7 +19087,7 @@ export class Orchestrator {
           issue,
           lifecycle,
           freshness.reason,
-          `Reconcile or discard the workspace seeded from ${lifecycle.workspaceSeed.sourceIssueIdentifier}, restore a direct dependency on a current ${this.config.mergePolicy.doneState} accepted artifact, then move this issue out of Blocked.`,
+          `Reconcile or discard the workspace seeded from ${lifecycle.workspaceSeed.sourceIssueIdentifier}, restore the reciprocal succession contract and its independent Linear block edge to a current ${this.config.mergePolicy.doneState} accepted artifact, then move this issue out of Blocked.`,
         );
       }
       return;
@@ -20096,6 +21221,7 @@ function currentFieldsAsIssue(
     delegateId: current.delegateId,
     assignedToWorker: current.assignedToWorker,
     labels: [...current.labels],
+    blocks: current.blocks.map((blocked) => ({ ...blocked })),
     blockedBy: current.blockedBy.map((blocker) => ({ ...blocker })),
     hasChildren: current.hasChildren,
     children: (current.children ?? []).map((child) => ({ ...child })),
@@ -21959,6 +23085,50 @@ function acceptedArtifactCompletionSourceStates(config: ServiceConfig): string[]
   ];
 }
 
+function acceptedArtifactValidationFailureReason(
+  error: unknown,
+): IssueAcceptedArtifactValidationFailureReason {
+  if (error instanceof AcceptedArtifactCompletionError) {
+    switch (error.reason) {
+      case "contract_or_review_drift":
+      case "pull_request_or_branch_drift":
+      case "source_checkpoint_drift":
+        return error.reason;
+    }
+  }
+  return "source_checkpoint_drift";
+}
+
+function acceptedArtifactLiveContractFingerprint(
+  description: string | null | undefined,
+): string {
+  const parsed = parseIssueContract(description);
+  if (parsed.valid) return parsed.fingerprint;
+  return `invalid:${createHash("sha256")
+    .update(description ?? "")
+    .digest("hex")}`;
+}
+
+function acceptedArtifactValidationFailureSignature(input: {
+  reason: IssueAcceptedArtifactValidationFailureReason;
+  liveContractFingerprint: string;
+  reviewedContractFingerprint: string | null;
+  sourceHeadSha: string | null;
+}): string {
+  const identity =
+    input.reason === "contract_or_review_drift"
+      ? [input.reason, input.liveContractFingerprint]
+      : [
+          input.reason,
+          input.liveContractFingerprint,
+          input.reviewedContractFingerprint ?? "",
+          input.sourceHeadSha ?? "",
+        ];
+  return createHash("sha256")
+    .update(identity.join("\0"))
+    .digest("hex");
+}
+
 function snapshotIsAcceptedArtifactDelivery(
   snapshot: IssueCurrentStateSnapshot,
 ): boolean {
@@ -21988,6 +23158,7 @@ function assertWorkspaceSeedMatchesArtifact(
 ): void {
   const matches =
     record.artifactId === seed.artifactId &&
+    record.successionId === seed.successionId &&
     record.sourceIssueId === seed.sourceIssueId &&
     record.sourceIssueIdentifier === seed.sourceIssueIdentifier &&
     record.repositoryFingerprint === seed.repositoryFingerprint &&
@@ -22018,6 +23189,125 @@ function latestReviewVerdictFromLifecycle(
   lifecycle: IssueLifecycleRecord | null,
 ): IssueReviewVerdictRecord | null {
   return lifecycle ? latestReviewVerdict(lifecycle) : null;
+}
+
+function issueMatchesSuccessionEndpoint(
+  issue: Pick<Issue, "id" | "identifier">,
+  endpoint: IssueSuccessionRecord["succeededIssue"],
+): boolean {
+  return (
+    (endpoint.id !== null && endpoint.id === issue.id) ||
+    endpoint.identifier.toLowerCase() === issue.identifier.toLowerCase()
+  );
+}
+
+function invalidSuccessionObservation(
+  durable: IssueSuccessionRecord,
+  issue: Issue,
+  counterpart: Issue,
+  errors: readonly string[],
+): IssueSuccessionRecord {
+  const issueContract = parseIssueContract(issue.description);
+  const counterpartContract = parseIssueContract(counterpart.description);
+  const refreshEndpoint = (
+    endpoint: IssueSuccessionRecord["succeededIssue"],
+  ): IssueSuccessionRecord["succeededIssue"] => {
+    if (issueMatchesSuccessionEndpoint(issue, endpoint)) {
+      return {
+        id: issue.id,
+        identifier: issue.identifier,
+        contractFingerprint: issueContract.valid
+          ? issueContract.fingerprint
+          : null,
+      };
+    }
+    if (issueMatchesSuccessionEndpoint(counterpart, endpoint)) {
+      return {
+        id: counterpart.id,
+        identifier: counterpart.identifier,
+        contractFingerprint: counterpartContract.valid
+          ? counterpartContract.fingerprint
+          : null,
+      };
+    }
+    return { ...endpoint };
+  };
+  const succeededIssue = refreshEndpoint(durable.succeededIssue);
+  const successorIssue = refreshEndpoint(durable.successorIssue);
+  const succeededLive = issueMatchesSuccessionEndpoint(
+    issue,
+    succeededIssue,
+  )
+    ? issue
+    : issueMatchesSuccessionEndpoint(counterpart, succeededIssue)
+      ? counterpart
+      : null;
+  const successorLive = issueMatchesSuccessionEndpoint(
+    issue,
+    successorIssue,
+  )
+    ? issue
+    : issueMatchesSuccessionEndpoint(counterpart, successorIssue)
+      ? counterpart
+      : null;
+  const linearBlockVerified =
+    succeededLive !== null &&
+    successorLive !== null &&
+    (succeededLive.blocks ?? []).some(
+      (edge) =>
+        edge.id === successorLive.id ||
+        edge.identifier?.toLowerCase() ===
+          successorLive.identifier.toLowerCase(),
+    ) &&
+    successorLive.blockedBy.some(
+      (edge) =>
+        edge.id === succeededLive.id ||
+        edge.identifier?.toLowerCase() ===
+          succeededLive.identifier.toLowerCase(),
+    );
+  const observedAt = new Date().toISOString();
+  return {
+    ...durable,
+    succeededIssue,
+    successorIssue,
+    linearBlockVerified,
+    status: "invalid",
+    validationErrors: [...new Set(errors)],
+    updatedAt: observedAt,
+  };
+}
+
+function preserveInvalidSuccessionEvidence(
+  existing: IssueSuccessionRecord | null,
+  observed: IssueSuccessionRecord,
+): IssueSuccessionRecord {
+  if (
+    existing === null ||
+    !sameIssueSuccessionIdentity(existing, observed)
+  ) {
+    return observed;
+  }
+  return {
+    ...observed,
+    artifactId: observed.artifactId ?? existing.artifactId,
+    workspaceSeedId:
+      observed.workspaceSeedId ?? existing.workspaceSeedId,
+    mergeCommitSha:
+      observed.mergeCommitSha ?? existing.mergeCommitSha,
+    declaredAt: existing.declaredAt,
+    agreedAt: existing.agreedAt ?? observed.agreedAt,
+  };
+}
+
+function validationErrorsContainSuccessionIssue(
+  errors: readonly string[],
+): boolean {
+  return errors.some(
+    (error) =>
+      error.includes("relationships.succession") ||
+      error.startsWith("Succession ") ||
+      error.toLowerCase().includes("succession contract"),
+  );
 }
 
 function countConsecutiveWorkerRuns(

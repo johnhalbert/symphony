@@ -24,7 +24,9 @@ Before proposing children, compare the parent contract, accepted completion repo
 - Each child must block the parent.
 - Child-to-child task dependencies must be represented in `dependencies`.
 - Each child description must include: `Problem / Goal`, `Issue Contract`, `Touched Surfaces`, `Acceptance Criteria`, `Contract Checklist`, `Validation Requirements`, `Out Of Scope`, and `Promotion Readiness`.
-- Each `Issue Contract` must include fenced JSON with `schemaVersion`, `contractVersion`, and non-empty stable `requirements`.
-- A deliberately unmerged expected-red test issue must declare `delivery: {"mode":"accepted_artifact","artifact":"expected_red_tests"}`. Its implementation sibling successors (children of the same decomposition parent), never children of the artifact issue, use merge delivery and directly depend on the test issue so Symphony can seed them from the accepted checkpoint.
+- Each `Issue Contract` must use `schemaVersion: 2` and include fenced JSON with `contractVersion`, non-empty stable `requirements`, and `relationships`.
+- `relationships.blocks` and `relationships.blockedBy` are both required arrays, with `[]` valid. They express only generalized ordering and must mirror `dependencies`: `blockedBy` names dependency titles; `blocks` names dependent child titles plus the parent issue identifier because every child blocks its parent. Symphony resolves child titles to assigned Linear identifiers after creation.
+- A deliberately unmerged expected-red test issue must declare `delivery: {"mode":"accepted_artifact","artifact":"expected_red_tests"}` and a structured `relationships.succession` with a stable `id`, `purpose: "expected_red_implementation"`, and `successor: {"issue":"<implementation child title>"}`. Successors are implementation sibling successors (children of the same decomposition parent), never children of the artifact issue. The merge-delivery implementation sibling must directly depend on the test issue and reciprocate the same id/purpose with `succeeds: {"issue":"<expected-red child title>"}`.
+- Succession is separate from `blocks`/`blockedBy`. Never infer or express artifact succession merely by adding an ordering dependency.
 - Do not include `dogfood-ready`; operators add readiness labels after review.
 - Do not create Linear issues directly, transition Linear, comment on Linear, commit, or push.

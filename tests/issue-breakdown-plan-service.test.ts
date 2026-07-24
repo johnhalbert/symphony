@@ -6,6 +6,8 @@ import {
   IssueBreakdownPlanService,
   issueBreakdownPlanFingerprintsMatch,
   issueBreakdownPlanRequestHash,
+  issueContentFingerprint,
+  issueContentFingerprintForBreakdownPlan,
   latestFreshIssueBreakdownPlan,
   preFinalDispositionIssueBreakdownPlanRequestHash,
 } from "../src/core/IssueBreakdownPlanService.js";
@@ -22,6 +24,39 @@ import {
 
 const PLANNER_FINAL_DISPOSITION = "Planner completed the requested issue breakdown analysis.";
 
+type IssueContractOverrides = NonNullable<
+  Parameters<typeof agentEligibleIssueContract>[0]
+>;
+type IssueContractSuccession = NonNullable<
+  NonNullable<
+    IssueContractOverrides["issueContractRelationships"]
+  >["succession"]
+>;
+
+function proposedIssueContract(
+  parentIdentifier: string,
+  options: {
+    contract?: Omit<IssueContractOverrides, "issueContractRelationships">;
+    dependentTitles?: string[];
+    dependencyTitles?: string[];
+    succession?: IssueContractSuccession;
+  } = {},
+): string {
+  return agentEligibleIssueContract({
+    ...(options.contract ?? {}),
+    issueContractRelationships: {
+      blocks: [
+        parentIdentifier,
+        ...(options.dependentTitles ?? []),
+      ],
+      blockedBy: [...(options.dependencyTitles ?? [])],
+      ...(options.succession === undefined
+        ? {}
+        : { succession: options.succession }),
+    },
+  });
+}
+
 describe("IssueBreakdownPlanService", () => {
   let root: string;
 
@@ -31,6 +66,19 @@ describe("IssueBreakdownPlanService", () => {
 
   afterEach(async () => {
     await rm(root, { recursive: true, force: true });
+  });
+
+  it("includes outgoing ordering edges in issue content fingerprints without depending on edge order", () => {
+    const candidate = issue();
+    const left = { id: "issue-2", identifier: "TEST-2", state: "Todo" };
+    const right = { id: "issue-3", identifier: "TEST-3", state: "In Progress" };
+
+    expect(issueContentFingerprint({ ...candidate, blocks: [left, right] })).toBe(
+      issueContentFingerprint({ ...candidate, blocks: [right, left] }),
+    );
+    expect(issueContentFingerprint({ ...candidate, blocks: [left] })).not.toBe(
+      issueContentFingerprint({ ...candidate, blocks: [] }),
+    );
   });
 
   it("validates, persists, and replays structured issue breakdown plans", async () => {
@@ -47,7 +95,7 @@ describe("IssueBreakdownPlanService", () => {
       proposedIssues: [
         {
           title: "Build planning schema",
-          description: agentEligibleIssueContract(),
+          description: proposedIssueContract(candidate.identifier),
           acceptanceCriteria: ["Plans persist proposed issues."],
           dependencies: [],
           labels: ["planning"],
@@ -103,7 +151,7 @@ describe("IssueBreakdownPlanService", () => {
       proposedIssues: [
         {
           title: "Build planning schema",
-          description: agentEligibleIssueContract(),
+          description: proposedIssueContract(candidate.identifier),
           acceptanceCriteria: ["Plans persist proposed issues."],
           dependencies: [],
           labels: ["planning"],
@@ -153,7 +201,7 @@ describe("IssueBreakdownPlanService", () => {
       proposedIssues: [
         {
           title: "Build planning schema",
-          description: agentEligibleIssueContract(),
+          description: proposedIssueContract(candidate.identifier),
           acceptanceCriteria: ["Plans persist proposed issues."],
           dependencies: [],
           labels: ["planning"],
@@ -196,7 +244,7 @@ describe("IssueBreakdownPlanService", () => {
       proposedIssues: [
         {
           title: "Build planning schema",
-          description: agentEligibleIssueContract(),
+          description: proposedIssueContract(candidate.identifier),
           acceptanceCriteria: ["Plans persist proposed issues."],
           dependencies: [],
           labels: ["planning"],
@@ -244,9 +292,11 @@ describe("IssueBreakdownPlanService", () => {
       proposedIssues: [
         {
           title: "Task",
-          description: agentEligibleIssueContract({
-            touchedSurfaces: ["- [X] Docs only", "- docs/dogfood-runbook.md"],
-            readyForDogfoodReady: "yes",
+          description: proposedIssueContract(candidate.identifier, {
+            contract: {
+              touchedSurfaces: ["- [X] Docs only", "- docs/dogfood-runbook.md"],
+              readyForDogfoodReady: "yes",
+            },
           }),
           acceptanceCriteria: ["Done"],
           dependencies: [],
@@ -311,7 +361,7 @@ describe("IssueBreakdownPlanService", () => {
       proposedIssues: [
         {
           title: "Task",
-          description: agentEligibleIssueContract(),
+          description: proposedIssueContract(candidate.identifier),
           acceptanceCriteria: ["Done"],
           dependencies: [],
           labels: [],
@@ -382,7 +432,7 @@ describe("IssueBreakdownPlanService", () => {
         finalDisposition: PLANNER_FINAL_DISPOSITION,
         summary: "Split original work.",
         proposedIssues: [
-          { title: "Build original child", description: agentEligibleIssueContract(), acceptanceCriteria: ["Done"], dependencies: [], labels: [] },
+          { title: "Build original child", description: proposedIssueContract(original.identifier), acceptanceCriteria: ["Done"], dependencies: [], labels: [] },
         ],
         idempotencyKey: "plan-a",
       },
@@ -395,7 +445,7 @@ describe("IssueBreakdownPlanService", () => {
         finalDisposition: PLANNER_FINAL_DISPOSITION,
         summary: "Split changed work.",
         proposedIssues: [
-          { title: "Build changed child", description: agentEligibleIssueContract(), acceptanceCriteria: ["Done"], dependencies: [], labels: [] },
+          { title: "Build changed child", description: proposedIssueContract(changed.identifier), acceptanceCriteria: ["Done"], dependencies: [], labels: [] },
         ],
         idempotencyKey: "plan-b",
       },
@@ -405,6 +455,29 @@ describe("IssueBreakdownPlanService", () => {
 
     expect(lifecycle?.lastIssueBreakdownPlanId).toBe(planB.plan.id);
     expect(issueBreakdownPlanFingerprintsMatch(planA.plan, original, config)).toBe(true);
+    const applicationTarget = {
+      ...original,
+      description: `${original.description ?? ""}\n\nService-owned relationship contract update.`,
+    };
+    const targetBoundPlan = {
+      ...planA.plan,
+      applicationTargetIssueContentFingerprint:
+        issueContentFingerprintForBreakdownPlan(applicationTarget, planA.plan),
+    };
+    expect(
+      issueBreakdownPlanFingerprintsMatch(
+        targetBoundPlan,
+        applicationTarget,
+        config,
+      ),
+    ).toBe(true);
+    expect(
+      issueBreakdownPlanFingerprintsMatch(
+        targetBoundPlan,
+        { ...applicationTarget, title: "Unrelated external drift" },
+        config,
+      ),
+    ).toBe(false);
     expect(latestFreshIssueBreakdownPlan(lifecycle, original, config)).toBeNull();
     expect(latestFreshIssueBreakdownPlan(lifecycle, changed, config)?.id).toBe(planB.plan.id);
 
@@ -442,7 +515,7 @@ describe("IssueBreakdownPlanService", () => {
           proposedIssues: [
             {
               title: "Task",
-              description: agentEligibleIssueContract(),
+              description: proposedIssueContract(candidate.identifier),
               acceptanceCriteria: ["Done"],
               dependencies: [],
               labels: ["dogfood-ready"],
@@ -576,10 +649,12 @@ describe("IssueBreakdownPlanService", () => {
           proposedIssues: [
             {
               title: "Task",
-              description: agentEligibleIssueContract({
-                issueContractRequirements: [{ id: "REQ-001", requirement: "Complete the documented work." }],
-                contractChecklist: ["- Happy path: covered.", "- Negative/error path: covered."],
-                validationRequirements: ["- Run tests."],
+              description: proposedIssueContract(candidate.identifier, {
+                contract: {
+                  issueContractRequirements: [{ id: "REQ-001", requirement: "Complete the documented work." }],
+                  contractChecklist: ["- Happy path: covered.", "- Negative/error path: covered."],
+                  validationRequirements: ["- Run tests."],
+                },
               }),
               acceptanceCriteria: ["Done"],
               dependencies: [],
@@ -606,6 +681,72 @@ describe("IssueBreakdownPlanService", () => {
     await expect(lifecycleStore.get(candidate.id)).resolves.toBeNull();
   });
 
+  it("accepts reciprocal succession when the target depends on its expected-red source", async () => {
+    const config = testConfig(root);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    const candidate = issue();
+    const service = new IssueBreakdownPlanService({ config, lifecycleStore });
+
+    await expect(
+      service.submit_issue_breakdown_plan(
+        {
+          runId: "run-plan-succession-edge",
+          issueId: candidate.id,
+          finalDisposition: PLANNER_FINAL_DISPOSITION,
+          summary: "Pair expected-red tests with their implementation.",
+          proposedIssues: [
+            {
+              title: "Land expected-red tests",
+              description: proposedIssueContract(candidate.identifier, {
+                contract: {
+                  issueContractDelivery: {
+                    mode: "accepted_artifact",
+                    artifact: "expected_red_tests",
+                  },
+                },
+                dependentTitles: ["Implement expected behavior"],
+                succession: {
+                  id: "expected-red-to-implementation",
+                  purpose: "expected_red_implementation",
+                  successor: { issue: "Implement expected behavior" },
+                },
+              }),
+              acceptanceCriteria: ["Expected-red tests are reviewed."],
+              dependencies: [],
+              labels: [],
+            },
+            {
+              title: "Implement expected behavior",
+              description: proposedIssueContract(candidate.identifier, {
+                dependencyTitles: ["Land expected-red tests"],
+                succession: {
+                  id: "expected-red-to-implementation",
+                  purpose: "expected_red_implementation",
+                  succeeds: { issue: "Land expected-red tests" },
+                },
+              }),
+              acceptanceCriteria: ["The inherited tests pass."],
+              dependencies: ["Land expected-red tests"],
+              labels: [],
+            },
+          ],
+          idempotencyKey: "plan-succession-edge",
+        },
+        {
+          issue: candidate,
+          activeRunId: "run-plan-succession-edge",
+          role: "worker",
+          phase: "issue_breakdown",
+        },
+      ),
+    ).resolves.toMatchObject({ accepted: true, replayed: false });
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      issueBreakdownPlans: [expect.objectContaining({ applicationStatus: "not_requested" })],
+    });
+  });
+
   it("rejects configured worker dispatch labels before persistence", async () => {
     const config = testConfig(root);
     config.agent.requireLabels = ["agent-ready"];
@@ -623,7 +764,7 @@ describe("IssueBreakdownPlanService", () => {
           proposedIssues: [
             {
               title: "Task",
-              description: agentEligibleIssueContract(),
+              description: proposedIssueContract(candidate.identifier),
               acceptanceCriteria: ["Done"],
               dependencies: [],
               labels: ["Agent-Ready"],
@@ -654,9 +795,11 @@ describe("IssueBreakdownPlanService", () => {
           proposedIssues: [
             {
               title: "Task",
-              description: agentEligibleIssueContract({
-                touchedSurfaces: ["- [X] Docs only", "- docs/dogfood-runbook.md"],
-                readyForDogfoodReady: "yes",
+              description: proposedIssueContract(candidate.identifier, {
+                contract: {
+                  touchedSurfaces: ["- [X] Docs only", "- docs/dogfood-runbook.md"],
+                  readyForDogfoodReady: "yes",
+                },
               }),
               acceptanceCriteria: ["Done"],
               dependencies: [],
@@ -679,10 +822,12 @@ describe("IssueBreakdownPlanService", () => {
         proposedIssues: [
           {
             title: "Task",
-            description: agentEligibleIssueContract({
-              touchedSurfaces: ["- [X] Docs only", "- docs/dogfood-runbook.md"],
-              readyForDogfoodReady: "no",
-              remainingBlocker: "Manual operator implementation required for protected surface.",
+            description: proposedIssueContract(candidate.identifier, {
+              contract: {
+                touchedSurfaces: ["- [X] Docs only", "- docs/dogfood-runbook.md"],
+                readyForDogfoodReady: "no",
+                remainingBlocker: "Manual operator implementation required for protected surface.",
+              },
             }),
             acceptanceCriteria: ["Done"],
             dependencies: [],
@@ -714,9 +859,11 @@ describe("IssueBreakdownPlanService", () => {
         proposedIssues: [
           {
             title: "Task",
-            description: agentEligibleIssueContract({
-              touchedSurfaces: ["- [X] API/projection"],
-              outOfScope: ["- Do not modify docs/dogfood-runbook.md in this slice."],
+            description: proposedIssueContract(candidate.identifier, {
+              contract: {
+                touchedSurfaces: ["- [X] API/projection"],
+                outOfScope: ["- Do not modify docs/dogfood-runbook.md in this slice."],
+              },
             }),
             acceptanceCriteria: ["Done"],
             dependencies: [],
@@ -752,10 +899,12 @@ describe("IssueBreakdownPlanService", () => {
             proposedIssues: [
               {
                 title: "Task",
-                description: agentEligibleIssueContract({
-                  touchedSurfaces: ["- [X] Docs only", "- docs/dogfood-runbook.md"],
-                  readyForDogfoodReady: "no",
-                  remainingBlocker,
+                description: proposedIssueContract(candidate.identifier, {
+                  contract: {
+                    touchedSurfaces: ["- [X] Docs only", "- docs/dogfood-runbook.md"],
+                    readyForDogfoodReady: "no",
+                    remainingBlocker,
+                  },
                 }),
                 acceptanceCriteria: ["Done"],
                 dependencies: [],
@@ -793,11 +942,13 @@ describe("IssueBreakdownPlanService", () => {
           proposedIssues: [
             {
               title: "Task",
-              description: agentEligibleIssueContract({
-                touchedSurfaces: ["- [X] Docs only", "- docs/dogfood-runbook.md"],
-                readyForDogfoodReady: "no",
-                remainingBlocker:
-                  'If any protected path is listed above, keep this issue manual-only with "Ready for `dogfood-ready`: no" and explain the operator blocker here.',
+              description: proposedIssueContract(candidate.identifier, {
+                contract: {
+                  touchedSurfaces: ["- [X] Docs only", "- docs/dogfood-runbook.md"],
+                  readyForDogfoodReady: "no",
+                  remainingBlocker:
+                    'If any protected path is listed above, keep this issue manual-only with "Ready for `dogfood-ready`: no" and explain the operator blocker here.',
+                },
               }),
               acceptanceCriteria: ["Done"],
               dependencies: [],

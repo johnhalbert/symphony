@@ -1174,7 +1174,7 @@ describe("FileWritebackOutboxStore", () => {
       payload: {
         parentIssueId: "issue-1",
         title: "Child issue",
-        description: agentEligibleIssueContract(),
+        description: plannedChildIssueContract(),
         acceptanceCriteria: ["Done"],
         requestedLabels: ["planning"],
         dependencies: [],
@@ -1210,7 +1210,7 @@ describe("FileWritebackOutboxStore", () => {
       payload: {
         parentIssueId: "issue-1",
         title: "Child issue",
-        description: agentEligibleIssueContract(),
+        description: plannedChildIssueContract(),
         acceptanceCriteria: ["Done"],
         requestedLabels: ["planning"],
         dependencies: [],
@@ -1802,7 +1802,7 @@ describe("SqliteWritebackOutboxStore", () => {
         payload: {
           parentIssueId: "issue-1",
           title: "Recovered child issue",
-          description: agentEligibleIssueContract(),
+          description: plannedChildIssueContract(),
           acceptanceCriteria: ["Done"],
           requestedLabels: ["planning"],
           dependencies: [],
@@ -2076,14 +2076,18 @@ async function submitTwoChildPlan(
       proposedIssues: [
         {
           title: "Build child",
-          description: agentEligibleIssueContract(),
+          description: plannedChildIssueContract({
+            dependentTitles: ["Build dependent child"],
+          }),
           acceptanceCriteria: ["Done"],
           dependencies: [],
           labels: ["planning"],
         },
         {
           title: "Build dependent child",
-          description: agentEligibleIssueContract(),
+          description: plannedChildIssueContract({
+            dependencyTitles: ["Build child"],
+          }),
           acceptanceCriteria: ["Done"],
           dependencies: ["Build child"],
           labels: ["planning"],
@@ -2106,6 +2110,24 @@ function createdIssueRefForOperation(operation: IssueCreateWriteback): IssueBrea
     identifier: `TEST-${childNumber + 1}`,
     url: `https://linear.test/TEST-${childNumber + 1}`,
   };
+}
+
+function plannedChildIssueContract(
+  options: {
+    parentIdentifier?: string;
+    dependentTitles?: string[];
+    dependencyTitles?: string[];
+  } = {},
+): string {
+  return agentEligibleIssueContract({
+    issueContractRelationships: {
+      blocks: [
+        options.parentIdentifier ?? "ENG-1",
+        ...(options.dependentTitles ?? []),
+      ],
+      blockedBy: [...(options.dependencyTitles ?? [])],
+    },
+  });
 }
 
 function lifecycleWithIssueBreakdownPlan(overrides: {
@@ -2135,7 +2157,7 @@ function lifecycleWithIssueBreakdownPlan(overrides: {
         proposedIssues: [
           {
             title: "Child issue",
-            description: agentEligibleIssueContract(),
+            description: plannedChildIssueContract(),
             acceptanceCriteria: ["Done"],
             dependencies: [],
             labels: ["planning"],
@@ -2174,7 +2196,7 @@ function issueCreateOperation(idempotencyKey: string) {
     payload: {
       parentIssueId: "issue-1",
       title: "Child issue",
-      description: agentEligibleIssueContract(),
+      description: plannedChildIssueContract(),
       acceptanceCriteria: ["Done"],
       requestedLabels: ["planning"],
       dependencies: [],

@@ -22,9 +22,13 @@ import type { ServiceConfig } from "../src/core/config/Config.js";
 import { SymphonyError } from "../src/core/errors.js";
 import type { AgentEvent, AgentHarness, AgentRunContext } from "../src/core/harness/AgentHarness.js";
 import { FakeHarness } from "../src/core/harness/FakeHarness.js";
+import { parseIssueContract } from "../src/core/IssueContractLint.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
-import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
+import {
+  FileIssueLifecycleStore,
+  type IssueContractSnapshot,
+} from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore, type RunRecord } from "../src/core/persistence/RunTranscriptStore.js";
 import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
 import type { TrackerCommentInput, TrackerTransitionInput, TrackerWriteResult, TrackerWriter } from "../src/core/tracker/TrackerWriter.js";
@@ -32,7 +36,33 @@ import type { Issue } from "../src/core/types.js";
 import { FileWritebackOutboxStore, WritebackProcessor } from "../src/core/writeback/WritebackOutbox.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
-import { issue, testConfig } from "./helpers.js";
+import { agentEligibleIssueContract, issue, testConfig } from "./helpers.js";
+
+const EMPTY_RELATIONSHIP_ISSUE_CONTRACT = agentEligibleIssueContract({
+  issueContractRelationships: {
+    blocks: [],
+    blockedBy: [],
+  },
+});
+
+function contractSnapshot(description: string): IssueContractSnapshot {
+  const parsed = parseIssueContract(description);
+  if (!parsed.valid) {
+    throw new Error(`Test Issue Contract is invalid: ${parsed.errors.join("; ")}`);
+  }
+  return {
+    schemaVersion: parsed.contract.schemaVersion,
+    contractVersion: parsed.contract.contractVersion,
+    fingerprint: parsed.fingerprint,
+    delivery: {
+      mode: parsed.contract.delivery.mode,
+      artifact:
+        parsed.contract.delivery.mode === "accepted_artifact"
+          ? parsed.contract.delivery.artifact
+          : null,
+    },
+  };
+}
 
 function issuesInStates(issues: Issue[], states: string[]): Issue[] {
   const wanted = new Set(states.map((state) => state.toLowerCase()));
@@ -527,7 +557,12 @@ describe("approval status API", () => {
     config.github.token = "github-token";
     config.github.operatorApproval!.pollIntervalMs = 5;
     config.workspace.source.baseRef = "main";
-    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "Todo",
+      labels: ["dogfood-ready"],
+      branchName: "symphony/TEST-1",
+      description: EMPTY_RELATIONSHIP_ISSUE_CONTRACT,
+    });
     let currentState = "Todo";
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
@@ -665,7 +700,12 @@ describe("approval status API", () => {
     config.github.token = "github-token";
     config.github.operatorApproval!.pollIntervalMs = 5;
     config.workspace.source.baseRef = "main";
-    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "Todo",
+      labels: ["dogfood-ready"],
+      branchName: "symphony/TEST-1",
+      description: EMPTY_RELATIONSHIP_ISSUE_CONTRACT,
+    });
     let currentState = "Todo";
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
@@ -827,7 +867,12 @@ describe("approval status API", () => {
     config.github.token = "github-token";
     config.github.operatorApproval!.pollIntervalMs = 5;
     config.workspace.source.baseRef = "main";
-    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "Todo",
+      labels: ["dogfood-ready"],
+      branchName: "symphony/TEST-1",
+      description: EMPTY_RELATIONSHIP_ISSUE_CONTRACT,
+    });
     let currentState = "Todo";
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
@@ -963,7 +1008,12 @@ describe("approval status API", () => {
     const workspacePath = path.join(root, "workspace");
     const reportSummary = "Implemented the requested change.";
     const pullRequestUrl = "https://github.com/acme/symphony/pull/42";
-    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "Todo",
+      labels: ["dogfood-ready"],
+      branchName: "symphony/TEST-1",
+      description: EMPTY_RELATIONSHIP_ISSUE_CONTRACT,
+    });
     let currentState = "Todo";
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
@@ -1070,6 +1120,7 @@ describe("approval status API", () => {
           changedFiles: ["src/core/orchestrator/Orchestrator.ts"],
           branchName: candidate.branchName,
           pullRequest: null,
+          contractSnapshot: contractSnapshot(candidate.description!),
           risks: [],
           acceptedAt: "2026-01-01T00:00:00.000Z",
           writebackOperationKeys: [],
@@ -1883,6 +1934,11 @@ class LiveCompletionReportHarness implements AgentHarness {
       runStore: this.runStore,
       pullRequestPublisher: this.publisher,
       operatorApproval: this.operatorApproval,
+      resolveIssuesByIds: async (ids) =>
+        ids.includes(ctx.issue.id) ||
+        ids.includes(ctx.issue.identifier)
+          ? [ctx.issue]
+          : [],
     }).submitCompletionReport(
       {
         runId: "live-report-run",

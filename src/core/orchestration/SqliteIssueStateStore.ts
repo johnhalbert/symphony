@@ -930,6 +930,7 @@ function normalizeIssueCurrentFields(
   return {
     ...record,
     version: 1,
+    blocks: Array.isArray(record.blocks) ? record.blocks : [],
     lastPlanningFailureAt:
       typeof record.lastPlanningFailureAt === "string"
         ? record.lastPlanningFailureAt
@@ -964,6 +965,8 @@ function normalizeIssueCurrentFields(
     latestCompletionReport: record.latestCompletionReport ?? null,
     latestApprovalPassVerdict: record.latestApprovalPassVerdict ?? null,
     acceptedArtifact: record.acceptedArtifact ?? null,
+    acceptedArtifactValidationFailure:
+      record.acceptedArtifactValidationFailure ?? null,
     workspaceSeed: record.workspaceSeed ?? null,
     mergeGate: record.mergeGate ?? null,
     mergeConflict: record.mergeConflict ?? null,

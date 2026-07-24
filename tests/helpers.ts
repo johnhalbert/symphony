@@ -65,6 +65,21 @@ export function agentEligibleIssueContract(
     issueContractDelivery?:
       | { mode: "merge" }
       | { mode: "accepted_artifact"; artifact: "expected_red_tests" };
+    issueContractRelationships?: {
+      blocks: string[];
+      blockedBy: string[];
+      succession?:
+        | {
+            id: string;
+            purpose: "expected_red_implementation";
+            successor: { issue: string };
+          }
+        | {
+            id: string;
+            purpose: "expected_red_implementation";
+            succeeds: { issue: string };
+          };
+    };
     touchedSurfaces?: string[];
     acceptanceCriteria?: string[];
     contractChecklist?: string[];
@@ -79,7 +94,7 @@ export function agentEligibleIssueContract(
     includeIssueContract = true,
     issueContractJson,
     issueContractFenceLanguage = "json",
-    issueContractSchemaVersion = 1,
+    issueContractSchemaVersion = 2,
     issueContractContractVersion = "2026-06-04.1",
     issueContractRequirements = [
       {
@@ -89,6 +104,7 @@ export function agentEligibleIssueContract(
       },
     ],
     issueContractDelivery,
+    issueContractRelationships,
     touchedSurfaces = ["- [X] Docs only"],
     acceptanceCriteria = ["- Done."],
     contractChecklist = [
@@ -114,6 +130,23 @@ export function agentEligibleIssueContract(
         contractVersion: issueContractContractVersion,
         requirements: issueContractRequirements,
         ...(issueContractDelivery === undefined ? {} : { delivery: issueContractDelivery }),
+        ...(issueContractSchemaVersion < 2
+          ? {}
+          : {
+              relationships:
+                issueContractRelationships ??
+                (issueContractDelivery?.mode === "accepted_artifact"
+                  ? {
+                      blocks: ["TEST-2"],
+                      blockedBy: [],
+                      succession: {
+                        id: "test-expected-red-implementation",
+                        purpose: "expected_red_implementation" as const,
+                        successor: { issue: "TEST-2" },
+                      },
+                    }
+                  : { blocks: [], blockedBy: [] }),
+            }),
       },
       null,
       2,

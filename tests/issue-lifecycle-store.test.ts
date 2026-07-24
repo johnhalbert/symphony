@@ -110,6 +110,7 @@ describe("FileIssueLifecycleStore", () => {
     const raw = JSON.parse(await nodeFs.readFile(recordPath, "utf8")) as Record<string, unknown>;
     delete raw.reviewVerdictSubmissions;
     delete raw.acceptedArtifact;
+    delete raw.acceptedArtifactValidationFailure;
     delete raw.workspaceSeed;
     await writeFile(recordPath, `${JSON.stringify(raw, null, 2)}\n`, "utf8");
 
@@ -118,8 +119,132 @@ describe("FileIssueLifecycleStore", () => {
     await expect(reloaded.get("issue-1")).resolves.toMatchObject({
       reviewVerdictSubmissions: [],
       acceptedArtifact: null,
+      acceptedArtifactValidationFailure: null,
       workspaceSeed: null,
     });
+  });
+
+  it("persists accepted-artifact validation failure accounting", async () => {
+    const store = new FileIssueLifecycleStore(root);
+    await store.ensureIssue(issue(), {
+      acceptedArtifactValidationFailure: {
+        version: 1,
+        count: 2,
+        limit: 3,
+        category: "contract_or_head_drift",
+        reason: "contract_or_review_drift",
+        signature: "failure-signature",
+        message: "Current Issue Contract changed after review",
+        firstFailedAt: "2026-07-22T10:00:00.000Z",
+        lastFailedAt: "2026-07-22T11:00:00.000Z",
+        completionReportId: "report-2",
+        reviewVerdictId: "verdict-2",
+        liveContractFingerprint: "live-contract",
+        reviewedContractFingerprint: "reviewed-contract",
+        sourceHeadSha: "2".repeat(40),
+      },
+    });
+
+    const found = await new FileIssueLifecycleStore(root).get("TEST-1");
+
+    expect(found?.acceptedArtifactValidationFailure).toEqual({
+      version: 1,
+      count: 2,
+      limit: 3,
+      category: "contract_or_head_drift",
+      reason: "contract_or_review_drift",
+      signature: "failure-signature",
+      message: "Current Issue Contract changed after review",
+      firstFailedAt: "2026-07-22T10:00:00.000Z",
+      lastFailedAt: "2026-07-22T11:00:00.000Z",
+      completionReportId: "report-2",
+      reviewVerdictId: "verdict-2",
+      liveContractFingerprint: "live-contract",
+      reviewedContractFingerprint: "reviewed-contract",
+      sourceHeadSha: "2".repeat(40),
+    });
+    expect(found?.handoff.memo.entries).toContain(
+      "Accepted-artifact validation failures: 2/3; latest contract_or_review_drift: Current Issue Contract changed after review",
+    );
+  });
+
+  it("persists the generalized relationship graph separately from a bilateral succession record", async () => {
+    const store = new FileIssueLifecycleStore(root);
+    await store.ensureIssue(issue(), {
+      relationshipState: {
+        version: 1,
+        issueId: "issue-1",
+        issueIdentifier: "TEST-1",
+        contractSchemaVersion: 2,
+        contractFingerprint: "source-contract",
+        contractBlocks: ["TEST-2", "TEST-9"],
+        contractBlockedBy: [],
+        trackerBlocks: [
+          { id: "issue-2", identifier: "TEST-2", state: "Todo" },
+          { id: "issue-9", identifier: "TEST-9", state: "Todo" },
+        ],
+        trackerBlockedBy: [],
+        edges: [
+          {
+            type: "blocks",
+            sourceIssueId: "issue-1",
+            sourceIssueIdentifier: "TEST-1",
+            targetIssueId: "issue-2",
+            targetIssueIdentifier: "TEST-2",
+            declared: true,
+            observed: true,
+          },
+          {
+            type: "blocks",
+            sourceIssueId: "issue-1",
+            sourceIssueIdentifier: "TEST-1",
+            targetIssueId: "issue-9",
+            targetIssueIdentifier: "TEST-9",
+            declared: true,
+            observed: true,
+          },
+        ],
+        status: "valid",
+        validationErrors: [],
+        observedAt: "2026-07-23T10:00:00.000Z",
+      },
+      succession: {
+        version: 1,
+        id: "tdd-test-1",
+        purpose: "expected_red_implementation",
+        role: "succeeded",
+        succeededIssue: {
+          id: "issue-1",
+          identifier: "TEST-1",
+          contractFingerprint: "source-contract",
+        },
+        successorIssue: {
+          id: "issue-2",
+          identifier: "TEST-2",
+          contractFingerprint: "target-contract",
+        },
+        linearBlockVerified: true,
+        status: "agreed",
+        artifactId: null,
+        workspaceSeedId: null,
+        mergeCommitSha: null,
+        validationErrors: [],
+        declaredAt: "2026-07-23T10:00:00.000Z",
+        agreedAt: "2026-07-23T10:00:00.000Z",
+        updatedAt: "2026-07-23T10:00:00.000Z",
+      },
+    });
+
+    const found = await new FileIssueLifecycleStore(root).get("TEST-1");
+
+    expect(found?.relationshipState?.edges).toHaveLength(2);
+    expect(found?.relationshipState?.contractBlocks).toEqual(["TEST-2", "TEST-9"]);
+    expect(found?.succession).toMatchObject({
+      id: "tdd-test-1",
+      succeededIssue: { identifier: "TEST-1" },
+      successorIssue: { identifier: "TEST-2" },
+    });
+    expect(found?.succession?.successorIssue.identifier).not.toBe("TEST-9");
   });
 
   it("persists accepted-artifact contracts, evidence, disposition, and workspace seed state", async () => {
@@ -315,6 +440,7 @@ describe("FileIssueLifecycleStore", () => {
         preparedHeadSha: "prepared-head-sha",
         targetBranch: "symphony/TEST-2",
         conflictedFiles: [],
+        absorbedPaths: ["tests/implementation.test.ts"],
         plannedAt: "2026-07-14T10:09:00.000Z",
         preparedAt: "2026-07-14T10:10:00.000Z",
         failureReason: null,
@@ -352,6 +478,7 @@ describe("FileIssueLifecycleStore", () => {
       id: "workspace-seed-1",
       status: "prepared",
       preparedHeadSha: "prepared-head-sha",
+      absorbedPaths: ["tests/implementation.test.ts"],
     });
   });
 
@@ -666,6 +793,36 @@ describe("FileIssueLifecycleStore", () => {
       version: 1,
       kind: "expected_red_tests",
       status: "merged",
+    };
+    await writeFile(recordPath, `${JSON.stringify(raw, null, 2)}\n`, "utf8");
+
+    await expect(store.get("issue-1")).rejects.toMatchObject({
+      code: "lifecycle_store_corrupt",
+    });
+  });
+
+  it("rejects invalid accepted-artifact validation failure state", async () => {
+    const store = new FileIssueLifecycleStore(root);
+    await store.ensureIssue(issue());
+    const recordPath = path.join(root, "issue-lifecycle", "issue-1.json");
+    const raw = JSON.parse(
+      await nodeFs.readFile(recordPath, "utf8"),
+    ) as Record<string, unknown>;
+    raw.acceptedArtifactValidationFailure = {
+      version: 1,
+      count: 0,
+      limit: 3,
+      category: "contract_or_head_drift",
+      reason: "contract_or_review_drift",
+      signature: "failure-signature",
+      message: "invalid count",
+      firstFailedAt: "2026-07-22T10:00:00.000Z",
+      lastFailedAt: "2026-07-22T10:00:00.000Z",
+      completionReportId: null,
+      reviewVerdictId: null,
+      liveContractFingerprint: "live-contract",
+      reviewedContractFingerprint: null,
+      sourceHeadSha: null,
     };
     await writeFile(recordPath, `${JSON.stringify(raw, null, 2)}\n`, "utf8");
 

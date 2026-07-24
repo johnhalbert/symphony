@@ -3,7 +3,7 @@ import path from "node:path";
 import type { ServiceConfig } from "../config/Config.js";
 import type { IssueBaseRefObservation } from "../BaseRefVerification.js";
 import { SymphonyError, errorMessage } from "../errors.js";
-import type { ArtifactFileManifestEntry, Issue } from "../types.js";
+import type { ArtifactFileManifestEntry, Issue, IssueBlockerRef } from "../types.js";
 import { mapWithFileReadConcurrency } from "./FileReadConcurrency.js";
 import { ProjectionRevisionNotifier, type ProjectionChangeListener, type ProjectionChangeUnsubscribe } from "./ProjectionRevision.js";
 
@@ -90,6 +90,7 @@ export interface IssueBreakdownPlanRecord {
   statusApiPointers: string[];
   issueUpdatedAt: string | null;
   issueContentFingerprint: string;
+  applicationTargetIssueContentFingerprint?: string | null;
   configFingerprint: string;
   cursorMode: string;
   acceptedAt: string;
@@ -137,6 +138,75 @@ export interface IssueContractSnapshot {
     mode: "merge" | "accepted_artifact";
     artifact: "expected_red_tests" | null;
   };
+}
+
+/**
+ * A normalized, issue-local projection of the generalized ordering graph.
+ * This is deliberately independent from TDD succession: an ordering edge does
+ * not select an artifact producer or consumer.
+ */
+export interface IssueRelationshipState {
+  version: 1;
+  issueId: string;
+  issueIdentifier: string;
+  contractSchemaVersion: number | null;
+  contractFingerprint: string | null;
+  contractBlocks: string[];
+  contractBlockedBy: string[];
+  trackerBlocks: IssueBlockerRef[];
+  trackerBlockedBy: IssueBlockerRef[];
+  edges: IssueRelationshipEdgeState[];
+  status: "valid" | "invalid" | "legacy";
+  validationErrors: string[];
+  observedAt: string;
+}
+
+export interface IssueRelationshipEdgeState {
+  type: "blocks";
+  sourceIssueId: string | null;
+  sourceIssueIdentifier: string | null;
+  targetIssueId: string | null;
+  targetIssueIdentifier: string | null;
+  declared: boolean;
+  observed: boolean;
+}
+
+export type IssueSuccessionStatus =
+  | "declared"
+  | "agreed"
+  | "checkpointed"
+  | "seeded"
+  | "verified_green"
+  | "integrated"
+  | "invalid";
+
+export interface IssueSuccessionIssueRef {
+  id: string | null;
+  identifier: string;
+  contractFingerprint: string | null;
+}
+
+/**
+ * Durable bilateral TDD succession agreement. Both issue lifecycle records may
+ * carry the same binding; its identity and endpoints do not come from blocker
+ * traversal.
+ */
+export interface IssueSuccessionRecord {
+  version: 1;
+  id: string;
+  purpose: "expected_red_implementation";
+  role: "succeeded" | "successor";
+  succeededIssue: IssueSuccessionIssueRef;
+  successorIssue: IssueSuccessionIssueRef;
+  linearBlockVerified: boolean;
+  status: IssueSuccessionStatus;
+  artifactId: string | null;
+  workspaceSeedId: string | null;
+  mergeCommitSha: string | null;
+  validationErrors: string[];
+  declaredAt: string;
+  agreedAt: string | null;
+  updatedAt: string;
 }
 
 export interface ExpectedRedArtifactEvidence {
@@ -575,6 +645,7 @@ export interface IssueMergeMetadata {
 export interface IssueAcceptedArtifactRecord extends LifecycleSupersessionFields {
   version: 1;
   id: string;
+  successionId?: string;
   kind: "expected_red_tests";
   status: "checkpointed" | "completed_unmerged";
   sourceIssueId: string;
@@ -599,12 +670,35 @@ export interface IssueAcceptedArtifactRecord extends LifecycleSupersessionFields
   completedAt: string | null;
 }
 
+export type IssueAcceptedArtifactValidationFailureReason =
+  | "contract_or_review_drift"
+  | "pull_request_or_branch_drift"
+  | "source_checkpoint_drift";
+
+export interface IssueAcceptedArtifactValidationFailureState {
+  version: 1;
+  count: number;
+  limit: number;
+  category: "contract_or_head_drift";
+  reason: IssueAcceptedArtifactValidationFailureReason;
+  signature: string;
+  message: string;
+  firstFailedAt: string;
+  lastFailedAt: string;
+  completionReportId: string | null;
+  reviewVerdictId: string | null;
+  liveContractFingerprint: string;
+  reviewedContractFingerprint: string | null;
+  sourceHeadSha: string | null;
+}
+
 export interface IssueWorkspaceSeedRecord {
   version: 1;
   id: string;
   kind: "accepted_artifact";
   status: "planned" | "preparing" | "conflicted" | "prepared" | "invalid";
   artifactId: string;
+  successionId?: string;
   sourceIssueId: string;
   sourceIssueIdentifier: string;
   repositoryFingerprint: string;
@@ -616,6 +710,7 @@ export interface IssueWorkspaceSeedRecord {
   preparedHeadSha: string | null;
   targetBranch: string;
   conflictedFiles: string[];
+  absorbedPaths?: string[];
   plannedAt: string;
   preparedAt: string | null;
   failureReason: string | null;
@@ -913,7 +1008,10 @@ export interface IssueLifecycleRecord {
   mergeConflictResolutionReports: IssueMergeConflictResolutionReportRecord[];
   preservedWorktreeStashes?: IssuePreservedWorktreeStash[];
   acceptedArtifact?: IssueAcceptedArtifactRecord | null;
+  acceptedArtifactValidationFailure?: IssueAcceptedArtifactValidationFailureState | null;
   workspaceSeed?: IssueWorkspaceSeedRecord | null;
+  relationshipState?: IssueRelationshipState | null;
+  succession?: IssueSuccessionRecord | null;
   handoff: IssueHandoffState;
   createdAt: string;
   updatedAt: string;
@@ -956,7 +1054,10 @@ export interface IssueLifecyclePatch {
   mergeConflictResolutionReports?: IssueMergeConflictResolutionReportRecord[];
   preservedWorktreeStashes?: IssuePreservedWorktreeStash[];
   acceptedArtifact?: IssueAcceptedArtifactRecord | null;
+  acceptedArtifactValidationFailure?: IssueAcceptedArtifactValidationFailureState | null;
   workspaceSeed?: IssueWorkspaceSeedRecord | null;
+  relationshipState?: IssueRelationshipState | null;
+  succession?: IssueSuccessionRecord | null;
   handoff?: IssueHandoffState;
 }
 
@@ -1053,10 +1154,25 @@ export class FileIssueLifecycleStore {
         "acceptedArtifact",
         existing?.acceptedArtifact ?? null,
       ),
+      acceptedArtifactValidationFailure: patchValue(
+        patch,
+        "acceptedArtifactValidationFailure",
+        existing?.acceptedArtifactValidationFailure ?? null,
+      ),
       workspaceSeed: patchValue(
         patch,
         "workspaceSeed",
         existing?.workspaceSeed ?? null,
+      ),
+      relationshipState: patchValue(
+        patch,
+        "relationshipState",
+        existing?.relationshipState ?? null,
+      ),
+      succession: patchValue(
+        patch,
+        "succession",
+        existing?.succession ?? null,
       ),
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
@@ -1223,6 +1339,11 @@ function buildLaneMemo(
       ? []
       : [
           `Latest completion report rejection ${lastCompletionReportRejection.id} (${lastCompletionReportRejection.runId}): ${clip(lastCompletionReportRejection.reason)}`,
+        ]),
+    ...(record.acceptedArtifactValidationFailure == null
+      ? []
+      : [
+          `Accepted-artifact validation failures: ${record.acceptedArtifactValidationFailure.count}/${record.acceptedArtifactValidationFailure.limit}; latest ${record.acceptedArtifactValidationFailure.reason}: ${clip(record.acceptedArtifactValidationFailure.message)}`,
         ]),
     lastReviewerOutput
       ? `Latest reviewer output ${lastReviewerOutput.verdictId} (${lastReviewerOutput.runId}): ${lastReviewerOutput.verdict}.`
@@ -1594,7 +1715,16 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
       filePath,
     ),
     acceptedArtifact: normalizeAcceptedArtifact(value.acceptedArtifact, filePath),
+    acceptedArtifactValidationFailure: normalizeAcceptedArtifactValidationFailure(
+      value.acceptedArtifactValidationFailure,
+      filePath,
+    ),
     workspaceSeed: normalizeWorkspaceSeed(value.workspaceSeed, filePath),
+    relationshipState: normalizeIssueRelationshipState(
+      value.relationshipState,
+      filePath,
+    ),
+    succession: normalizeIssueSuccessionRecord(value.succession, filePath),
     createdAt: requiredString(value.createdAt, filePath, "createdAt"),
     updatedAt: requiredString(value.updatedAt, filePath, "updatedAt"),
   };
@@ -1802,6 +1932,15 @@ function normalizeIssueBreakdownPlan(value: unknown, filePath: string, index: nu
             filePath,
             `issueBreakdownPlans[${index}].issueContentFingerprint`,
           ),
+    ...(value.applicationTargetIssueContentFingerprint === undefined
+      ? {}
+      : {
+          applicationTargetIssueContentFingerprint: nullableString(
+            value.applicationTargetIssueContentFingerprint,
+            filePath,
+            `issueBreakdownPlans[${index}].applicationTargetIssueContentFingerprint`,
+          ),
+        }),
     configFingerprint: requiredString(value.configFingerprint, filePath, `issueBreakdownPlans[${index}].configFingerprint`),
     cursorMode: requiredString(value.cursorMode, filePath, `issueBreakdownPlans[${index}].cursorMode`),
     acceptedAt: requiredString(value.acceptedAt, filePath, `issueBreakdownPlans[${index}].acceptedAt`),
@@ -3322,6 +3461,15 @@ function normalizeAcceptedArtifact(value: unknown, filePath: string): IssueAccep
   return {
     version: 1,
     id: requiredString(value.id, filePath, "acceptedArtifact.id"),
+    ...(value.successionId === undefined
+      ? {}
+      : {
+          successionId: requiredString(
+            value.successionId,
+            filePath,
+            "acceptedArtifact.successionId",
+          ),
+        }),
     kind: "expected_red_tests",
     status: value.status,
     sourceIssueId: requiredString(value.sourceIssueId, filePath, "acceptedArtifact.sourceIssueId"),
@@ -3380,6 +3528,90 @@ function normalizeAcceptedArtifact(value: unknown, filePath: string): IssueAccep
   };
 }
 
+function normalizeAcceptedArtifactValidationFailure(
+  value: unknown,
+  filePath: string,
+): IssueAcceptedArtifactValidationFailureState | null {
+  if (value === undefined || value === null) return null;
+  if (!isRecord(value)) {
+    throw corruptLifecycle(filePath, "acceptedArtifactValidationFailure is invalid");
+  }
+  if (value.version !== 1) {
+    throw corruptLifecycle(filePath, "acceptedArtifactValidationFailure.version is invalid");
+  }
+  if (value.category !== "contract_or_head_drift") {
+    throw corruptLifecycle(filePath, "acceptedArtifactValidationFailure.category is invalid");
+  }
+  const reason = value.reason;
+  if (
+    reason !== "contract_or_review_drift" &&
+    reason !== "pull_request_or_branch_drift" &&
+    reason !== "source_checkpoint_drift"
+  ) {
+    throw corruptLifecycle(filePath, "acceptedArtifactValidationFailure.reason is invalid");
+  }
+  return {
+    version: 1,
+    count: positiveInteger(
+      value.count,
+      filePath,
+      "acceptedArtifactValidationFailure.count",
+    ),
+    limit: positiveInteger(
+      value.limit,
+      filePath,
+      "acceptedArtifactValidationFailure.limit",
+    ),
+    category: "contract_or_head_drift",
+    reason,
+    signature: requiredString(
+      value.signature,
+      filePath,
+      "acceptedArtifactValidationFailure.signature",
+    ),
+    message: requiredString(
+      value.message,
+      filePath,
+      "acceptedArtifactValidationFailure.message",
+    ),
+    firstFailedAt: requiredString(
+      value.firstFailedAt,
+      filePath,
+      "acceptedArtifactValidationFailure.firstFailedAt",
+    ),
+    lastFailedAt: requiredString(
+      value.lastFailedAt,
+      filePath,
+      "acceptedArtifactValidationFailure.lastFailedAt",
+    ),
+    completionReportId: optionalNullableString(
+      value.completionReportId,
+      filePath,
+      "acceptedArtifactValidationFailure.completionReportId",
+    ),
+    reviewVerdictId: optionalNullableString(
+      value.reviewVerdictId,
+      filePath,
+      "acceptedArtifactValidationFailure.reviewVerdictId",
+    ),
+    liveContractFingerprint: requiredString(
+      value.liveContractFingerprint,
+      filePath,
+      "acceptedArtifactValidationFailure.liveContractFingerprint",
+    ),
+    reviewedContractFingerprint: optionalNullableString(
+      value.reviewedContractFingerprint,
+      filePath,
+      "acceptedArtifactValidationFailure.reviewedContractFingerprint",
+    ),
+    sourceHeadSha: optionalNullableString(
+      value.sourceHeadSha,
+      filePath,
+      "acceptedArtifactValidationFailure.sourceHeadSha",
+    ),
+  };
+}
+
 function normalizeWorkspaceSeed(value: unknown, filePath: string): IssueWorkspaceSeedRecord | null {
   if (value === undefined || value === null) return null;
   if (!isRecord(value)) throw corruptLifecycle(filePath, "workspaceSeed is invalid");
@@ -3400,6 +3632,15 @@ function normalizeWorkspaceSeed(value: unknown, filePath: string): IssueWorkspac
     kind: "accepted_artifact",
     status: value.status,
     artifactId: requiredString(value.artifactId, filePath, "workspaceSeed.artifactId"),
+    ...(value.successionId === undefined
+      ? {}
+      : {
+          successionId: requiredString(
+            value.successionId,
+            filePath,
+            "workspaceSeed.successionId",
+          ),
+        }),
     sourceIssueId: requiredString(value.sourceIssueId, filePath, "workspaceSeed.sourceIssueId"),
     sourceIssueIdentifier: requiredString(
       value.sourceIssueIdentifier,
@@ -3427,10 +3668,221 @@ function normalizeWorkspaceSeed(value: unknown, filePath: string): IssueWorkspac
     preparedHeadSha: nullableString(value.preparedHeadSha, filePath, "workspaceSeed.preparedHeadSha"),
     targetBranch: requiredString(value.targetBranch, filePath, "workspaceSeed.targetBranch"),
     conflictedFiles: requiredStringArray(value.conflictedFiles, filePath, "workspaceSeed.conflictedFiles"),
+    ...(value.absorbedPaths === undefined
+      ? {}
+      : {
+          absorbedPaths: requiredStringArray(
+            value.absorbedPaths,
+            filePath,
+            "workspaceSeed.absorbedPaths",
+          ),
+        }),
     plannedAt: requiredString(value.plannedAt, filePath, "workspaceSeed.plannedAt"),
     preparedAt: nullableString(value.preparedAt, filePath, "workspaceSeed.preparedAt"),
     failureReason: nullableString(value.failureReason, filePath, "workspaceSeed.failureReason"),
   };
+}
+
+function normalizeIssueRelationshipState(
+  value: unknown,
+  filePath: string,
+): IssueRelationshipState | null {
+  if (value === undefined || value === null) return null;
+  if (!isRecord(value)) throw corruptLifecycle(filePath, "relationshipState is invalid");
+  if (value.version !== 1) {
+    throw corruptLifecycle(filePath, "relationshipState.version is invalid");
+  }
+  if (value.status !== "valid" && value.status !== "invalid" && value.status !== "legacy") {
+    throw corruptLifecycle(filePath, "relationshipState.status is invalid");
+  }
+  return {
+    version: 1,
+    issueId: requiredString(value.issueId, filePath, "relationshipState.issueId"),
+    issueIdentifier: requiredString(
+      value.issueIdentifier,
+      filePath,
+      "relationshipState.issueIdentifier",
+    ),
+    contractSchemaVersion:
+      value.contractSchemaVersion === null
+        ? null
+        : positiveInteger(
+            value.contractSchemaVersion,
+            filePath,
+            "relationshipState.contractSchemaVersion",
+          ),
+    contractFingerprint: nullableString(
+      value.contractFingerprint,
+      filePath,
+      "relationshipState.contractFingerprint",
+    ),
+    contractBlocks: requiredStringArray(
+      value.contractBlocks,
+      filePath,
+      "relationshipState.contractBlocks",
+    ),
+    contractBlockedBy: requiredStringArray(
+      value.contractBlockedBy,
+      filePath,
+      "relationshipState.contractBlockedBy",
+    ),
+    trackerBlocks: normalizeIssueBlockerRefs(
+      value.trackerBlocks,
+      filePath,
+      "relationshipState.trackerBlocks",
+    ),
+    trackerBlockedBy: normalizeIssueBlockerRefs(
+      value.trackerBlockedBy,
+      filePath,
+      "relationshipState.trackerBlockedBy",
+    ),
+    edges: normalizeIssueRelationshipEdges(value.edges, filePath),
+    status: value.status,
+    validationErrors: requiredStringArray(
+      value.validationErrors,
+      filePath,
+      "relationshipState.validationErrors",
+    ),
+    observedAt: requiredString(value.observedAt, filePath, "relationshipState.observedAt"),
+  };
+}
+
+function normalizeIssueRelationshipEdges(
+  value: unknown,
+  filePath: string,
+): IssueRelationshipEdgeState[] {
+  return requiredArray(value, filePath, "relationshipState.edges").map((entry, index) => {
+    const field = `relationshipState.edges[${index}]`;
+    if (!isRecord(entry) || entry.type !== "blocks") {
+      throw corruptLifecycle(filePath, `${field} is invalid`);
+    }
+    return {
+      type: "blocks",
+      sourceIssueId: optionalNullableString(entry.sourceIssueId, filePath, `${field}.sourceIssueId`),
+      sourceIssueIdentifier: optionalNullableString(
+        entry.sourceIssueIdentifier,
+        filePath,
+        `${field}.sourceIssueIdentifier`,
+      ),
+      targetIssueId: optionalNullableString(entry.targetIssueId, filePath, `${field}.targetIssueId`),
+      targetIssueIdentifier: optionalNullableString(
+        entry.targetIssueIdentifier,
+        filePath,
+        `${field}.targetIssueIdentifier`,
+      ),
+      declared: requiredBoolean(entry.declared, filePath, `${field}.declared`),
+      observed: requiredBoolean(entry.observed, filePath, `${field}.observed`),
+    };
+  });
+}
+
+function normalizeIssueBlockerRefs(
+  value: unknown,
+  filePath: string,
+  field: string,
+): IssueBlockerRef[] {
+  return requiredArray(value, filePath, field).map((entry, index) => {
+    if (!isRecord(entry)) {
+      throw corruptLifecycle(filePath, `${field}[${index}] is invalid`);
+    }
+    return {
+      id: optionalNullableString(entry.id, filePath, `${field}[${index}].id`),
+      identifier: optionalNullableString(
+        entry.identifier,
+        filePath,
+        `${field}[${index}].identifier`,
+      ),
+      state: optionalNullableString(entry.state, filePath, `${field}[${index}].state`),
+    };
+  });
+}
+
+function normalizeIssueSuccessionRecord(
+  value: unknown,
+  filePath: string,
+): IssueSuccessionRecord | null {
+  if (value === undefined || value === null) return null;
+  if (!isRecord(value)) throw corruptLifecycle(filePath, "succession is invalid");
+  if (value.version !== 1) throw corruptLifecycle(filePath, "succession.version is invalid");
+  if (value.purpose !== "expected_red_implementation") {
+    throw corruptLifecycle(filePath, "succession.purpose is invalid");
+  }
+  if (value.role !== "succeeded" && value.role !== "successor") {
+    throw corruptLifecycle(filePath, "succession.role is invalid");
+  }
+  if (!isIssueSuccessionStatus(value.status)) {
+    throw corruptLifecycle(filePath, "succession.status is invalid");
+  }
+  return {
+    version: 1,
+    id: requiredString(value.id, filePath, "succession.id"),
+    purpose: "expected_red_implementation",
+    role: value.role,
+    succeededIssue: normalizeIssueSuccessionIssueRef(
+      value.succeededIssue,
+      filePath,
+      "succession.succeededIssue",
+    ),
+    successorIssue: normalizeIssueSuccessionIssueRef(
+      value.successorIssue,
+      filePath,
+      "succession.successorIssue",
+    ),
+    linearBlockVerified: requiredBoolean(
+      value.linearBlockVerified,
+      filePath,
+      "succession.linearBlockVerified",
+    ),
+    status: value.status,
+    artifactId: optionalNullableString(value.artifactId, filePath, "succession.artifactId"),
+    workspaceSeedId: optionalNullableString(
+      value.workspaceSeedId,
+      filePath,
+      "succession.workspaceSeedId",
+    ),
+    mergeCommitSha: optionalNullableString(
+      value.mergeCommitSha,
+      filePath,
+      "succession.mergeCommitSha",
+    ),
+    validationErrors: requiredStringArray(
+      value.validationErrors,
+      filePath,
+      "succession.validationErrors",
+    ),
+    declaredAt: requiredString(value.declaredAt, filePath, "succession.declaredAt"),
+    agreedAt: optionalNullableString(value.agreedAt, filePath, "succession.agreedAt"),
+    updatedAt: requiredString(value.updatedAt, filePath, "succession.updatedAt"),
+  };
+}
+
+function normalizeIssueSuccessionIssueRef(
+  value: unknown,
+  filePath: string,
+  field: string,
+): IssueSuccessionIssueRef {
+  if (!isRecord(value)) throw corruptLifecycle(filePath, `${field} is invalid`);
+  return {
+    id: optionalNullableString(value.id, filePath, `${field}.id`),
+    identifier: requiredString(value.identifier, filePath, `${field}.identifier`),
+    contractFingerprint: optionalNullableString(
+      value.contractFingerprint,
+      filePath,
+      `${field}.contractFingerprint`,
+    ),
+  };
+}
+
+function isIssueSuccessionStatus(value: unknown): value is IssueSuccessionStatus {
+  return (
+    value === "declared" ||
+    value === "agreed" ||
+    value === "checkpointed" ||
+    value === "seeded" ||
+    value === "verified_green" ||
+    value === "integrated" ||
+    value === "invalid"
+  );
 }
 
 function normalizeArtifactFileManifest(value: unknown, filePath: string): ArtifactFileManifestEntry[] {

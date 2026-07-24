@@ -16,6 +16,8 @@ export interface AcceptedArtifactWorkspaceSeed {
   version: 1;
   kind: "accepted_artifact";
   artifactId: string;
+  /** Present for schema-v2 artifacts selected by a bilateral succession agreement. */
+  successionId?: string;
   sourceIssueId: string;
   sourceIssueIdentifier: string;
   repositoryFingerprint: string;
@@ -31,6 +33,8 @@ export interface WorkspaceSeedBinding extends AcceptedArtifactWorkspaceSeed {
   preparedBaseHeadSha: string;
   preparedHeadSha: string | null;
   conflictedFiles: string[];
+  /** Reviewed manifest paths whose exact final state was already present on the prepared base. */
+  absorbedPaths?: string[];
 }
 
 export interface IssueChildRef {
@@ -56,6 +60,8 @@ export interface Issue {
   delegateId: string | null;
   assignedToWorker: boolean;
   labels: string[];
+  /** Outgoing generalized ordering edges reported by the tracker. */
+  blocks?: IssueBlockerRef[];
   blockedBy: IssueBlockerRef[];
   hasChildren?: boolean;
   children?: IssueChildRef[];
@@ -76,6 +82,7 @@ export interface IssueStatusView {
   assigneeId: string | null;
   delegateId: string | null;
   labels: string[];
+  blocks?: IssueBlockerRef[];
   blockedBy: IssueBlockerRef[];
   hasChildren?: boolean;
   children?: IssueChildRef[];
@@ -248,6 +255,7 @@ export function toIssueStatusView(issue: Issue): IssueStatusView {
     assigneeId: issue.assigneeId,
     delegateId: issue.delegateId,
     labels: [...issue.labels],
+    blocks: (issue.blocks ?? []).map((blocked) => ({ ...blocked })),
     blockedBy: issue.blockedBy.map((blocker) => ({ ...blocker })),
     ...(issue.hasChildren === undefined ? {} : { hasChildren: issue.hasChildren }),
     ...(issue.children === undefined

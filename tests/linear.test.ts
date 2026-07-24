@@ -4,10 +4,11 @@ import {
   LinearTrackerClient,
   normalizeIssue,
 } from "../src/integrations/linear/LinearTrackerClient.js";
-import { testConfig } from "./helpers.js";
+import { parseIssueContract } from "../src/core/IssueContractLint.js";
+import { agentEligibleIssueContract, testConfig } from "./helpers.js";
 
 describe("LinearTrackerClient", () => {
-  it("normalizes issue labels and blockers", () => {
+  it("normalizes issue labels and incoming and outgoing blocker relationships", () => {
     const normalized = normalizeIssue({
       id: "id",
       identifier: "T-1",
@@ -24,9 +25,24 @@ describe("LinearTrackerClient", () => {
           },
         ],
       },
+      relations: {
+        nodes: [
+          {
+            type: "blocks",
+            relatedIssue: { id: "target", identifier: "T-2", state: { name: "Todo" } },
+          },
+          {
+            type: "related",
+            relatedIssue: { id: "ignored", identifier: "T-3", state: { name: "Todo" } },
+          },
+        ],
+      },
     });
 
     expect(normalized?.labels).toEqual(["bug"]);
+    expect(normalized?.blocks).toEqual([
+      { id: "target", identifier: "T-2", state: "Todo" },
+    ]);
     expect(normalized?.blockedBy[0]?.identifier).toBe("T-0");
     expect(normalized?.hasChildren).toBe(false);
     expect(normalized?.assigneeId).toBe("user-1");
@@ -126,6 +142,8 @@ describe("LinearTrackerClient", () => {
                   identifier: `T-${calls}`,
                   title: "Title",
                   state: { name: "Todo" },
+                  inverseRelations: emptyRelationConnection(),
+                  relations: emptyRelationConnection(),
                 },
               ],
               pageInfo: { hasNextPage: calls === 1, endCursor: calls === 1 ? "next" : null },
@@ -158,6 +176,8 @@ describe("LinearTrackerClient", () => {
                 identifier: `T-${calls}`,
                 title: "Title",
                 state: { name: "Todo" },
+                inverseRelations: emptyRelationConnection(),
+                relations: emptyRelationConnection(),
               },
             ],
             pageInfo: {
@@ -183,6 +203,186 @@ describe("LinearTrackerClient", () => {
     expect(requests[1]?.variables.after).toBe("next-page");
   });
 
+  it("paginates outgoing issue relations before normalizing the issue", async () => {
+    const config = testConfig("/tmp/symphony");
+    const requests: Array<{
+      query: string;
+      variables: Record<string, unknown>;
+    }> = [];
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      const request = JSON.parse(String(init?.body)) as {
+        query: string;
+        variables: Record<string, unknown>;
+      };
+      requests.push(request);
+      if (request.query.includes("SymphonyIssueRelationsPage")) {
+        return jsonResponse({
+          data: {
+            issue: {
+              id: "id-1",
+              relations: {
+                nodes: [
+                  {
+                    type: "blocks",
+                    relatedIssue: {
+                      id: "target-2",
+                      identifier: "T-3",
+                      state: { name: "In Progress" },
+                    },
+                  },
+                ],
+                pageInfo: pageInfo(),
+              },
+            },
+          },
+        });
+      }
+      return jsonResponse({
+        data: {
+          issues: {
+            nodes: [
+              {
+                id: "id-1",
+                identifier: "T-1",
+                title: "Title",
+                state: { name: "Todo" },
+                inverseRelations: emptyRelationConnection(),
+                relations: {
+                  nodes: [
+                    {
+                      type: "blocks",
+                      relatedIssue: {
+                        id: "target-1",
+                        identifier: "T-2",
+                        state: { name: "Todo" },
+                      },
+                    },
+                  ],
+                  pageInfo: pageInfo(true, "outgoing-page-2"),
+                },
+              },
+            ],
+            pageInfo: pageInfo(),
+          },
+        },
+      });
+    };
+
+    const client = new LinearTrackerClient(config.tracker, fetchImpl);
+
+    await expect(client.fetchIssueStatesByIds(["id-1"])).resolves.toMatchObject([
+      {
+        blocks: [
+          { id: "target-1", identifier: "T-2", state: "Todo" },
+          { id: "target-2", identifier: "T-3", state: "In Progress" },
+        ],
+      },
+    ]);
+    expect(requests).toHaveLength(2);
+    expect(requests[0]?.query).toContain(
+      `relations(first: 100) {
+    nodes { type relatedIssue { id identifier state { name } } }
+    pageInfo { hasNextPage endCursor }
+  }`,
+    );
+    expect(requests[1]).toMatchObject({
+      variables: { id: "id-1", after: "outgoing-page-2" },
+    });
+    expect(requests[1]?.query).toContain(
+      "relations(first: 100, after: $after)",
+    );
+  });
+
+  it("paginates incoming issue relations before normalizing the issue", async () => {
+    const config = testConfig("/tmp/symphony");
+    const requests: Array<{
+      query: string;
+      variables: Record<string, unknown>;
+    }> = [];
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      const request = JSON.parse(String(init?.body)) as {
+        query: string;
+        variables: Record<string, unknown>;
+      };
+      requests.push(request);
+      if (request.query.includes("SymphonyIssueInverseRelationsPage")) {
+        return jsonResponse({
+          data: {
+            issue: {
+              id: "id-1",
+              inverseRelations: {
+                nodes: [
+                  {
+                    type: "blocks",
+                    issue: {
+                      id: "source-2",
+                      identifier: "T-3",
+                      state: { name: "Done" },
+                    },
+                  },
+                ],
+                pageInfo: pageInfo(),
+              },
+            },
+          },
+        });
+      }
+      return jsonResponse({
+        data: {
+          issues: {
+            nodes: [
+              {
+                id: "id-1",
+                identifier: "T-1",
+                title: "Title",
+                state: { name: "Todo" },
+                inverseRelations: {
+                  nodes: [
+                    {
+                      type: "blocks",
+                      issue: {
+                        id: "source-1",
+                        identifier: "T-0",
+                        state: { name: "In Progress" },
+                      },
+                    },
+                  ],
+                  pageInfo: pageInfo(true, "incoming-page-2"),
+                },
+                relations: emptyRelationConnection(),
+              },
+            ],
+            pageInfo: pageInfo(),
+          },
+        },
+      });
+    };
+
+    const client = new LinearTrackerClient(config.tracker, fetchImpl);
+
+    await expect(client.fetchIssueStatesByIds(["id-1"])).resolves.toMatchObject([
+      {
+        blockedBy: [
+          { id: "source-1", identifier: "T-0", state: "In Progress" },
+          { id: "source-2", identifier: "T-3", state: "Done" },
+        ],
+      },
+    ]);
+    expect(requests).toHaveLength(2);
+    expect(requests[0]?.query).toContain(
+      `inverseRelations(first: 100) {
+    nodes { type issue { id identifier state { name } } }
+    pageInfo { hasNextPage endCursor }
+  }`,
+    );
+    expect(requests[1]).toMatchObject({
+      variables: { id: "id-1", after: "incoming-page-2" },
+    });
+    expect(requests[1]?.query).toContain(
+      "inverseRelations(first: 100, after: $after)",
+    );
+  });
+
   it("fetches terminal issues by bounded identifiers and states", async () => {
     const config = testConfig("/tmp/symphony");
     const requests: Array<{ query: string; variables: Record<string, unknown> }> = [];
@@ -197,6 +397,8 @@ describe("LinearTrackerClient", () => {
                 identifier: "T-1",
                 title: "Title",
                 state: { name: "Done" },
+                inverseRelations: emptyRelationConnection(),
+                relations: emptyRelationConnection(),
               },
             ],
             pageInfo: pageInfo(),
@@ -350,6 +552,8 @@ describe("LinearTrackerClient", () => {
                 identifier: `T-${calls}`,
                 title: "Title",
                 state: { name: "Todo" },
+                inverseRelations: emptyRelationConnection(),
+                relations: emptyRelationConnection(),
               },
             ],
             pageInfo: {
@@ -396,6 +600,8 @@ describe("LinearTrackerClient", () => {
                 identifier: "T-1",
                 title: "Title",
                 state: { name: "Ready to Merge" },
+                inverseRelations: emptyRelationConnection(),
+                relations: emptyRelationConnection(),
               },
             ],
             pageInfo: {
@@ -898,7 +1104,7 @@ describe("LinearTrackerClient", () => {
               identifier: "T-1",
               team: { id: "team-1", labels: { nodes: [{ id: "label-1", name: "Planning" }] } },
               project: { id: "project-1" },
-              children: { nodes: [] },
+              children: { nodes: [], pageInfo: pageInfo() },
             },
           },
         });
@@ -949,7 +1155,7 @@ describe("LinearTrackerClient", () => {
             identifier: "T-1",
             team: { id: "team-1", labels: { nodes: [] } },
             project: { id: "project-1" },
-            children: { nodes: [] },
+            children: { nodes: [], pageInfo: pageInfo() },
           },
         },
       });
@@ -983,7 +1189,7 @@ describe("LinearTrackerClient", () => {
           data: {
             issue: {
               id: "child-1",
-              relations: { nodes: [] },
+              relations: { nodes: [], pageInfo: pageInfo() },
             },
           },
         });
@@ -1015,6 +1221,126 @@ describe("LinearTrackerClient", () => {
     });
   });
 
+  it("verifies an existing blocker relation beyond the first page without mutating Linear", async () => {
+    const config = testConfig("/tmp/symphony");
+    const requests: Array<{ query: string; variables: Record<string, unknown> }> = [];
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      const request = JSON.parse(String(init?.body)) as {
+        query: string;
+        variables: Record<string, unknown>;
+      };
+      requests.push(request);
+
+      if (request.query.includes("SymphonyIssueRelationContext")) {
+        return jsonResponse({
+          data: {
+            issue: {
+              id: "child-1",
+              relations: {
+                nodes: [{ type: "blocks", relatedIssue: { id: "other-child" } }],
+                pageInfo: pageInfo(true, "relations-page-2"),
+              },
+            },
+          },
+        });
+      }
+      if (request.query.includes("SymphonyIssueRelationsPage")) {
+        return jsonResponse({
+          data: {
+            issue: {
+              id: "child-1",
+              relations: {
+                nodes: [
+                  {
+                    type: "blocks",
+                    relatedIssue: {
+                      id: "child-2",
+                      identifier: "T-2",
+                      state: { name: "Todo" },
+                    },
+                  },
+                ],
+                pageInfo: pageInfo(),
+              },
+            },
+          },
+        });
+      }
+      throw new Error("Unexpected Linear mutation");
+    };
+
+    const client = new LinearTrackerClient(config.tracker, fetchImpl);
+    const result = await client.createIssueRelation({
+      sourceIssueId: "child-1",
+      targetIssueId: "child-2",
+      type: "blocks",
+      dedupeKey: "relation-key",
+      dependency: "Child one",
+    });
+
+    expect(result.status).toBe("verified");
+    expect(requests).toHaveLength(2);
+    expect(requests[1]).toMatchObject({
+      variables: { id: "child-1", after: "relations-page-2" },
+    });
+    expect(requests[1]?.query).toContain("SymphonyIssueRelationsPage");
+  });
+
+  it("rejects description updates when the live Issue Contract drifted without mutating Linear", async () => {
+    const config = testConfig("/tmp/symphony");
+    const plannedDescription = agentEligibleIssueContract({
+      issueContractContractVersion: "planned-contract",
+    });
+    const desiredDescription = agentEligibleIssueContract({
+      issueContractContractVersion: "desired-contract",
+    });
+    const liveDescription = agentEligibleIssueContract({
+      issueContractContractVersion: "live-drifted-contract",
+    });
+    const plannedContract = parseIssueContract(plannedDescription);
+    if (!plannedContract.valid) throw new Error("Expected planned Issue Contract to be valid");
+
+    const requests: Array<{ query: string; variables: Record<string, unknown> }> = [];
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      const request = JSON.parse(String(init?.body)) as {
+        query: string;
+        variables: Record<string, unknown>;
+      };
+      requests.push(request);
+      if (!request.query.includes("SymphonyIssueWriteContext")) {
+        throw new Error("Unexpected Linear mutation");
+      }
+      return jsonResponse({
+        data: {
+          issue: {
+            id: "child-1",
+            identifier: "T-1",
+            description: liveDescription,
+            state: { id: "todo", name: "Todo" },
+            team: { states: { nodes: [] } },
+            comments: { nodes: [] },
+          },
+        },
+      });
+    };
+
+    const client = new LinearTrackerClient(config.tracker, fetchImpl);
+
+    await expect(
+      client.updateIssueDescription({
+        issueId: "child-1",
+        description: desiredDescription,
+        dedupeKey: "description-update-key",
+        expectedContractFingerprint: plannedContract.fingerprint,
+      }),
+    ).rejects.toMatchObject({
+      code: "conflict",
+      message: "Linear issue child-1 Issue Contract changed after the breakdown plan created it",
+    });
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.query).toContain("SymphonyIssueWriteContext");
+  });
+
   it("verifies existing marker-matched child issues", async () => {
     const config = testConfig("/tmp/symphony");
     const fetchImpl: typeof fetch = async () =>
@@ -1036,6 +1362,7 @@ describe("LinearTrackerClient", () => {
                   parent: { id: "issue-1" },
                 },
               ],
+              pageInfo: pageInfo(),
             },
           },
         },
@@ -1056,6 +1383,95 @@ describe("LinearTrackerClient", () => {
     expect(result.status).toBe("verified");
     expect(result.evidence?.issueCreateStatus).toBe("verified");
   });
+
+  it("verifies a marker-matched child beyond the first page without creating a duplicate", async () => {
+    const config = testConfig("/tmp/symphony");
+    const requests: Array<{
+      query: string;
+      variables: Record<string, unknown>;
+    }> = [];
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      const request = JSON.parse(String(init?.body)) as {
+        query: string;
+        variables: Record<string, unknown>;
+      };
+      requests.push(request);
+      if (request.query.includes("SymphonyIssueCreateContext")) {
+        return jsonResponse({
+          data: {
+            issue: {
+              id: "issue-1",
+              identifier: "T-1",
+              team: { id: "team-1", labels: { nodes: [] } },
+              project: null,
+              children: {
+                nodes: [
+                  {
+                    id: "other-child",
+                    identifier: "T-99",
+                    title: "Other child",
+                    description: "Unrelated child",
+                    url: "https://linear.test/T-99",
+                    parent: { id: "issue-1" },
+                  },
+                ],
+                pageInfo: pageInfo(true, "children-page-2"),
+              },
+            },
+          },
+        });
+      }
+      if (request.query.includes("SymphonyIssueChildrenPage")) {
+        return jsonResponse({
+          data: {
+            issue: {
+              id: "issue-1",
+              children: {
+                nodes: [
+                  {
+                    id: "child-1",
+                    identifier: "T-2",
+                    title: "Child issue",
+                    description:
+                      "<!-- symphony-issue-breakdown:plan-1:0:hash-1 -->",
+                    url: "https://linear.test/T-2",
+                    parent: { id: "issue-1" },
+                  },
+                ],
+                pageInfo: pageInfo(),
+              },
+            },
+          },
+        });
+      }
+      throw new Error("Unexpected Linear mutation");
+    };
+
+    const client = new LinearTrackerClient(config.tracker, fetchImpl);
+    const result = await client.createIssueFromPlan({
+      parentIssueId: "issue-1",
+      title: "Child issue",
+      description: "Build the child.",
+      acceptanceCriteria: ["Done"],
+      requestedLabels: [],
+      dependencies: [],
+      dedupeKey: "plan-1:0",
+      payloadHash: "hash-1",
+    });
+
+    expect(result.status).toBe("verified");
+    expect(result.evidence).toMatchObject({
+      issueCreateStatus: "verified",
+      issue: { id: "child-1", identifier: "T-2" },
+    });
+    expect(requests).toHaveLength(2);
+    expect(requests[1]).toMatchObject({
+      variables: { id: "issue-1", after: "children-page-2" },
+    });
+    expect(requests[1]?.query).toContain(
+      "children(first: 100, after: $after)",
+    );
+  });
 });
 
 function jsonResponse(body: unknown): Response {
@@ -1064,4 +1480,11 @@ function jsonResponse(body: unknown): Response {
 
 function pageInfo(hasNextPage = false, endCursor: string | null = null): { hasNextPage: boolean; endCursor: string | null } {
   return { hasNextPage, endCursor };
+}
+
+function emptyRelationConnection(): {
+  nodes: [];
+  pageInfo: { hasNextPage: boolean; endCursor: string | null };
+} {
+  return { nodes: [], pageInfo: pageInfo() };
 }
