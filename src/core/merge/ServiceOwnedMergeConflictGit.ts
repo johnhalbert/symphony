@@ -1611,7 +1611,19 @@ class ServiceGit {
   }
 
   async rebaseOnto(newBaseSha: string, oldBaseSha: string): Promise<GitResult> {
-    return this.git(["rebase", "--onto", newBaseSha, oldBaseSha], { allowFailure: true });
+    return this.git(
+      [
+        "-c",
+        `user.name=${SERVICE_GIT_NAME}`,
+        "-c",
+        `user.email=${SERVICE_GIT_EMAIL}`,
+        "rebase",
+        "--onto",
+        newBaseSha,
+        oldBaseSha,
+      ],
+      { allowFailure: true },
+    );
   }
 
   async conflictedFiles(): Promise<string[]> {

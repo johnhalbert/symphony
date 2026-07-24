@@ -4,6 +4,11 @@ import path from "node:path";
 import type { ServiceConfig } from "./config/Config.js";
 import { SymphonyError } from "./errors.js";
 import { parseIssueContract } from "./IssueContractLint.js";
+import {
+  buildIssueRelationshipState,
+  mergeIssueSuccessionProgress,
+  resolveIssueSuccessionAgreement,
+} from "./IssueRelationshipService.js";
 import type {
   CompletionReportPullRequestRef,
   IssueAcceptedArtifactRecord,
@@ -12,6 +17,7 @@ import type {
   IssueLifecycleStore,
   IssueReviewFeedbackRecord,
   IssueReviewVerdictRecord,
+  IssueSuccessionRecord,
 } from "./persistence/IssueLifecycleStore.js";
 import {
   isSupersededLifecycleRecord,
@@ -58,6 +64,7 @@ export interface AcceptedArtifactServiceOptions {
     Partial<Pick<WritebackProcessor, "enqueueAndProcess">>;
   client: AcceptedArtifactGitHubClient;
   checkpointBuilder?: AcceptedArtifactCheckpointBuilder;
+  resolveIssuesByIds?: (issueIds: string[]) => Promise<Issue[]>;
 }
 
 export interface CompleteAcceptedArtifactInput {
@@ -125,6 +132,7 @@ export function classifyAcceptedArtifactCompletionError(error: unknown): Accepte
 
 interface ValidatedAcceptedArtifactReview {
   lifecycle: IssueLifecycleRecord;
+  sourceIssue: Issue;
   report: IssueCompletionReportRecord;
   verdict: IssueReviewVerdictRecord;
   feedback: IssueReviewFeedbackRecord;
@@ -136,6 +144,8 @@ interface ValidatedAcceptedArtifactReview {
   sourceBaseHeadSha: string;
   baseRef: string;
   contractFingerprint: string;
+  targetIssue: Issue;
+  succession: IssueSuccessionRecord;
 }
 
 export class AcceptedArtifactService {
@@ -198,6 +208,28 @@ export class AcceptedArtifactService {
 
   private async performCompletion(input: CompleteAcceptedArtifactInput): Promise<CompleteAcceptedArtifactResult> {
     const review = await this.validateReview(input.issue);
+    const sourceIssue = review.sourceIssue;
+    const targetLifecycle = await this.options.lifecycleStore.get(
+      review.targetIssue.id,
+    );
+    const sourceSuccession = mergeIssueSuccessionProgress(
+      review.lifecycle.succession,
+      { ...review.succession, role: "succeeded" },
+    );
+    const targetSuccession = mergeIssueSuccessionProgress(
+      targetLifecycle?.succession,
+      { ...review.succession, role: "successor" },
+    );
+    await Promise.all([
+      this.options.lifecycleStore.updateIssue(sourceIssue, {
+        relationshipState: buildIssueRelationshipState(sourceIssue),
+        succession: sourceSuccession,
+      }),
+      this.options.lifecycleStore.updateIssue(review.targetIssue, {
+        relationshipState: buildIssueRelationshipState(review.targetIssue),
+        succession: targetSuccession,
+      }),
+    ]);
     const artifactId = acceptedArtifactId(review);
     let replayed = false;
     let artifact = review.lifecycle.acceptedArtifact ?? null;
@@ -228,10 +260,11 @@ export class AcceptedArtifactService {
       artifact = {
         id: artifactId,
         version: 1,
+        successionId: review.succession.id,
         kind: "expected_red_tests",
         status: "checkpointed",
-        sourceIssueId: input.issue.id,
-        sourceIssueIdentifier: input.issue.identifier,
+        sourceIssueId: sourceIssue.id,
+        sourceIssueIdentifier: sourceIssue.identifier,
         contractFingerprint: review.contractFingerprint,
         completionReportId: review.report.id,
         reviewVerdictId: review.verdict.id,
@@ -247,9 +280,9 @@ export class AcceptedArtifactService {
         changedFiles: [...review.report.changedFiles],
         fileManifest,
         artifactEvidence: review.report.artifactEvidence!,
-        commentOperationKey: acceptedArtifactCommentOperationKey(input.issue.id, artifactId),
+        commentOperationKey: acceptedArtifactCommentOperationKey(sourceIssue.id, artifactId),
         doneTransitionOperationKey: acceptedArtifactDoneOperationKey(
-          input.issue.id,
+          sourceIssue.id,
           artifactId,
           this.options.config.mergePolicy.doneState,
         ),
@@ -258,7 +291,16 @@ export class AcceptedArtifactService {
         prClosedAt: null,
         completedAt: null,
       };
-      const checkpointed = await this.options.lifecycleStore.updateIssue(input.issue, { acceptedArtifact: artifact });
+      const checkpointed = await this.options.lifecycleStore.updateIssue(sourceIssue, {
+        acceptedArtifact: artifact,
+        succession: mergeIssueSuccessionProgress(sourceSuccession, {
+          ...review.succession,
+          role: "succeeded",
+          status: "checkpointed",
+          artifactId,
+          updatedAt: now,
+        }),
+      });
       artifact = checkpointed.acceptedArtifact ?? null;
       if (artifact === null) {
         throw new AcceptedArtifactCompletionError(
@@ -268,10 +310,31 @@ export class AcceptedArtifactService {
         );
       }
     }
+    const checkpointObservedAt = new Date().toISOString();
+    await Promise.all([
+      this.options.lifecycleStore.updateIssue(sourceIssue, {
+        succession: mergeIssueSuccessionProgress(sourceSuccession, {
+          ...review.succession,
+          role: "succeeded",
+          status: "checkpointed",
+          artifactId: artifact.id,
+          updatedAt: checkpointObservedAt,
+        }),
+      }),
+      this.options.lifecycleStore.updateIssue(review.targetIssue, {
+        succession: mergeIssueSuccessionProgress(targetSuccession, {
+          ...review.succession,
+          role: "successor",
+          status: "checkpointed",
+          artifactId: artifact.id,
+          updatedAt: checkpointObservedAt,
+        }),
+      }),
+    ]);
 
     const planned = planAcceptedArtifactCompletionWritebacks(
       {
-        issue: input.issue,
+        issue: sourceIssue,
         artifact,
         fromStates: acceptedArtifactCompletionSourceStates(this.options.config),
         doneState: this.options.config.mergePolicy.doneState,
@@ -321,7 +384,7 @@ export class AcceptedArtifactService {
 
     if (artifact.status !== "completed_unmerged") {
       const completedAt = new Date().toISOString();
-      const completed = await this.options.lifecycleStore.updateIssue(input.issue, {
+      const completed = await this.options.lifecycleStore.updateIssue(sourceIssue, {
         acceptedArtifact: {
           ...artifact,
           status: "completed_unmerged",
@@ -375,58 +438,95 @@ export class AcceptedArtifactService {
         "Accepted-artifact completion requires durable lifecycle state",
       );
     }
-    if (!sameStateIn(issue.state, acceptedArtifactCompletionSourceStates(this.options.config))) {
-      throw new SymphonyError(
-        "conflict",
+    if (!this.options.resolveIssuesByIds) {
+      throw contractOrReviewDrift(
+        "Accepted-artifact completion requires live reciprocal succession verification",
+      );
+    }
+    const successionAgreement = await resolveIssueSuccessionAgreement(issue, {
+      fetchIssueStatesByIds: this.options.resolveIssuesByIds,
+    });
+    if (
+      successionAgreement.kind !== "agreed" ||
+      successionAgreement.sourceIssue.id !== issue.id
+    ) {
+      if (successionAgreement.kind === "none") {
+        const liveContract = parseIssueContract(
+          successionAgreement.issue.description,
+        );
+        if (
+          !liveContract.valid ||
+          liveContract.contract.delivery.mode !== "accepted_artifact" ||
+          liveContract.contract.delivery.artifact !== "expected_red_tests"
+        ) {
+          throw contractOrReviewDrift(
+            "Current Issue Contract no longer declares expected-red accepted-artifact delivery",
+          );
+        }
+      }
+      throw contractOrReviewDrift(
+        successionAgreement.kind === "invalid"
+          ? `Accepted-artifact succession agreement is invalid: ${successionAgreement.errors.join("; ")}`
+          : "Accepted-artifact Issue Contract must declare a reciprocal implementation successor",
+      );
+    }
+    const liveIssue = successionAgreement.sourceIssue;
+    const liveContract = successionAgreement.sourceContract;
+    if (
+      !sameStateIn(
+        liveIssue.state,
+        acceptedArtifactCompletionSourceStates(this.options.config),
+      )
+    ) {
+      throw contractOrReviewDrift(
         "Accepted-artifact completion requires the issue to remain in review or an unmerged review-pass state",
       );
     }
     if (lifecycle.phase !== "passed") {
-      throw new SymphonyError("conflict", "Accepted-artifact completion requires a persisted pass verdict");
+      throw contractOrReviewDrift("Accepted-artifact completion requires a persisted pass verdict");
     }
     if (lifecycle.merge !== null) {
       throw unexpectedMergedError();
     }
-
-    const parsedContract = parseIssueContract(issue.description);
-    if (!parsedContract.valid) {
-      throw new SymphonyError("conflict", "Accepted-artifact Issue Contract is missing or invalid", {
-        errors: parsedContract.errors,
-      });
-    }
     if (
-      parsedContract.contract.delivery.mode !== "accepted_artifact" ||
-      parsedContract.contract.delivery.artifact !== "expected_red_tests"
+      liveContract.delivery.mode !== "accepted_artifact" ||
+      liveContract.delivery.artifact !== "expected_red_tests"
     ) {
-      throw new SymphonyError("conflict", "Current Issue Contract no longer declares expected-red accepted-artifact delivery");
+      throw contractOrReviewDrift(
+        "Current Issue Contract no longer declares expected-red accepted-artifact delivery",
+      );
     }
 
     const report = latestCurrentCompletionReport(lifecycle);
-    if (!report) throw new SymphonyError("conflict", "Accepted-artifact completion report is not current");
+    if (!report) throw contractOrReviewDrift("Accepted-artifact completion report is not current");
     const snapshot = report.contractSnapshot;
     if (
       !snapshot ||
       snapshot.delivery.mode !== "accepted_artifact" ||
       snapshot.delivery.artifact !== "expected_red_tests" ||
-      snapshot.fingerprint !== parsedContract.fingerprint ||
-      snapshot.schemaVersion !== parsedContract.contract.schemaVersion ||
-      snapshot.contractVersion !== parsedContract.contract.contractVersion
+      snapshot.fingerprint !== liveContract.fingerprint ||
+      snapshot.schemaVersion !== liveContract.schemaVersion ||
+      snapshot.contractVersion !== liveContract.contractVersion
     ) {
-      throw new SymphonyError("conflict", "Issue Contract changed after the accepted-artifact completion report");
+      throw contractOrReviewDrift("Issue Contract changed after the accepted-artifact completion report");
     }
     if (!report.artifactEvidence || report.artifactEvidence.kind !== "expected_red_tests") {
-      throw new SymphonyError("conflict", "Accepted-artifact completion report lacks expected-red evidence");
+      throw contractOrReviewDrift("Accepted-artifact completion report lacks expected-red evidence");
     }
     if (!Number.isInteger(report.artifactEvidence.exitCode) || report.artifactEvidence.exitCode <= 0) {
-      throw new SymphonyError("conflict", "Accepted-artifact evidence must record an intentional nonzero exit code");
+      throw contractOrReviewDrift(
+        "Accepted-artifact evidence must record an intentional nonzero exit code",
+      );
     }
     if (report.dependencyArtifactResult) {
-      throw new SymphonyError("conflict", "Accepted-artifact source report cannot contain dependency artifact results");
+      throw contractOrReviewDrift(
+        "Accepted-artifact source report cannot contain dependency artifact results",
+      );
     }
 
     const pullRequest = requiredPullRequest(report.pullRequest);
     if (report.pullRequest?.draft !== true) {
-      throw new SymphonyError("conflict", "Accepted-artifact completion requires a draft pull request");
+      throw sourceCheckpointDrift("Accepted-artifact completion requires a draft pull request");
     }
     const acceptanceContext = report.acceptanceContext;
     const sourceBaseHeadSha = fullObjectId(acceptanceContext?.baseHeadSha, "source base head");
@@ -437,11 +537,15 @@ export class AcceptedArtifactService {
       acceptanceContext.worktreeDirty !== false ||
       acceptanceContext.worktreeStatus !== "clean"
     ) {
-      throw new SymphonyError("conflict", "Accepted-artifact completion report does not bind a clean source checkpoint");
+      throw sourceCheckpointDrift(
+        "Accepted-artifact completion report does not bind a clean source checkpoint",
+      );
     }
     const configuredBaseRef = this.options.config.workspace.source.baseRef?.trim() ?? "";
     if (configuredBaseRef.length === 0 || acceptanceContext.baseRef?.trim() !== configuredBaseRef) {
-      throw new SymphonyError("conflict", "Accepted-artifact completion report base ref does not match configuration");
+      throw sourceCheckpointDrift(
+        "Accepted-artifact completion report base ref does not match configuration",
+      );
     }
 
     const verdict = lifecycle.reviewVerdicts.find((candidate) => candidate.id === lifecycle.lastReviewVerdictId);
@@ -451,10 +555,14 @@ export class AcceptedArtifactService {
       verdict.passDisposition !== "accepted_artifact" ||
       isSupersededLifecycleRecord(verdict)
     ) {
-      throw new SymphonyError("conflict", "Accepted-artifact completion requires the current accepted-artifact pass verdict");
+      throw contractOrReviewDrift(
+        "Accepted-artifact completion requires the current accepted-artifact pass verdict",
+      );
     }
     if (Date.parse(verdict.submittedAt) < Date.parse(report.acceptedAt)) {
-      throw new SymphonyError("conflict", "Accepted-artifact pass verdict predates the current completion report");
+      throw contractOrReviewDrift(
+        "Accepted-artifact pass verdict predates the current completion report",
+      );
     }
     const feedback = lifecycle.reviewFeedback.find(
       (candidate) =>
@@ -465,21 +573,23 @@ export class AcceptedArtifactService {
         candidate.pullRequest.headSha === sourceHeadSha,
     );
     if (!feedback) {
-      throw new SymphonyError(
-        "conflict",
+      throw contractOrReviewDrift(
         "Accepted-artifact completion requires lifecycle-bound COMMENT review feedback on the reviewed head",
       );
     }
 
     return {
       lifecycle,
+      sourceIssue: liveIssue,
       report,
       verdict,
       feedback,
       pullRequest: { ...pullRequest, headSha: sourceHeadSha },
       sourceBaseHeadSha,
       baseRef: configuredBaseRef,
-      contractFingerprint: parsedContract.fingerprint,
+      contractFingerprint: liveContract.fingerprint,
+      targetIssue: successionAgreement.targetIssue,
+      succession: successionAgreement.succession,
     };
   }
 
@@ -490,6 +600,7 @@ export class AcceptedArtifactService {
   ): void {
     if (
       artifact.id !== artifactId ||
+      artifact.successionId !== review.succession.id ||
       artifact.sourceIssueId !== review.lifecycle.issueId ||
       artifact.sourceIssueIdentifier !== review.lifecycle.issueIdentifier ||
       artifact.contractFingerprint !== review.contractFingerprint ||
@@ -526,11 +637,12 @@ export class AcceptedArtifactService {
 
   private async validateRemoteBranch(artifact: IssueAcceptedArtifactRecord): Promise<void> {
     const branch = artifact.pullRequest.branch?.trim() ?? "";
-    if (branch.length === 0) throw new SymphonyError("conflict", "Accepted-artifact source branch is missing");
+    if (branch.length === 0) {
+      throw pullRequestOrBranchDrift("Accepted-artifact source branch is missing");
+    }
     const remoteHead = await this.options.client.getBranchHeadSha({ branchName: branch });
     if (remoteHead.toLowerCase() !== artifact.sourceHeadSha.toLowerCase()) {
-      throw new SymphonyError(
-        "conflict",
+      throw pullRequestOrBranchDrift(
         `Accepted-artifact source branch moved from ${artifact.sourceHeadSha} to ${remoteHead}`,
       );
     }
@@ -547,7 +659,9 @@ export class AcceptedArtifactService {
       live.headBranch !== review.pullRequest.branch ||
       live.draft !== true
     ) {
-      throw new SymphonyError("conflict", "Accepted-artifact draft PR no longer matches the reviewed head and branch");
+      throw pullRequestOrBranchDrift(
+        "Accepted-artifact draft PR no longer matches the reviewed head and branch",
+      );
     }
     if (pullRequestWasMerged(live)) {
       throw unexpectedMergedError();
@@ -556,7 +670,9 @@ export class AcceptedArtifactService {
     const validState =
       expectedState === "open_or_closed" ? state === "open" || state === "closed" : state === expectedState;
     if (!validState) {
-      throw new SymphonyError("conflict", `Accepted-artifact draft PR has unexpected state ${live.state ?? "unknown"}`);
+      throw pullRequestOrBranchDrift(
+        `Accepted-artifact draft PR has unexpected state ${live.state ?? "unknown"}`,
+      );
     }
     return live;
   }
@@ -616,6 +732,42 @@ function unexpectedMergedError(): AcceptedArtifactCompletionError {
   );
 }
 
+function contractOrReviewDrift(
+  message: string,
+  details?: unknown,
+): AcceptedArtifactCompletionError {
+  return new AcceptedArtifactCompletionError(
+    "contract_or_head_drift",
+    "contract_or_review_drift",
+    message,
+    details,
+  );
+}
+
+function pullRequestOrBranchDrift(
+  message: string,
+  details?: unknown,
+): AcceptedArtifactCompletionError {
+  return new AcceptedArtifactCompletionError(
+    "contract_or_head_drift",
+    "pull_request_or_branch_drift",
+    message,
+    details,
+  );
+}
+
+function sourceCheckpointDrift(
+  message: string,
+  details?: unknown,
+): AcceptedArtifactCompletionError {
+  return new AcceptedArtifactCompletionError(
+    "contract_or_head_drift",
+    "source_checkpoint_drift",
+    message,
+    details,
+  );
+}
+
 function pullRequestWasMerged(
   pullRequest: Pick<PullRequestDetails, "merged" | "mergedAt">,
 ): boolean {
@@ -645,7 +797,11 @@ function acceptedArtifactDoneOperationKey(issueId: string, artifactId: string, d
 function repositoryFingerprint(config: ServiceConfig): string {
   const repository = config.workspace.source.repository?.trim() ?? "";
   if (repository.length === 0) {
-    throw new SymphonyError("conflict", "Accepted-artifact completion requires a configured git repository");
+    throw new AcceptedArtifactCompletionError(
+      "permanent_github_access_or_configuration",
+      "github_access_or_configuration",
+      "Accepted-artifact completion requires a configured git repository",
+    );
   }
   return workspaceRepositoryFingerprint(repository);
 }
@@ -664,7 +820,9 @@ function requiredPullRequest(
     !pullRequest.headSha ||
     !pullRequest.branch
   ) {
-    throw new SymphonyError("conflict", "Accepted-artifact completion requires a lifecycle-bound pull request");
+    throw sourceCheckpointDrift(
+      "Accepted-artifact completion requires a lifecycle-bound pull request",
+    );
   }
   return pullRequest as Omit<CompletionReportPullRequestRef, "number" | "headSha" | "branch"> & {
     number: number;
@@ -824,7 +982,9 @@ async function assertAncestor(
 function fullObjectId(value: string | null | undefined, label: string): string {
   const normalized = value?.trim() ?? "";
   if (!/^[0-9a-f]{40,64}$/i.test(normalized)) {
-    throw new SymphonyError("conflict", `Accepted-artifact ${label} must be a full git object ID`);
+    throw sourceCheckpointDrift(
+      `Accepted-artifact ${label} must be a full git object ID`,
+    );
   }
   return normalized;
 }
@@ -883,7 +1043,13 @@ function runGit(
       if (settled) return;
       settled = true;
       child.kill("SIGTERM");
-      reject(new SymphonyError("conflict", `Accepted-artifact git command timed out: git ${args.join(" ")}`));
+      reject(
+        new AcceptedArtifactCompletionError(
+          "transient",
+          "github_or_tracker_failure",
+          `Accepted-artifact git command timed out: git ${args.join(" ")}`,
+        ),
+      );
     }, timeoutMs);
     child.stdout.on("data", (chunk: Buffer) => {
       stdout += chunk.toString("utf8").slice(0, 128_000);

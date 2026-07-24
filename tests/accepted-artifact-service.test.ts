@@ -38,8 +38,29 @@ describe("AcceptedArtifactService", () => {
     const sourceIssue = issue({
       state: "In Review",
       branchName: "symphony/TEST-1",
+      blocks: [
+        { id: "issue-2", identifier: "TEST-2", state: "Todo" },
+      ],
       description: agentEligibleIssueContract({
         issueContractDelivery: { mode: "accepted_artifact", artifact: "expected_red_tests" },
+      }),
+    });
+    const targetIssue = issue({
+      id: "issue-2",
+      identifier: "TEST-2",
+      blockedBy: [
+        { id: sourceIssue.id, identifier: sourceIssue.identifier, state: sourceIssue.state },
+      ],
+      description: agentEligibleIssueContract({
+        issueContractRelationships: {
+          blocks: [],
+          blockedBy: ["TEST-1"],
+          succession: {
+            id: "test-expected-red-implementation",
+            purpose: "expected_red_implementation",
+            succeeds: { issue: "TEST-1" },
+          },
+        },
       }),
     });
     const contract = parseIssueContractFromDescription(sourceIssue.description);
@@ -146,6 +167,11 @@ describe("AcceptedArtifactService", () => {
       lifecycleStore,
       writebackOutbox: outbox,
       client,
+      resolveIssuesByIds: async (ids) =>
+        [sourceIssue, targetIssue].filter(
+          (candidate) =>
+            ids.includes(candidate.id) || ids.includes(candidate.identifier),
+        ),
       checkpointBuilder: {
         build: async (input) => {
           expect(input).toMatchObject({
@@ -167,6 +193,7 @@ describe("AcceptedArtifactService", () => {
       completionReportId: report.id,
       reviewVerdictId: verdict.id,
       reviewFeedbackId: feedback.id,
+      successionId: "test-expected-red-implementation",
       sourceBaseHeadSha: BASE_SHA,
       sourceHeadSha: HEAD_SHA,
       fileManifest: [{ path: "tests/feature.test.ts", status: "added", blobSha: BLOB_SHA }],
@@ -180,12 +207,42 @@ describe("AcceptedArtifactService", () => {
         expect.objectContaining({ acceptedArtifactId: completed.artifact.id, fromStates: ["In Review"], toState: "Done" }),
       ]),
     );
+    await expect(lifecycleStore.get(sourceIssue.id)).resolves.toMatchObject({
+      succession: {
+        id: "test-expected-red-implementation",
+        role: "succeeded",
+        status: "checkpointed",
+        artifactId: completed.artifact.id,
+        workspaceSeedId: null,
+      },
+    });
+    await expect(lifecycleStore.get(targetIssue.id)).resolves.toMatchObject({
+      succession: {
+        id: "test-expected-red-implementation",
+        role: "successor",
+        status: "checkpointed",
+        artifactId: completed.artifact.id,
+        workspaceSeedId: null,
+      },
+    });
 
     const replayed = await service.completeAcceptedArtifact({ issue: sourceIssue, workspacePath: null });
     expect(replayed.replayed).toBe(true);
     expect(replayed.artifact.id).toBe(completed.artifact.id);
     expect(client.closeCalls).toHaveLength(1);
     expect(await outbox.list()).toHaveLength(2);
+    await expect(lifecycleStore.get(sourceIssue.id)).resolves.toMatchObject({
+      succession: {
+        status: "checkpointed",
+        artifactId: completed.artifact.id,
+      },
+    });
+    await expect(lifecycleStore.get(targetIssue.id)).resolves.toMatchObject({
+      succession: {
+        status: "checkpointed",
+        artifactId: completed.artifact.id,
+      },
+    });
 
     client.setBranchFailure(new SymphonyError("not_found", "GitHub branch head lookup returned HTTP 404"));
     await expect(service.completeAcceptedArtifact({ issue: sourceIssue, workspacePath: null })).rejects.toMatchObject({
@@ -287,11 +344,25 @@ describe("AcceptedArtifactService", () => {
       lifecycleStore,
       writebackOutbox: new FileWritebackOutboxStore(config.workspace.stateDir),
       client: new FakeAcceptedArtifactGitHubClient(),
+      resolveIssuesByIds: async (ids) =>
+        ids.includes(changedIssue.id) ||
+        ids.includes(changedIssue.identifier)
+          ? [changedIssue]
+          : [],
     });
 
-    await expect(service.completeAcceptedArtifact({ issue: changedIssue, workspacePath: "/tmp/source" })).rejects.toThrow(
-      /no longer declares expected-red accepted-artifact delivery/,
-    );
+    await expect(
+      service.completeAcceptedArtifact({
+        issue: changedIssue,
+        workspacePath: "/tmp/source",
+      }),
+    ).rejects.toMatchObject({
+      category: "contract_or_head_drift",
+      reason: "contract_or_review_drift",
+      message: expect.stringMatching(
+        /no longer declares expected-red accepted-artifact delivery/,
+      ),
+    });
   });
 });
 

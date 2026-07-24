@@ -22,9 +22,11 @@ import {
   type ExpectedRedArtifactEvidence,
   type IssueAcceptedArtifactRecord,
   type IssueMergeGateState,
+  type IssueSuccessionRecord,
   type IssueWorkspaceSeedRecord,
 } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
+import type { Issue } from "../src/core/types.js";
 import { FileWritebackOutboxStore, type NewWritebackOperation, type WritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
 import { agentEligibleIssueContract, issue, testConfig } from "./helpers.js";
 import type { OperatorApprovalRecord } from "../src/core/approval/OperatorApprovalService.js";
@@ -507,7 +509,11 @@ describe("CompletionReportService", () => {
     const { service, lifecycleStore, outbox } = fixture();
     const replayContext = contextWithWorkspace({
       workspacePath,
-      issue: issue({ state: "In Progress", branchName: "main" }),
+      issue: issue({
+        state: "In Progress",
+        branchName: "main",
+        description: mergeIssueContract(),
+      }),
       workspace: workspaceForGitFixture(workspacePath),
     });
 
@@ -529,7 +535,11 @@ describe("CompletionReportService", () => {
     const { service, lifecycleStore, outbox } = fixture();
     const replayContext = contextWithWorkspace({
       workspacePath,
-      issue: issue({ state: "In Progress", branchName: "main" }),
+      issue: issue({
+        state: "In Progress",
+        branchName: "main",
+        description: mergeIssueContract(),
+      }),
       workspace: workspaceForGitFixture(workspacePath),
     });
     const original = report({ branchName: "main" });
@@ -562,7 +572,11 @@ describe("CompletionReportService", () => {
     const { service, lifecycleStore, outbox } = fixture();
     const replayContext = contextWithWorkspace({
       workspacePath,
-      issue: issue({ state: "In Progress", branchName: "main" }),
+      issue: issue({
+        state: "In Progress",
+        branchName: "main",
+        description: mergeIssueContract(),
+      }),
       workspace: workspaceForGitFixture(workspacePath),
     });
     const input = report({ branchName: "main" });
@@ -652,7 +666,11 @@ describe("CompletionReportService", () => {
     const workspaceContext = () =>
       contextWithWorkspace({
         workspacePath,
-        issue: issue({ state: "In Progress", branchName: "main" }),
+        issue: issue({
+          state: "In Progress",
+          branchName: "main",
+          description: mergeIssueContract(),
+        }),
         workspace: {
           path: workspacePath,
           workspaceKey: "TEST-1",
@@ -693,12 +711,16 @@ describe("CompletionReportService", () => {
   });
 
   it("requires structured expected-red evidence for accepted-artifact delivery", async () => {
-    const { service } = fixture();
+    const acceptedSource = acceptedArtifactIssue();
+    const acceptedSuccessor = acceptedArtifactSuccessorIssue();
+    const { service } = fixture({
+      resolveIssuesByIds: issueResolver(acceptedSource, acceptedSuccessor),
+    });
 
     await expect(
       service.submitCompletionReport(
         report(),
-        context({ issue: acceptedArtifactIssue() }),
+        context({ issue: acceptedSource }),
       ),
     ).rejects.toMatchObject({
       code: "invalid_request",
@@ -730,7 +752,11 @@ describe("CompletionReportService", () => {
   });
 
   it("requires every expected-red test file to be declared in changedFiles", async () => {
-    const { service } = fixture();
+    const acceptedSource = acceptedArtifactIssue();
+    const acceptedSuccessor = acceptedArtifactSuccessorIssue();
+    const { service } = fixture({
+      resolveIssuesByIds: issueResolver(acceptedSource, acceptedSuccessor),
+    });
 
     await expect(
       service.submitCompletionReport(
@@ -738,7 +764,7 @@ describe("CompletionReportService", () => {
           artifactEvidence: expectedRedEvidence(),
           changedFiles: ["src/unrelated.ts"],
         }),
-        context({ issue: acceptedArtifactIssue() }),
+        context({ issue: acceptedSource }),
       ),
     ).rejects.toMatchObject({
       code: "invalid_request",
@@ -748,6 +774,8 @@ describe("CompletionReportService", () => {
   });
 
   it("publishes accepted expected-red artifacts as draft PRs without generic PR handoff or green checks", async () => {
+    const acceptedSource = acceptedArtifactIssue();
+    const acceptedSuccessor = acceptedArtifactSuccessorIssue();
     const publisher = new FakePublisher(
       {
         action: "created",
@@ -764,6 +792,12 @@ describe("CompletionReportService", () => {
     );
     const { service, lifecycleStore, runStore } = fixture({
       publisher,
+      resolveIssuesByIds: async (ids) =>
+        [acceptedSource, acceptedSuccessor].filter(
+          (candidate) =>
+            ids.includes(candidate.id) ||
+            ids.includes(candidate.identifier),
+        ),
       configure(config) {
         config.github.prHandoff.enabled = false;
         config.github.prHandoff.requiredChecks = ["Typecheck and test"];
@@ -778,7 +812,7 @@ describe("CompletionReportService", () => {
         artifactEvidence: expectedRedEvidence(),
         changedFiles: ["tests/new-behavior.test.ts"],
       }),
-      contextWithWorkspace({ issue: acceptedArtifactIssue() }),
+      contextWithWorkspace({ issue: acceptedSource }),
     );
 
     expect(publisher.inputs).toHaveLength(1);
@@ -793,7 +827,7 @@ describe("CompletionReportService", () => {
         draft: true,
       },
       contractSnapshot: {
-        schemaVersion: 1,
+        schemaVersion: 2,
         contractVersion: "2026-07-14.accepted-artifact",
         fingerprint: expect.any(String),
         delivery: { mode: "accepted_artifact", artifact: "expected_red_tests" },
@@ -821,6 +855,8 @@ describe("CompletionReportService", () => {
   });
 
   it("rejects an accepted expected-red artifact when the verified PR is not draft", async () => {
+    const acceptedSource = acceptedArtifactIssue();
+    const acceptedSuccessor = acceptedArtifactSuccessorIssue();
     const publisher = new FakePublisher({
       action: "created",
       url: "https://github.com/acme/symphony/pull/42",
@@ -831,7 +867,15 @@ describe("CompletionReportService", () => {
       evidenceCursor: "idem-1",
       draft: false,
     });
-    const { service, lifecycleStore, outbox } = fixture({ publisher });
+    const { service, lifecycleStore, outbox } = fixture({
+      publisher,
+      resolveIssuesByIds: async (ids) =>
+        [acceptedSource, acceptedSuccessor].filter(
+          (candidate) =>
+            ids.includes(candidate.id) ||
+            ids.includes(candidate.identifier),
+        ),
+    });
 
     await expect(
       service.submitCompletionReport(
@@ -839,7 +883,7 @@ describe("CompletionReportService", () => {
           artifactEvidence: expectedRedEvidence(),
           changedFiles: ["tests/new-behavior.test.ts"],
         }),
-        contextWithWorkspace({ issue: acceptedArtifactIssue() }),
+        contextWithWorkspace({ issue: acceptedSource }),
       ),
     ).rejects.toMatchObject({
       code: "invalid_request",
@@ -851,16 +895,68 @@ describe("CompletionReportService", () => {
     expect(await outbox.list()).toHaveLength(0);
   });
 
+  it("rejects expected-red completion when the declared successor is not reciprocal", async () => {
+    const acceptedSource = acceptedArtifactIssue();
+    const { service, lifecycleStore } = fixture({
+      resolveIssuesByIds: issueResolver(acceptedSource),
+    });
+
+    await expect(
+      service.submitCompletionReport(
+        report({
+          artifactEvidence: expectedRedEvidence(),
+          changedFiles: ["tests/new-behavior.test.ts"],
+        }),
+        contextWithWorkspace({ issue: acceptedSource }),
+      ),
+    ).rejects.toMatchObject({
+      code: "conflict",
+      message: expect.stringContaining(
+        "Accepted expected-red artifact succession is invalid",
+      ),
+    });
+    await expect(lifecycleStore.get("issue-1")).resolves.toBeNull();
+  });
+
+  it("rejects a declared implementation successor without its durable prepared seed", async () => {
+    const source = sourceArtifactIssue();
+    const target = liveSeededTarget(source);
+    const { service, lifecycleStore } = fixture({
+      resolveIssuesByIds: async (ids) =>
+        [source, target].filter(
+          (candidate) =>
+            ids.includes(candidate.id) ||
+            ids.includes(candidate.identifier),
+        ),
+    });
+
+    await expect(
+      service.submitCompletionReport(
+        report(),
+        context({ issue: target }),
+      ),
+    ).rejects.toMatchObject({
+      code: "conflict",
+      message:
+        "Declared implementation successor completion requires the matching durable prepared accepted-artifact workspace seed",
+    });
+    await expect(lifecycleStore.get(target.id)).resolves.toBeNull();
+  });
+
   it("requires seeded implementations to prove the completed source artifact now passes", async () => {
-    const { service, lifecycleStore } = fixture();
-    const targetIssue = issue({ state: "In Progress", branchName: "symphony/TEST-1" });
-    await lifecycleStore.ensureIssue(sourceArtifactIssue(), {
+    const source = sourceArtifactIssue();
+    const targetIssue = liveSeededTarget(source);
+    const { service, lifecycleStore } = fixture({
+      resolveIssuesByIds: issueResolver(source, targetIssue),
+    });
+    await lifecycleStore.ensureIssue(source, {
       phase: "terminal",
       acceptedArtifact: completedAcceptedArtifact(),
     });
     await lifecycleStore.ensureIssue(targetIssue, {
       phase: "implementation",
       workspaceSeed: preparedWorkspaceSeed(),
+      succession: targetSuccessionRecord(),
     });
     const targetContext = context({ issue: targetIssue });
 
@@ -911,21 +1007,74 @@ describe("CompletionReportService", () => {
     expect(result.report.dependencyArtifactResult).toEqual(passingDependencyArtifactResult());
     await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
       phase: "review",
+      succession: {
+        id: "tdd-test-0-implementation",
+        role: "successor",
+        status: "verified_green",
+        artifactId: completedAcceptedArtifact().id,
+        workspaceSeedId: preparedWorkspaceSeed().id,
+      },
       completionReports: [
         { dependencyArtifactResult: passingDependencyArtifactResult() },
       ],
+    });
+    await expect(lifecycleStore.get(source.id)).resolves.toMatchObject({
+      succession: {
+        id: "tdd-test-0-implementation",
+        role: "succeeded",
+        status: "verified_green",
+        artifactId: completedAcceptedArtifact().id,
+        workspaceSeedId: preparedWorkspaceSeed().id,
+      },
+    });
+
+    const verifiedTarget = await lifecycleStore.get(targetIssue.id);
+    const verifiedSource = await lifecycleStore.get(source.id);
+    if (!verifiedTarget?.succession || !verifiedSource?.succession) {
+      throw new Error("Expected verified succession lifecycle records");
+    }
+    await Promise.all([
+      lifecycleStore.updateIssue(targetIssue, {
+        succession: {
+          ...verifiedTarget.succession,
+          status: "seeded",
+        },
+      }),
+      lifecycleStore.updateIssue(source, {
+        succession: {
+          ...verifiedSource.succession,
+          status: "checkpointed",
+        },
+      }),
+    ]);
+
+    const replay = await service.submitCompletionReport(
+      report({ dependencyArtifactResult: passingDependencyArtifactResult() }),
+      targetContext,
+    );
+
+    expect(replay.accepted).toBe(true);
+    await expect(lifecycleStore.get(targetIssue.id)).resolves.toMatchObject({
+      completionReports: [expect.objectContaining({ id: result.report.id })],
+    });
+    await expect(lifecycleStore.get(targetIssue.id)).resolves.toMatchObject({
+      succession: { status: "verified_green" },
+    });
+    await expect(lifecycleStore.get(source.id)).resolves.toMatchObject({
+      succession: { status: "verified_green" },
     });
   });
 
   it("verifies the inherited artifact manifest before accepting seeded completion", async () => {
     const verifierInputs: DependencyArtifactManifestVerificationInput[] = [];
+    const source = sourceArtifactIssue();
+    const target = liveSeededTarget(source);
     const { service, lifecycleStore } = fixture({
       dependencyArtifactManifestVerifier: async (input) => {
         verifierInputs.push(input);
       },
+      resolveIssuesByIds: issueResolver(source, target),
     });
-    const source = sourceArtifactIssue();
-    const target = liveSeededTarget(source);
     const artifact = completedAcceptedArtifact();
     await lifecycleStore.ensureIssue(source, {
       phase: "terminal",
@@ -934,6 +1083,7 @@ describe("CompletionReportService", () => {
     await lifecycleStore.ensureIssue(target, {
       phase: "implementation",
       workspaceSeed: preparedWorkspaceSeed(),
+      succession: targetSuccessionRecord(source, target),
     });
 
     await service.submitCompletionReport(
@@ -1013,9 +1163,12 @@ describe("CompletionReportService", () => {
   });
 
   it("rejects dependency completion evidence for a superseded accepted artifact", async () => {
-    const { service, lifecycleStore } = fixture();
-    const targetIssue = issue({ state: "In Progress", branchName: "symphony/TEST-1" });
-    await lifecycleStore.ensureIssue(sourceArtifactIssue(), {
+    const source = sourceArtifactIssue();
+    const targetIssue = liveSeededTarget(source);
+    const { service, lifecycleStore } = fixture({
+      resolveIssuesByIds: issueResolver(source, targetIssue),
+    });
+    await lifecycleStore.ensureIssue(source, {
       phase: "terminal",
       acceptedArtifact: {
         ...completedAcceptedArtifact(),
@@ -1027,6 +1180,7 @@ describe("CompletionReportService", () => {
     await lifecycleStore.ensureIssue(targetIssue, {
       phase: "implementation",
       workspaceSeed: preparedWorkspaceSeed(),
+      succession: targetSuccessionRecord(),
     });
 
     await expect(
@@ -1056,6 +1210,7 @@ describe("CompletionReportService", () => {
     await lifecycleStore.ensureIssue(liveTarget, {
       phase: "implementation",
       workspaceSeed: preparedWorkspaceSeed(),
+      succession: targetSuccessionRecord(reopenedSource, liveTarget),
     });
 
     await expect(
@@ -1076,8 +1231,16 @@ describe("CompletionReportService", () => {
   });
 
   it("rejects chaining an accepted-artifact source onto another accepted artifact", async () => {
-    const { service, lifecycleStore } = fixture();
     const targetIssue = acceptedArtifactIssue();
+    const acceptedSuccessor = acceptedArtifactSuccessorIssue();
+    const { service, lifecycleStore } = fixture({
+      resolveIssuesByIds: async (ids) =>
+        [targetIssue, acceptedSuccessor].filter(
+          (candidate) =>
+            ids.includes(candidate.id) ||
+            ids.includes(candidate.identifier),
+        ),
+    });
     await lifecycleStore.ensureIssue(sourceArtifactIssue(), {
       phase: "terminal",
       acceptedArtifact: completedAcceptedArtifact(),
@@ -1085,6 +1248,7 @@ describe("CompletionReportService", () => {
     await lifecycleStore.ensureIssue(targetIssue, {
       phase: "implementation",
       workspaceSeed: preparedWorkspaceSeed(),
+      succession: targetSuccessionRecord(),
     });
 
     await expect(
@@ -1104,11 +1268,17 @@ describe("CompletionReportService", () => {
   });
 
   it("rejects idempotent completion replay after the Issue Contract fingerprint changes", async () => {
-    const { service, lifecycleStore } = fixture();
     const firstIssue = issue({
       state: "In Progress",
       branchName: "symphony/TEST-1",
       description: mergeIssueContract("2026-07-14.first"),
+    });
+    let liveIssue = firstIssue;
+    const { service, lifecycleStore } = fixture({
+      resolveIssuesByIds: async (ids) =>
+        ids.includes(liveIssue.id) || ids.includes(liveIssue.identifier)
+          ? [liveIssue]
+          : [],
     });
     const first = await service.submitCompletionReport(report(), context({ issue: firstIssue }));
     const changedIssue = {
@@ -1116,6 +1286,7 @@ describe("CompletionReportService", () => {
       description: mergeIssueContract("2026-07-14.changed"),
       updatedAt: "2026-07-14T01:00:00Z",
     };
+    liveIssue = changedIssue;
 
     await expect(
       service.submitCompletionReport(report(), context({ issue: changedIssue })),
@@ -1128,6 +1299,36 @@ describe("CompletionReportService", () => {
       },
     });
     expect((await lifecycleStore.get("issue-1"))?.completionReports).toHaveLength(1);
+  });
+
+  it("rejects a completion report when Linear relationships drift after dispatch", async () => {
+    const dispatched = context().issue;
+    const liveIssue = {
+      ...dispatched,
+      blockedBy: [
+        {
+          id: "new-blocker",
+          identifier: "TEST-NEW-BLOCKER",
+          state: "Todo",
+        },
+      ],
+    };
+    const { service, lifecycleStore } = fixture({
+      resolveIssuesByIds: issueResolver(liveIssue),
+    });
+
+    await expect(
+      service.submitCompletionReport(
+        report(),
+        context({ issue: dispatched }),
+      ),
+    ).rejects.toMatchObject({
+      code: "conflict",
+      message: expect.stringContaining(
+        "exact schema-v2 Issue Contract relationship graph",
+      ),
+    });
+    await expect(lifecycleStore.get(dispatched.id)).resolves.toBeNull();
   });
 
   it("publishes a new service-owned PR before accepting a completion report", async () => {
@@ -1237,7 +1438,11 @@ describe("CompletionReportService", () => {
     await startRun(runStore);
     const replayContext = contextWithWorkspace({
       workspacePath,
-      issue: issue({ state: "In Progress", branchName: "main" }),
+      issue: issue({
+        state: "In Progress",
+        branchName: "main",
+        description: mergeIssueContract(),
+      }),
       workspace: workspaceForGitFixture(workspacePath),
     });
 
@@ -1440,7 +1645,12 @@ describe("CompletionReportService", () => {
     config.reviewLoop.reviewStates = ["In Review"];
     const lifecycleStore = new FileIssueLifecycleStore(root);
     const failingOutbox = new FailingOutbox();
-    const failingService = new CompletionReportService({ config, lifecycleStore, writebackOutbox: failingOutbox });
+    const failingService = new CompletionReportService({
+      config,
+      lifecycleStore,
+      writebackOutbox: failingOutbox,
+      resolveIssuesByIds: resolveDefaultCompletionIssue,
+    });
 
     await expect(failingService.submitCompletionReport(report(), context())).rejects.toThrow("enqueue failed");
 
@@ -1451,12 +1661,78 @@ describe("CompletionReportService", () => {
     expect(failingOutbox.attempted).toBeGreaterThan(0);
 
     const outbox = new FileWritebackOutboxStore(root);
-    const retryService = new CompletionReportService({ config, lifecycleStore, writebackOutbox: outbox });
+    const retryService = new CompletionReportService({
+      config,
+      lifecycleStore,
+      writebackOutbox: outbox,
+      resolveIssuesByIds: resolveDefaultCompletionIssue,
+    });
     const retry = await retryService.submitCompletionReport(report(), context());
 
     expect(retry.replayed).toBe(false);
     expect(retry.writebackOperations).toHaveLength(2);
     expect((await lifecycleStore.get("issue-1"))?.completionReports).toHaveLength(1);
+  });
+
+  it("does not advance seeded succession before the completion report is durably accepted", async () => {
+    const config = testConfig(root);
+    config.writeback.enabled = true;
+    config.writeback.dispatchState = "In Progress";
+    config.reviewLoop.reviewStates = ["In Review"];
+    const lifecycleStore = new FileIssueLifecycleStore(root);
+    const failingOutbox = new FailingOutbox();
+    const source = sourceArtifactIssue();
+    const target = liveSeededTarget(source);
+    const targetSuccession = {
+      ...targetSuccessionRecord(source, target),
+      status: "seeded" as const,
+    };
+    await lifecycleStore.ensureIssue(source, {
+      phase: "terminal",
+      acceptedArtifact: completedAcceptedArtifact(),
+      succession: {
+        ...targetSuccession,
+        role: "succeeded",
+        status: "checkpointed",
+        workspaceSeedId: null,
+      },
+    });
+    await lifecycleStore.ensureIssue(target, {
+      phase: "implementation",
+      workspaceSeed: preparedWorkspaceSeed(),
+      succession: targetSuccession,
+    });
+    const service = new CompletionReportService({
+      config,
+      lifecycleStore,
+      writebackOutbox: failingOutbox,
+      resolveIssuesByIds: issueResolver(source, target),
+      dependencyArtifactManifestVerifier: async () => undefined,
+    });
+
+    await expect(
+      service.submitCompletionReport(
+        report({
+          dependencyArtifactResult: passingDependencyArtifactResult(),
+        }),
+        context({ issue: target }),
+      ),
+    ).rejects.toThrow("enqueue failed");
+
+    await expect(lifecycleStore.get(source.id)).resolves.toMatchObject({
+      succession: {
+        role: "succeeded",
+        status: "checkpointed",
+      },
+    });
+    await expect(lifecycleStore.get(target.id)).resolves.toMatchObject({
+      phase: "implementation",
+      succession: {
+        role: "successor",
+        status: "seeded",
+      },
+      completionReports: [],
+    });
   });
 
   it("fails closed when a pre-lifecycle retry finds different queued disposition intent", async () => {
@@ -1480,6 +1756,7 @@ describe("CompletionReportService", () => {
       config,
       lifecycleStore,
       writebackOutbox: outbox,
+      resolveIssuesByIds: resolveDefaultCompletionIssue,
     });
 
     await expect(
@@ -1539,6 +1816,7 @@ describe("CompletionReportService", () => {
       config,
       lifecycleStore,
       writebackOutbox: outbox,
+      resolveIssuesByIds: resolveDefaultCompletionIssue,
       writebackProcessor,
       runStore,
       operatorApproval: {
@@ -1569,10 +1847,17 @@ describe("CompletionReportService", () => {
 
   it("rejects reports outside the implementation state and phase", async () => {
     const { service, lifecycleStore } = fixture();
-    await lifecycleStore.ensureIssue(issue({ state: "In Review" }), { phase: "review" });
+    const reviewIssue = issue({
+      state: "In Review",
+      description: mergeIssueContract(),
+    });
+    await lifecycleStore.ensureIssue(reviewIssue, { phase: "review" });
 
     await expect(
-      service.submitCompletionReport(report(), context({ issue: issue({ state: "In Review" }), phase: "review" })),
+      service.submitCompletionReport(
+        report(),
+        context({ issue: reviewIssue, phase: "review" }),
+      ),
     ).rejects.toMatchObject({
       code: "invalid_request",
     });
@@ -1590,7 +1875,13 @@ describe("CompletionReportService", () => {
   });
 
   it("rejects ordinary completion reports from the configured merge conflicts state", async () => {
+    const conflictIssue = issue({
+      state: "Approved with Conflicts",
+      branchName: "symphony/TEST-1",
+      description: mergeIssueContract(),
+    });
     const { service, lifecycleStore, outbox } = fixture({
+      resolveIssuesByIds: issueResolver(conflictIssue),
       configure(config) {
         config.mergePolicy.mode = "gated";
         config.mergePolicy.conflictsState = "Approved with Conflicts";
@@ -1598,28 +1889,35 @@ describe("CompletionReportService", () => {
       },
     });
 
-    await lifecycleStore.ensureIssue(issue({ state: "Approved with Conflicts" }), {
+    await lifecycleStore.ensureIssue(conflictIssue, {
       phase: "merge_conflict_resolution",
     });
 
     await expect(
       service.submitCompletionReport(
         report(),
-        context({ issue: issue({ state: "Approved with Conflicts", branchName: "symphony/TEST-1" }) }),
+        context({ issue: conflictIssue }),
       ),
     ).rejects.toMatchObject({ code: "invalid_request" });
     expect(await outbox.list()).toHaveLength(0);
   });
 
   it("accepts a manual completion report with the issue state gate explicitly ignored", async () => {
-    const { service, lifecycleStore, outbox } = fixture();
+    const reviewIssue = issue({
+      state: "In Review",
+      branchName: "symphony/TEST-1",
+      description: mergeIssueContract(),
+    });
+    const { service, lifecycleStore, outbox } = fixture({
+      resolveIssuesByIds: issueResolver(reviewIssue),
+    });
     const finalDisposition =
       "Manual completion accepted outside the normal state gate.\n\nThe complete worker response remains visible without truncation.";
 
     const result = await service.submitCompletionReport(
       report({ finalDisposition }),
       context({
-        issue: issue({ state: "In Review", branchName: "symphony/TEST-1" }),
+        issue: reviewIssue,
         ignoreStateGate: true,
       }),
     );
@@ -1689,7 +1987,8 @@ describe("CompletionReportService", () => {
     const runStore = new FileRunTranscriptStore(root);
     const outbox = new FileWritebackOutboxStore(root);
     const defaultSource = sourceArtifactIssue();
-    const defaultTarget = liveSeededTarget(defaultSource);
+    const defaultIssue = context().issue;
+    const acceptedArtifactTarget = acceptedArtifactSuccessorIssue();
     const service = new CompletionReportService({
       config,
       lifecycleStore,
@@ -1700,8 +1999,10 @@ describe("CompletionReportService", () => {
       resolveIssuesByIds:
         options.resolveIssuesByIds ??
         (async (ids) =>
-          [defaultTarget, defaultSource].filter((candidate) =>
-            ids.includes(candidate.id),
+          [defaultIssue, defaultSource, acceptedArtifactTarget].filter(
+            (candidate) =>
+              ids.includes(candidate.id) ||
+              ids.includes(candidate.identifier),
           )),
       dependencyArtifactManifestVerifier:
         options.dependencyArtifactManifestVerifier ?? (async () => undefined),
@@ -1736,7 +2037,11 @@ function report(overrides: Partial<CompletionReportInput> = {}): CompletionRepor
 
 function context(overrides: Partial<CompletionReportActiveContext> = {}): CompletionReportActiveContext {
   return {
-    issue: issue({ state: "In Progress", branchName: "symphony/TEST-1" }),
+    issue: issue({
+      state: "In Progress",
+      branchName: "symphony/TEST-1",
+      description: mergeIssueContract(),
+    }),
     activeRunId: "run-1",
     role: "worker",
     token: "worker-token",
@@ -1746,6 +2051,23 @@ function context(overrides: Partial<CompletionReportActiveContext> = {}): Comple
     phase: "implementation",
     ...overrides,
   };
+}
+
+async function resolveDefaultCompletionIssue(ids: string[]): Promise<Issue[]> {
+  const candidate = context().issue;
+  return ids.includes(candidate.id) || ids.includes(candidate.identifier)
+    ? [candidate]
+    : [];
+}
+
+function issueResolver(
+  ...issues: Issue[]
+): (ids: string[]) => Promise<Issue[]> {
+  return async (ids) =>
+    issues.filter(
+      (candidate) =>
+        ids.includes(candidate.id) || ids.includes(candidate.identifier),
+    );
 }
 
 function contextWithWorkspace(overrides: Partial<CompletionReportActiveContext> = {}): CompletionReportActiveContext {
@@ -1768,9 +2090,51 @@ function acceptedArtifactIssue() {
   return issue({
     state: "In Progress",
     branchName: "symphony/TEST-1",
+    blocks: [
+      {
+        id: "accepted-successor-2",
+        identifier: "TEST-2",
+        state: "Todo",
+      },
+    ],
     description: agentEligibleIssueContract({
       issueContractContractVersion: "2026-07-14.accepted-artifact",
       issueContractDelivery: { mode: "accepted_artifact", artifact: "expected_red_tests" },
+      issueContractRelationships: {
+        blocks: ["TEST-2"],
+        blockedBy: [],
+        succession: {
+          id: "test-expected-red-implementation",
+          purpose: "expected_red_implementation",
+          successor: { issue: "TEST-2" },
+        },
+      },
+    }),
+  });
+}
+
+function acceptedArtifactSuccessorIssue() {
+  return issue({
+    id: "accepted-successor-2",
+    identifier: "TEST-2",
+    state: "Todo",
+    blockedBy: [
+      {
+        id: "issue-1",
+        identifier: "TEST-1",
+        state: "In Progress",
+      },
+    ],
+    description: agentEligibleIssueContract({
+      issueContractRelationships: {
+        blocks: [],
+        blockedBy: ["TEST-1"],
+        succession: {
+          id: "test-expected-red-implementation",
+          purpose: "expected_red_implementation",
+          succeeds: { issue: "TEST-1" },
+        },
+      },
     }),
   });
 }
@@ -1802,11 +2166,21 @@ function sourceArtifactIssue(state = "Done") {
     identifier: "TEST-0",
     state,
     branchName: "symphony/TEST-0",
+    blocks: [{ id: "issue-1", identifier: "TEST-1", state: "In Progress" }],
     description: agentEligibleIssueContract({
       issueContractContractVersion: "2026-07-14.source-artifact",
       issueContractDelivery: {
         mode: "accepted_artifact",
         artifact: "expected_red_tests",
+      },
+      issueContractRelationships: {
+        blocks: ["TEST-1"],
+        blockedBy: [],
+        succession: {
+          id: "tdd-test-0-implementation",
+          purpose: "expected_red_implementation",
+          successor: { issue: "TEST-1" },
+        },
       },
     }),
   });
@@ -1823,6 +2197,17 @@ function liveSeededTarget(source = sourceArtifactIssue()) {
         state: source.state,
       },
     ],
+    description: agentEligibleIssueContract({
+      issueContractRelationships: {
+        blocks: [],
+        blockedBy: ["TEST-0"],
+        succession: {
+          id: "tdd-test-0-implementation",
+          purpose: "expected_red_implementation",
+          succeeds: { issue: "TEST-0" },
+        },
+      },
+    }),
   });
 }
 
@@ -1832,6 +2217,7 @@ function completedAcceptedArtifact(): IssueAcceptedArtifactRecord {
   return {
     version: 1,
     id: "accepted-artifact:source-issue-1:abc123",
+    successionId: "tdd-test-0-implementation",
     kind: "expected_red_tests",
     status: "completed_unmerged",
     sourceIssueId: "source-issue-1",
@@ -1876,6 +2262,7 @@ function preparedWorkspaceSeed(): IssueWorkspaceSeedRecord {
     kind: "accepted_artifact",
     status: "prepared",
     artifactId: completedAcceptedArtifact().id,
+    successionId: "tdd-test-0-implementation",
     sourceIssueId: "source-issue-1",
     sourceIssueIdentifier: "TEST-0",
     repositoryFingerprint: "repo-fingerprint",
@@ -1890,6 +2277,42 @@ function preparedWorkspaceSeed(): IssueWorkspaceSeedRecord {
     plannedAt: "2026-07-14T00:01:00.000Z",
     preparedAt: "2026-07-14T00:01:01.000Z",
     failureReason: null,
+  };
+}
+
+function targetSuccessionRecord(
+  source = sourceArtifactIssue(),
+  target = liveSeededTarget(source),
+): IssueSuccessionRecord {
+  const sourceContract = parseIssueContract(source.description);
+  const targetContract = parseIssueContract(target.description);
+  if (!sourceContract.valid || !targetContract.valid) {
+    throw new Error("Succession test contracts are invalid");
+  }
+  return {
+    version: 1,
+    id: "tdd-test-0-implementation",
+    purpose: "expected_red_implementation",
+    role: "successor",
+    succeededIssue: {
+      id: source.id,
+      identifier: source.identifier,
+      contractFingerprint: sourceContract.fingerprint,
+    },
+    successorIssue: {
+      id: target.id,
+      identifier: target.identifier,
+      contractFingerprint: targetContract.fingerprint,
+    },
+    linearBlockVerified: true,
+    status: "checkpointed",
+    artifactId: completedAcceptedArtifact().id,
+    workspaceSeedId: preparedWorkspaceSeed().id,
+    mergeCommitSha: null,
+    validationErrors: [],
+    declaredAt: "2026-07-14T00:00:00.000Z",
+    agreedAt: "2026-07-14T00:00:00.000Z",
+    updatedAt: "2026-07-14T00:01:00.000Z",
   };
 }
 

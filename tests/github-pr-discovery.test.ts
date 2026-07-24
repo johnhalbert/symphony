@@ -13,7 +13,7 @@ import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 import { FileWritebackOutboxStore, WritebackProcessor } from "../src/core/writeback/WritebackOutbox.js";
 import { GitHubPullRequestClient } from "../src/integrations/github/GitHubPullRequestClient.js";
 import type { Issue } from "../src/core/types.js";
-import { issue, testConfig } from "./helpers.js";
+import { agentEligibleIssueContract, issue, testConfig } from "./helpers.js";
 
 function issuesInStates(issues: Issue[], states: string[]): Issue[] {
   const wanted = new Set(states.map((state) => state.toLowerCase()));
@@ -108,7 +108,10 @@ describe("GitHub pull request discovery", () => {
 
   it("links a discovered PR to lifecycle and run records idempotently", async () => {
     const config = testConfig(root);
-    const candidate = issue({ branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      description: agentEligibleIssueContract(),
+      branchName: "symphony/TEST-1",
+    });
     let refreshes = 0;
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
@@ -179,7 +182,12 @@ describe("GitHub pull request discovery", () => {
     config.github.prHandoff.enabled = true;
     config.github.prHandoff.targetState = "Human Review";
     config.github.prHandoff.requiredChecks = ["Typecheck and test"];
-    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      description: agentEligibleIssueContract(),
+      state: "Todo",
+      labels: ["dogfood-ready"],
+      branchName: "symphony/TEST-1",
+    });
     let currentState = "Todo";
     let stateFetches = 0;
     const tracker: TrackerClient = {
@@ -249,7 +257,12 @@ describe("GitHub pull request discovery", () => {
     config.tracker.handoffStates = ["Human Review"];
     config.github.prHandoff.enabled = true;
     config.github.prHandoff.targetState = "Human Review";
-    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      description: agentEligibleIssueContract(),
+      state: "Todo",
+      labels: ["dogfood-ready"],
+      branchName: "symphony/TEST-1",
+    });
     let currentState = "Todo";
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {

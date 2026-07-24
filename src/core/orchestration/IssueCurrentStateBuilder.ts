@@ -23,11 +23,16 @@ import {
   latestIssuePostMortemReportForFingerprint,
 } from "../IssuePostMortemService.js";
 import {
+  buildDeclaredIssueSuccessionRecord,
+  buildIssueRelationshipState,
+} from "../IssueRelationshipService.js";
+import {
   isSupersededLifecycleRecord,
   latestCurrentApprovalPassVerdict,
   latestCurrentCompletionReport,
   phaseForIssueState,
   type IssueAcceptedArtifactRecord,
+  type IssueAcceptedArtifactValidationFailureState,
   type IssueBlockerProvenanceRecord,
   type IssueCompletionReportRecord,
   type IssueLifecycleRecord,
@@ -39,6 +44,8 @@ import {
   type IssuePreservedWorktreeStash,
   type IssueReviewFeedbackRecord,
   type IssueReviewVerdictRecord,
+  type IssueRelationshipState,
+  type IssueSuccessionRecord,
   type IssueWorkspaceSeedRecord,
 } from "../persistence/IssueLifecycleStore.js";
 import {
@@ -174,6 +181,7 @@ type TrackerFields = Pick<
   | "delegateId"
   | "assignedToWorker"
   | "labels"
+  | "blocks"
   | "blockedBy"
   | "hasChildren"
   | "children"
@@ -219,7 +227,10 @@ type LifecycleFields = Pick<
   | "latestCompletionReport"
   | "latestApprovalPassVerdict"
   | "acceptedArtifact"
+  | "acceptedArtifactValidationFailure"
   | "workspaceSeed"
+  | "relationshipState"
+  | "succession"
   | "mergeGate"
   | "mergeConflict"
   | "lifecycleSummaryCiStatus"
@@ -258,7 +269,10 @@ type LifecycleReportFields = Pick<
   | "latestCompletionReport"
   | "latestApprovalPassVerdict"
   | "acceptedArtifact"
+  | "acceptedArtifactValidationFailure"
   | "workspaceSeed"
+  | "relationshipState"
+  | "succession"
   | "mergePolicyLatestCompletionReport"
   | "mergePolicyLatestApprovalVerdict"
 >;
@@ -621,9 +635,7 @@ export class IssueCurrentStateBuilder {
         ? []
         : [lifecycleCore.sourceSnapshotId];
     const lifecycleReportSourceSnapshotIds =
-      lifecycleReports.sourceSnapshotId === null
-        ? []
-        : [lifecycleReports.sourceSnapshotId];
+      lifecycleReports.sourceSnapshotIds;
     const lifecyclePublicationSourceSnapshotIds =
       lifecyclePublication.sourceSnapshotId === null
         ? []
@@ -776,6 +788,7 @@ export class IssueCurrentStateBuilder {
         delegateId: issue.delegateId,
         assignedToWorker: issue.assignedToWorker,
         labels: [...issue.labels],
+        blocks: (issue.blocks ?? []).map((blocked) => ({ ...blocked })),
         blockedBy: issue.blockedBy.map((blocker) => ({ ...blocker })),
         hasChildren: issue.hasChildren === true,
         children: (issue.children ?? []).map((child) => ({ ...child })),
@@ -990,18 +1003,18 @@ export class IssueCurrentStateBuilder {
     | {
         complete: true;
         fields: LifecycleReportFields;
-        sourceSnapshotId: string;
+        sourceSnapshotIds: string[];
       }
-    | { complete: false; fields: null; sourceSnapshotId: string | null } {
+    | { complete: false; fields: null; sourceSnapshotIds: string[] } {
     const snapshot = latestLifecycleMutationSnapshot(context.history);
     if (snapshot === null) {
-      return { complete: false, fields: null, sourceSnapshotId: null };
+      return { complete: false, fields: null, sourceSnapshotIds: [] };
     }
     if (!historyLifecycleMutationFresh(context, snapshot)) {
       return {
         complete: false,
         fields: null,
-        sourceSnapshotId: snapshot.historySnapshotId,
+        sourceSnapshotIds: [snapshot.historySnapshotId],
       };
     }
     const lastCompletionReportRejectionId = stringFromUnknown(
@@ -1033,18 +1046,34 @@ export class IssueCurrentStateBuilder {
     const acceptedArtifact = recordFromUnknown<IssueAcceptedArtifactRecord>(
       snapshot.lifecycleAcceptedArtifact,
     );
+    const acceptedArtifactValidationFailure =
+      objectFromUnknown<IssueAcceptedArtifactValidationFailureState>(
+        snapshot.lifecycleAcceptedArtifactValidationFailure,
+      );
     const workspaceSeed = recordFromUnknown<IssueWorkspaceSeedRecord>(
       snapshot.lifecycleWorkspaceSeed,
     );
+    const relationshipProjection = relationshipProjectionFromHistory(
+      context.history,
+      snapshot,
+    );
     return {
       complete: true,
-      sourceSnapshotId: snapshot.historySnapshotId,
+      sourceSnapshotIds: [
+        ...new Set([
+          snapshot.historySnapshotId,
+          relationshipProjection.sourceSnapshotId,
+        ]),
+      ],
       fields: {
         lastCompletionReportRejectionId,
         latestCompletionReport,
         latestApprovalPassVerdict,
         acceptedArtifact,
+        acceptedArtifactValidationFailure,
         workspaceSeed,
+        relationshipState: relationshipProjection.relationshipState,
+        succession: relationshipProjection.succession,
         mergePolicyLatestCompletionReport: latestCompletionReport,
         mergePolicyLatestApprovalVerdict: latestApprovalPassVerdict,
       },
@@ -1621,6 +1650,7 @@ export class IssueCurrentStateBuilder {
       delegateId: issue.delegateId,
       assignedToWorker: issue.assignedToWorker,
       labels: [...issue.labels],
+      blocks: (issue.blocks ?? []).map((blocked) => ({ ...blocked })),
       blockedBy: issue.blockedBy.map((blocker) => ({ ...blocker })),
       hasChildren: issue.hasChildren === true,
       children: (issue.children ?? []).map((child) => ({ ...child })),
@@ -1710,7 +1740,17 @@ export class IssueCurrentStateBuilder {
       latestCompletionReport: context.mergePolicyLatestCompletionReport,
       latestApprovalPassVerdict: context.mergePolicyLatestApprovalVerdict,
       acceptedArtifact: lifecycle?.acceptedArtifact ?? null,
+      acceptedArtifactValidationFailure:
+        lifecycle?.acceptedArtifactValidationFailure ?? null,
       workspaceSeed: lifecycle?.workspaceSeed ?? null,
+      // The broad ordering graph is a current tracker/contract projection.
+      // A lifecycle copy may preserve historical succession evidence, but it
+      // must not mask later contract or Linear relationship drift here.
+      relationshipState: buildIssueRelationshipState(issue),
+      succession: currentSuccessionForIssue(
+        issue,
+        lifecycle?.succession ?? null,
+      ),
       mergeGate: lifecycle?.mergeGate ?? null,
       mergeConflict: lifecycle?.mergeConflict ?? null,
       lifecycleSummaryCiStatus: lifecycle?.summaryPointers.ciStatus ?? null,
@@ -2099,8 +2139,15 @@ function issueFromTrackerObservationSnapshot(
   const title = stringFromUnknown(snapshot.observedTitle);
   const state = stringFromUnknown(snapshot.observedTrackerState);
   const labels = stringArrayFromUnknown(snapshot.observedLabels);
+  const blocks = issueBlockersFromUnknown(snapshot.observedBlocks ?? []);
   const blockedBy = issueBlockersFromUnknown(snapshot.observedBlockedBy);
-  if (title === null || state === null || labels === null || blockedBy === null)
+  if (
+    title === null ||
+    state === null ||
+    labels === null ||
+    blocks === null ||
+    blockedBy === null
+  )
     return null;
   return {
     id: snapshot.issueId,
@@ -2115,6 +2162,7 @@ function issueFromTrackerObservationSnapshot(
     delegateId: stringFromUnknown(snapshot.observedDelegateId),
     assignedToWorker: snapshot.observedAssignedToWorker === true,
     labels,
+    blocks,
     blockedBy,
     hasChildren: snapshot.observedHasChildren === true,
     children: issueChildrenFromUnknown(snapshot.observedChildren) ?? [],
@@ -2256,8 +2304,18 @@ function lifecycleRecordFromHistorySnapshot(
     acceptedArtifact: recordFromUnknown<IssueAcceptedArtifactRecord>(
       snapshot.lifecycleAcceptedArtifact,
     ),
+    acceptedArtifactValidationFailure:
+      objectFromUnknown<IssueAcceptedArtifactValidationFailureState>(
+        snapshot.lifecycleAcceptedArtifactValidationFailure,
+      ),
     workspaceSeed: recordFromUnknown<IssueWorkspaceSeedRecord>(
       snapshot.lifecycleWorkspaceSeed,
+    ),
+    relationshipState: objectFromUnknown<IssueRelationshipState>(
+      snapshot.lifecycleRelationshipState,
+    ),
+    succession: recordFromUnknown<IssueSuccessionRecord>(
+      snapshot.lifecycleSuccession,
     ),
     issueTriageReports,
     postMortemReports,
@@ -2509,6 +2567,54 @@ function latestLifecycleMutationSnapshot(
     if (
       snapshot.snapshotKind === "evidence" &&
       snapshot.evidenceKind === "lifecycle"
+    ) {
+      return snapshot;
+    }
+  }
+  return null;
+}
+
+function relationshipProjectionFromHistory(
+  history: readonly IssueHistorySnapshot[],
+  lifecycleSnapshot: IssueHistorySnapshot,
+): {
+  relationshipState: IssueRelationshipState | null;
+  succession: IssueSuccessionRecord | null;
+  sourceSnapshotId: string;
+} {
+  const relationshipSnapshot =
+    latestRelationshipProjectionSnapshot(history) ?? lifecycleSnapshot;
+  return {
+    relationshipState:
+      relationshipSnapshot.relationshipState === undefined
+        ? objectFromUnknown<IssueRelationshipState>(
+            lifecycleSnapshot.lifecycleRelationshipState,
+          )
+        : objectFromUnknown<IssueRelationshipState>(
+            relationshipSnapshot.relationshipState,
+          ),
+    succession:
+      relationshipSnapshot.succession === undefined
+        ? recordFromUnknown<IssueSuccessionRecord>(
+            lifecycleSnapshot.lifecycleSuccession,
+          )
+        : recordFromUnknown<IssueSuccessionRecord>(
+            relationshipSnapshot.succession,
+          ),
+    sourceSnapshotId: relationshipSnapshot.historySnapshotId,
+  };
+}
+
+function latestRelationshipProjectionSnapshot(
+  history: readonly IssueHistorySnapshot[],
+): IssueHistorySnapshot | null {
+  for (const snapshot of history.slice().reverse()) {
+    if (
+      snapshot.snapshotKind === "evidence" &&
+      (snapshot.evidenceKind === "tracker" ||
+        snapshot.evidenceKind === "lifecycle") &&
+      (snapshot.relationshipState !== undefined ||
+        snapshot.succession !== undefined)
     ) {
       return snapshot;
     }
@@ -2917,6 +3023,79 @@ function recordFromUnknown<T extends { id: string }>(value: unknown): T | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const record = value as Partial<T>;
   return typeof record.id === "string" ? (record as T) : null;
+}
+
+function objectFromUnknown<T extends object>(value: unknown): T | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as T)
+    : null;
+}
+
+function currentSuccessionForIssue(
+  issue: Issue,
+  durable: IssueSuccessionRecord | null,
+): IssueSuccessionRecord | null {
+  const declared = buildDeclaredIssueSuccessionRecord(issue);
+  if (declared === null) {
+    if (durable?.status !== "invalid") return null;
+    const relationshipState = buildIssueRelationshipState(issue);
+    if (
+      relationshipState.contractSchemaVersion !== 2 ||
+      relationshipState.contractFingerprint === null
+    ) {
+      return null;
+    }
+    const durableCurrentEndpoint =
+      durable.role === "succeeded"
+        ? durable.succeededIssue
+        : durable.successorIssue;
+    const currentEndpointMatches =
+      (durableCurrentEndpoint.id === null ||
+        durableCurrentEndpoint.id === issue.id) &&
+      durableCurrentEndpoint.identifier.toLowerCase() ===
+        issue.identifier.toLowerCase() &&
+      durableCurrentEndpoint.contractFingerprint ===
+        relationshipState.contractFingerprint;
+    return currentEndpointMatches ? durable : null;
+  }
+  if (
+    durable === null ||
+    durable.id !== declared.id ||
+    durable.purpose !== declared.purpose ||
+    durable.role !== declared.role
+  ) {
+    return declared;
+  }
+  const durableCurrentEndpoint =
+    durable.role === "succeeded"
+      ? durable.succeededIssue
+      : durable.successorIssue;
+  const declaredCurrentEndpoint =
+    declared.role === "succeeded"
+      ? declared.succeededIssue
+      : declared.successorIssue;
+  const durableCounterpartEndpoint =
+    durable.role === "succeeded"
+      ? durable.successorIssue
+      : durable.succeededIssue;
+  const declaredCounterpartEndpoint =
+    declared.role === "succeeded"
+      ? declared.successorIssue
+      : declared.succeededIssue;
+  const currentEndpointMatches =
+    durableCurrentEndpoint.id === declaredCurrentEndpoint.id &&
+    durableCurrentEndpoint.identifier.toLowerCase() ===
+      declaredCurrentEndpoint.identifier.toLowerCase() &&
+    durableCurrentEndpoint.contractFingerprint ===
+      declaredCurrentEndpoint.contractFingerprint;
+  const liveSuccessionEdgeMatches =
+    declaredCounterpartEndpoint.id !== null &&
+    durableCounterpartEndpoint.id === declaredCounterpartEndpoint.id &&
+    durableCounterpartEndpoint.identifier.toLowerCase() ===
+      declaredCounterpartEndpoint.identifier.toLowerCase();
+  return currentEndpointMatches && liveSuccessionEdgeMatches
+    ? durable
+    : declared;
 }
 
 function baseRefObservationFromUnknown(value: unknown): IssueBaseRefObservation | null {

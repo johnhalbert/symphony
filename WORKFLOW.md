@@ -26,18 +26,19 @@ review_loop:
   failure_limits:
     reviewer_failures: 3
     merge_gate_failures: 3
+    accepted_artifact_validation_failures: 3
   max_incomplete_turns: 3
   continuation_history_threshold: 5
   reviewer_prompt_extensions:
-    - Review the fenced JSON `Issue Contract` first. If it is missing, invalid, or lacks a non-empty `requirements` array with stable unique IDs, treat that as an issue-authoring defect and fail fast instead of deriving a substitute contract.
-    - When `delivery.mode=accepted_artifact` and `artifact=expected_red_tests`, review the intended assertion failure as the deliverable, use head-bound COMMENT feedback for a pass, and do not block or decompose the test issue merely because its implementation successor has not run. Merge-delivery issues still require green implementation evidence and APPROVE feedback.
+    - Review the fenced JSON `Issue Contract` first. Active contracts must use schema v2, include a non-empty `requirements` array with stable unique IDs, and include `relationships.blocks` plus `relationships.blockedBy` arrays that match Linear. Missing or invalid data is an issue-authoring defect; fail fast instead of deriving a substitute contract.
+    - Treat `blocks`/`blockedBy` as generalized ordering only. When `delivery.mode=accepted_artifact` and `artifact=expected_red_tests`, require a separate reciprocal `relationships.succession` agreement with its merge-delivery implementation successor. Review the intended assertion failure as the deliverable, use head-bound COMMENT feedback for a pass, and do not block or decompose the test issue merely because its implementation successor has not run. Merge-delivery successors still require green implementation evidence and APPROVE feedback.
     - Check lifecycle phase, blockedReason, review counters, incomplete-turn counters, run terminal status, transcript events, PR metadata, and tracker/writeback comments/transitions when shared orchestration behavior is touched.
     - Check MCP, HTTP/status API, orchestrator, writeback/outbox, tracker, harness, and persistence boundaries when the change crosses those systems.
     - Check approval/publication variants including pending, approved, rejected, cancelled, stale, expired, already-terminal, replay, rejectPolicy cancel/fail, live worker wait, and after-worker-exit resume when publication behavior is touched.
     - "Check dispatch invariants: no redispatch and no incomplete-turn burn while an intentional non-dispatch or human-required state is active."
   worker_prompt_extensions:
-    - Use the fenced JSON `Issue Contract` as the authoritative requirements list. If it is missing, invalid, or lacks a non-empty `requirements` array with stable unique IDs, stop and report the issue-authoring gap instead of inventing a substitute contract.
-    - Honor the Issue Contract delivery mode. Accepted expected-red artifact issues author tests without production implementation and submit structured artifact evidence; merge-delivery successors preserve the injected dependency artifact, reproduce its command red, implement the owned behavior, and prove the same command green.
+    - Use the fenced JSON `Issue Contract` as the authoritative requirements and relationship declaration. Active contracts must use schema v2 with required `relationships.blocks` and `relationships.blockedBy` arrays matching Linear; stop on an authoring gap instead of inventing a substitute contract.
+    - Honor the Issue Contract delivery mode and keep ordering distinct from TDD succession. Accepted expected-red artifact issues require a reciprocal succession agreement, author tests without production implementation, and submit structured artifact evidence; only the declared merge-delivery successor receives the injected artifact, reproduces its command red, implements the owned behavior, and proves the same command green.
     - For Symphony orchestration, workflow, tracker, harness, API, approval, publication, or writeback changes, validate lifecycle phase, blockedReason, review counters, incomplete-turn counters, run terminal status, transcript events, PR metadata, and tracker/writeback comments/transitions.
     - Validate MCP, HTTP/status API, orchestrator, writeback/outbox, tracker, harness, and persistence boundaries when touched.
     - Cover approval/publication variants including pending, approved, rejected, cancelled, stale, expired, already-terminal, replay, rejectPolicy cancel/fail, live worker wait, and after-worker-exit resume when applicable.

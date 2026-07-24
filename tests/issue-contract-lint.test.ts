@@ -3,8 +3,10 @@ import {
   analyzeIssueContractDescription,
   hasMeaningfulRemainingBlocker,
   missingRequiredIssueContractSections,
+  parseIssueContract,
   parseIssueContractFromDescription,
   parseIssueContractJson,
+  replaceIssueContractJson,
 } from "../src/core/IssueContractLint.js";
 import { agentEligibleIssueContract, fencedAuthoringSectionSpoof, nestedFencedIssueContractSpoof } from "./helpers.js";
 
@@ -42,6 +44,27 @@ describe("IssueContractLint", () => {
     expect(analysis.readyForDogfoodReady).toBe(true);
   });
 
+  it("rejects duplicate Issue Contract sections consistently for parsing and rewriting", () => {
+    const description = [
+      agentEligibleIssueContract(),
+      agentEligibleIssueContract(),
+    ].join("\n\n");
+
+    expect(analyzeIssueContractDescription(description, []).issueContractErrors)
+      .toContain(
+        "Issue description must contain exactly one `Issue Contract` section",
+      );
+    expect(parseIssueContract(description)).toMatchObject({
+      valid: false,
+      errors: [
+        "Issue description must contain exactly one `Issue Contract` section",
+      ],
+    });
+    expect(() => replaceIssueContractJson(description, "{}")).toThrow(
+      "Issue description must contain exactly one `Issue Contract` section",
+    );
+  });
+
   it.each([
     ["non-json fence", agentEligibleIssueContract({ issueContractFenceLanguage: "yaml" }), "fenced `json` block"],
     ["malformed JSON", agentEligibleIssueContract({ issueContractJson: "{ not valid json" }), "valid JSON"],
@@ -69,9 +92,14 @@ describe("IssueContractLint", () => {
   });
 
   it("defaults legacy contracts to merge delivery and exposes a canonical fingerprint", () => {
-    const implicit = parseIssueContractFromDescription(agentEligibleIssueContract());
+    const implicit = parseIssueContractFromDescription(
+      agentEligibleIssueContract({ issueContractSchemaVersion: 1 }),
+    );
     const explicit = parseIssueContractFromDescription(
-      agentEligibleIssueContract({ issueContractDelivery: { mode: "merge" } }),
+      agentEligibleIssueContract({
+        issueContractSchemaVersion: 1,
+        issueContractDelivery: { mode: "merge" },
+      }),
     );
 
     expect(implicit).toMatchObject({
@@ -81,6 +109,128 @@ describe("IssueContractLint", () => {
     });
     expect(implicit?.document).toMatchObject({ delivery: { mode: "merge" } });
     expect(implicit?.fingerprint).toBe(explicit?.fingerprint);
+  });
+
+  it("requires schema-v2 relationship arrays for agent-eligible issues while retaining legacy parsing", () => {
+    const legacyDescription = agentEligibleIssueContract({ issueContractSchemaVersion: 1 });
+
+    expect(parseIssueContractFromDescription(legacyDescription)).toMatchObject({
+      schemaVersion: 1,
+      delivery: { mode: "merge" },
+    });
+    expect(analyzeIssueContractDescription(legacyDescription, []).issueContractErrors).toContain(
+      "Agent-eligible Issue Contract must use schemaVersion 2",
+    );
+
+    const missingRelationships = analyzeIssueContractDescription(
+      agentEligibleIssueContract({
+        issueContractJson: JSON.stringify({
+          schemaVersion: 2,
+          contractVersion: "v2",
+          requirements: [{ id: "REQ-001", requirement: "Do the concrete work." }],
+        }),
+      }),
+      [],
+    );
+    expect(missingRelationships.issueContractErrors).toContain(
+      "Issue Contract must include `relationships.blocks` and `relationships.blockedBy` arrays",
+    );
+  });
+
+  it("accepts required empty ordering arrays and an optional standalone succession contract", () => {
+    const ordinary = parseIssueContractFromDescription(agentEligibleIssueContract());
+    expect(ordinary?.relationships).toEqual({ blocks: [], blockedBy: [] });
+
+    const producer = parseIssueContractFromDescription(
+      agentEligibleIssueContract({
+        issueContractDelivery: {
+          mode: "accepted_artifact",
+          artifact: "expected_red_tests",
+        },
+        issueContractRelationships: {
+          blocks: ["TEST-2"],
+          blockedBy: [],
+          succession: {
+            id: "tdd-test-1",
+            purpose: "expected_red_implementation",
+            successor: { issue: "TEST-2" },
+          },
+        },
+      }),
+    );
+    const consumer = parseIssueContractFromDescription(
+      agentEligibleIssueContract({
+        issueContractRelationships: {
+          blocks: [],
+          blockedBy: ["TEST-1"],
+          succession: {
+            id: "tdd-test-1",
+            purpose: "expected_red_implementation",
+            succeeds: { issue: "TEST-1" },
+          },
+        },
+      }),
+    );
+
+    expect(producer?.relationships?.succession).toMatchObject({
+      id: "tdd-test-1",
+      successor: { issue: "TEST-2" },
+    });
+    expect(consumer?.relationships?.succession).toMatchObject({
+      id: "tdd-test-1",
+      succeeds: { issue: "TEST-1" },
+    });
+  });
+
+  it.each([
+    [
+      { blocks: [], blockedBy: [] },
+      { mode: "accepted_artifact", artifact: "expected_red_tests" },
+      "requires `relationships.succession.successor`",
+    ],
+    [
+      {
+        blocks: [],
+        blockedBy: [],
+        succession: {
+          id: "tdd-test",
+          purpose: "expected_red_implementation",
+          successor: { issue: "TEST-2" },
+        },
+      },
+      { mode: "accepted_artifact", artifact: "expected_red_tests" },
+      "`relationships.blocks` must include",
+    ],
+    [
+      {
+        blocks: [],
+        blockedBy: [],
+        succession: {
+          id: "tdd-test",
+          purpose: "expected_red_implementation",
+          succeeds: { issue: "TEST-1" },
+        },
+      },
+      { mode: "merge" },
+      "`relationships.blockedBy` must include",
+    ],
+  ])("enforces succession delivery and ordering consistency %#", (relationships, delivery, expectedError) => {
+    const analysis = analyzeIssueContractDescription(
+      agentEligibleIssueContract({
+        issueContractJson: JSON.stringify({
+          schemaVersion: 2,
+          contractVersion: "v2",
+          requirements: [{ id: "REQ-001", requirement: "Do the concrete work." }],
+          delivery,
+          relationships,
+        }),
+      }),
+      [],
+    );
+
+    expect(analysis.issueContractErrors).toEqual(
+      expect.arrayContaining([expect.stringContaining(expectedError)]),
+    );
   });
 
   it("parses the accepted expected-red artifact delivery mode", () => {

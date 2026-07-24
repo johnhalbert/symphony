@@ -7,6 +7,7 @@ import type {
   IssueBreakdownPlanRecord,
   IssueBreakdownPlanApplicationStatus,
   IssueAcceptedArtifactRecord,
+  IssueAcceptedArtifactValidationFailureState,
   IssueBlockerProvenanceRecord,
   IssueCompletionReportRecord,
   IssueLifecyclePatch,
@@ -18,6 +19,8 @@ import type {
   IssuePreservedWorktreeStash,
   IssueReviewFeedbackRecord,
   IssueReviewVerdictRecord,
+  IssueRelationshipState,
+  IssueSuccessionRecord,
   IssueTriageRecoveryDispositionRecord,
   IssueTriageReportRecord,
   IssueTriageBlockerRecord,
@@ -195,6 +198,7 @@ export interface IssueCurrentFields {
   delegateId: string | null;
   assignedToWorker: boolean;
   labels: string[];
+  blocks: NonNullable<Issue["blocks"]>;
   blockedBy: Issue["blockedBy"];
   hasChildren: boolean;
   children?: NonNullable<Issue["children"]>;
@@ -239,7 +243,10 @@ export interface IssueCurrentFields {
   latestCompletionReport: IssueCompletionReportRecord | null;
   latestApprovalPassVerdict: IssueReviewVerdictRecord | null;
   acceptedArtifact: IssueAcceptedArtifactRecord | null;
+  acceptedArtifactValidationFailure?: IssueAcceptedArtifactValidationFailureState | null;
   workspaceSeed: IssueWorkspaceSeedRecord | null;
+  relationshipState?: IssueRelationshipState | null;
+  succession?: IssueSuccessionRecord | null;
   mergeGate: IssueMergeGateState | null;
   mergeConflict: IssueMergeConflictMetadata | null;
   lifecycleSummaryCiStatus: string | null;
@@ -467,6 +474,7 @@ export interface TrackerObservedIssueSnapshot extends IssueEvidenceHistorySnapsh
   observedAssigneeId: string | null;
   observedDelegateId: string | null;
   observedAssignedToWorker: boolean;
+  observedBlocks?: NonNullable<Issue["blocks"]>;
   observedBlockedBy: Issue["blockedBy"];
   observedHasChildren: boolean;
   observedChildren?: NonNullable<Issue["children"]>;
@@ -504,7 +512,10 @@ export interface LifecycleMutationEvidenceSnapshot extends IssueEvidenceHistoryS
   lifecycleLatestCompletionReport: IssueCompletionReportRecord | null;
   lifecycleLatestApprovalPassVerdict: IssueReviewVerdictRecord | null;
   lifecycleAcceptedArtifact: IssueAcceptedArtifactRecord | null;
+  lifecycleAcceptedArtifactValidationFailure?: IssueAcceptedArtifactValidationFailureState | null;
   lifecycleWorkspaceSeed: IssueWorkspaceSeedRecord | null;
+  lifecycleRelationshipState?: IssueRelationshipState | null;
+  lifecycleSuccession?: IssueSuccessionRecord | null;
   lifecycleMerge: IssueMergeMetadata | null;
   lifecycleMergeGate: IssueMergeGateState | null;
   lifecycleMergeGateResults: IssueMergeGateResultRecord[] | null;
@@ -676,6 +687,8 @@ export function normalizeIssueHistorySnapshotEvidenceFields(
         observedAssignedToWorker:
           booleanField(payload, "assignedToWorker") ??
           snapshot.assignedToWorker,
+        observedBlocks:
+          arrayField(payload, "blocks") ?? snapshot.blocks ?? [],
         observedBlockedBy:
           arrayField(payload, "blockedBy") ?? snapshot.blockedBy,
         observedHasChildren:
@@ -782,9 +795,22 @@ export function normalizeIssueHistorySnapshotEvidenceFields(
           payload,
           "acceptedArtifact",
         ),
+        lifecycleAcceptedArtifactValidationFailure:
+          recordField<IssueAcceptedArtifactValidationFailureState>(
+            payload,
+            "acceptedArtifactValidationFailure",
+          ),
         lifecycleWorkspaceSeed: recordField<IssueWorkspaceSeedRecord>(
           payload,
           "workspaceSeed",
+        ),
+        lifecycleRelationshipState: recordField<IssueRelationshipState>(
+          payload,
+          "relationshipState",
+        ),
+        lifecycleSuccession: recordField<IssueSuccessionRecord>(
+          payload,
+          "succession",
         ),
         lifecycleMerge: recordField<IssueMergeMetadata>(payload, "merge"),
         lifecycleMergeGate: recordField<IssueMergeGateState>(

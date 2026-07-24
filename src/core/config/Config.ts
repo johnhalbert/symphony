@@ -40,6 +40,7 @@ const rawConfigSchema = z
           .object({
             reviewer_failures: z.number().int().positive().optional(),
             merge_gate_failures: z.number().int().positive().optional(),
+            accepted_artifact_validation_failures: z.number().int().positive().optional(),
           })
           .passthrough()
           .optional(),
@@ -611,6 +612,7 @@ export interface ReviewLoopConfig {
 export interface ReviewLoopFailureLimitsConfig {
   reviewerFailures: number;
   mergeGateFailures: number;
+  acceptedArtifactValidationFailures: number;
 }
 
 export interface MergePolicyConfig {
@@ -768,7 +770,8 @@ const DEFAULT_ISSUE_BREAKDOWN_PROMPT = [
   "Before ending the run, call submit_issue_breakdown_plan with a concise summary, an idempotencyKey, and proposedIssues[].",
   "Each proposed issue must include title, description, acceptanceCriteria[], dependencies[], and labels[].",
   "Each proposed issue description must use the agent-eligible issue contract section headings `Problem / Goal`, `Issue Contract`, `Touched Surfaces`, `Acceptance Criteria`, `Contract Checklist`, `Validation Requirements`, `Out Of Scope`, and `Promotion Readiness`; use the same headings for docs-only and implementation issues.",
-  "In `Issue Contract`, include a fenced `json` block with a positive integer `schemaVersion`, a non-empty `contractVersion`, and a non-empty `requirements` array whose entries have stable unique `id` values and non-empty `requirement` text.",
+  "In `Issue Contract`, use schemaVersion 2 and include a fenced `json` block with a non-empty `contractVersion`, a non-empty `requirements` array whose entries have stable unique `id` values and non-empty `requirement` text, and required `relationships.blocks` / `relationships.blockedBy` arrays (empty arrays are valid).",
+  "`blocks` and `blockedBy` express generalized ordering only: blockedBy mirrors dependencies and blocks names dependent proposed titles plus the parent identifier. For an expected-red/implementation pair, additionally declare a separate reciprocal `relationships.succession` with the same stable id and purpose `expected_red_implementation`, using `successor` on the artifact issue and `succeeds` on the merge issue.",
   "Do not include secrets, tokens, private keys, or credential values in proposed issue descriptions. Do not add `dogfood-ready` automatically; leave readiness as an explicit Promotion Readiness decision for operator review.",
   "Symphony persists these proposals locally; do not create or modify Linear issues.",
 ].join("\n");
@@ -1150,6 +1153,10 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       failureLimits: {
         reviewerFailures: raw.review_loop?.failure_limits?.reviewer_failures ?? raw.review_loop?.max_review_rounds ?? 3,
         mergeGateFailures: raw.review_loop?.failure_limits?.merge_gate_failures ?? raw.review_loop?.max_review_rounds ?? 3,
+        acceptedArtifactValidationFailures:
+          raw.review_loop?.failure_limits?.accepted_artifact_validation_failures ??
+          raw.review_loop?.max_review_rounds ??
+          3,
       },
       maxIncompleteTurns: raw.review_loop?.max_incomplete_turns ?? 3,
       continuationHistoryThreshold: raw.review_loop?.continuation_history_threshold ?? 5,

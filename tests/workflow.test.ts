@@ -568,6 +568,7 @@ Work on {{ issue.identifier }}.
           failure_limits: {
             reviewer_failures: 5,
             merge_gate_failures: 2,
+            accepted_artifact_validation_failures: 6,
           },
           max_incomplete_turns: 2,
           continuation_history_threshold: 7,
@@ -623,6 +624,7 @@ Work on {{ issue.identifier }}.
       failureLimits: {
         reviewerFailures: 5,
         mergeGateFailures: 2,
+        acceptedArtifactValidationFailures: 6,
       },
       maxIncompleteTurns: 2,
       continuationHistoryThreshold: 7,
@@ -679,6 +681,57 @@ Work on {{ issue.identifier }}.
       done: ["Done"],
       canceled: [],
     });
+  });
+
+  it("defaults accepted-artifact validation failures with the legacy review-round fallback", () => {
+    const legacy = parseServiceConfig(
+      {
+        tracker: {
+          kind: "linear",
+          api_key: "$LINEAR_API_KEY",
+          project_slug: "TEST",
+        },
+        review_loop: { max_review_rounds: 7 },
+      },
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret" },
+    );
+    const defaults = parseServiceConfig(
+      {
+        tracker: {
+          kind: "linear",
+          api_key: "$LINEAR_API_KEY",
+          project_slug: "TEST",
+        },
+      },
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret" },
+    );
+
+    expect(
+      legacy.reviewLoop.failureLimits.acceptedArtifactValidationFailures,
+    ).toBe(7);
+    expect(
+      defaults.reviewLoop.failureLimits.acceptedArtifactValidationFailures,
+    ).toBe(3);
+    expect(() =>
+      parseServiceConfig(
+        {
+          tracker: {
+            kind: "linear",
+            api_key: "$LINEAR_API_KEY",
+            project_slug: "TEST",
+          },
+          review_loop: {
+            failure_limits: {
+              accepted_artifact_validation_failures: 0,
+            },
+          },
+        },
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      ),
+    ).toThrow();
   });
 
   it("rejects readonly issue breakdown workspaces unless a non-Windows git worktree source can enforce them", () => {

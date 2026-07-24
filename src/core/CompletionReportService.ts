@@ -10,6 +10,11 @@ import {
 import type { ServiceConfig } from "./config/Config.js";
 import { SymphonyError, errorMessage } from "./errors.js";
 import { parseIssueContract } from "./IssueContractLint.js";
+import {
+  buildIssueRelationshipState,
+  mergeIssueSuccessionProgress,
+  resolveIssueSuccessionAgreement,
+} from "./IssueRelationshipService.js";
 import type {
   CompletionReportAcceptanceContext,
   CompletionReportChecklistItem,
@@ -19,10 +24,13 @@ import type {
   IssueCompletionReportRejectionRecord,
   IssueCompletionReportRecord,
   IssueContractSnapshot,
+  IssueLifecyclePatch,
   IssueLifecycleRecord,
   IssueLifecyclePhase,
   IssueLifecycleStore,
+  IssueSuccessionRecord,
 } from "./persistence/IssueLifecycleStore.js";
+import type { RecordLifecycleEvidenceInput } from "./orchestration/IssueLifecycleEvidenceRecorder.js";
 import {
   isSupersededLifecycleRecord,
   latestCurrentCompletionReport,
@@ -150,10 +158,13 @@ export interface CompletionReportServiceOptions {
   baseRefVerifier?: Pick<BaseRefVerifier, "verify">;
   operatorApproval?: Pick<OperatorApprovalService, "requestPublicationApproval" | "waitForPublicationApprovalRequest"> &
     Partial<Pick<OperatorApprovalService, "get" | "getByDedupe">>;
-  resolveIssuesByIds?: (issueIds: string[]) => Promise<Issue[]>;
+  resolveIssuesByIds: (issueIds: string[]) => Promise<Issue[]>;
   dependencyArtifactManifestVerifier?: (
     input: DependencyArtifactManifestVerificationInput,
   ) => Promise<void>;
+  recordLifecycleEvidence?:
+    | ((input: RecordLifecycleEvidenceInput) => Promise<unknown>)
+    | undefined;
 }
 
 export interface DependencyArtifactManifestVerificationInput {
@@ -238,6 +249,14 @@ interface CompletionReportReadinessRejection {
   unsatisfiedAcceptanceChecklist: Array<{ text: string; evidence: string | null }>;
 }
 
+interface CompletionSuccessionVerification {
+  sourceIssue: Issue;
+  targetIssue: Issue;
+  succession: IssueSuccessionRecord;
+  artifactId: string;
+  workspaceSeedId: string;
+}
+
 export interface PublicationApprovalResumeInput {
   approval: OperatorApprovalRecord;
   issue: Issue;
@@ -282,11 +301,20 @@ export class CompletionReportService {
   async submitCompletionReport(input: unknown, context: CompletionReportActiveContext): Promise<CompletionReportResult> {
     const report = parseCompletionReport(input);
     this.validateCaller(report, context);
+    const dispatchedIssue = context.issue;
+    const liveIssue = await refreshCompletionIssue(
+      dispatchedIssue,
+      this.options.resolveIssuesByIds,
+    );
+    assertDispatchedContractHasNotDrifted(dispatchedIssue, liveIssue);
+    context = { ...context, issue: liveIssue };
+    this.validateCaller(report, context);
 
     const existingLifecycle = await this.options.lifecycleStore.get(context.issue.id);
     const contractSnapshot = contractSnapshotForIssue(context.issue);
-    await validateCompletionDeliveryEvidence({
+    const successionVerification = await validateCompletionDeliveryEvidence({
       report,
+      issue: context.issue,
       contractSnapshot,
       lifecycle: existingLifecycle,
       lifecycleStore: this.options.lifecycleStore,
@@ -297,9 +325,7 @@ export class CompletionReportService {
         context.workspace?.path ??
         existingLifecycle?.summaryPointers.workspacePath ??
         null,
-      ...(this.options.resolveIssuesByIds === undefined
-        ? {}
-        : { resolveIssuesByIds: this.options.resolveIssuesByIds }),
+      resolveIssuesByIds: this.options.resolveIssuesByIds,
       ...(this.options.dependencyArtifactManifestVerifier === undefined
         ? {}
         : {
@@ -328,6 +354,11 @@ export class CompletionReportService {
         completionReplayMatchesAuthoritativeState(existing, currentAcceptanceContext) &&
         completionReplayMatchesDeliveryEvidence(existing, report, contractSnapshot)
       ) {
+        await persistCompletionSuccessionVerification({
+          verification: successionVerification,
+          lifecycleStore: this.options.lifecycleStore,
+          recordLifecycleEvidence: this.options.recordLifecycleEvidence,
+        });
         return { accepted: true, replayed: true, report: existing, writebackOperations: [] };
       }
       existing = undefined;
@@ -539,6 +570,7 @@ export class CompletionReportService {
       lifecycle,
       existing,
       contractSnapshot,
+      successionVerification,
     });
   }
 
@@ -549,6 +581,10 @@ export class CompletionReportService {
       throw new SymphonyError("invalid_request", "PR publication is enabled but no GitHub publisher is configured");
     }
 
+    const liveIssue = await refreshCompletionIssue(
+      input.issue,
+      this.options.resolveIssuesByIds,
+    );
     const lifecycle = await this.options.lifecycleStore.get(input.approval.issueId);
     const existing = lifecycle === null
       ? null
@@ -558,8 +594,39 @@ export class CompletionReportService {
       existing.runId !== input.approval.runId ||
       existing.idempotencyKey !== input.approval.evidenceCursor
     ) return null;
+    const report = completionReportInputFromRecord(existing);
+    const contractSnapshot = contractSnapshotForIssue(liveIssue);
+    assertCompletionContractHasNotDrifted(existing, contractSnapshot);
     if (isFinalizedCompletionReport(existing, lifecycle)) {
-      return { accepted: true, replayed: true, report: existing, writebackOperations: [] };
+      const successionVerification =
+        await validateCompletionDeliveryEvidence({
+          report,
+          issue: liveIssue,
+          contractSnapshot,
+          lifecycle,
+          lifecycleStore: this.options.lifecycleStore,
+          config: this.options.config,
+          targetIssueId: liveIssue.id,
+          workspacePath: input.approval.action.workspacePath,
+          resolveIssuesByIds: this.options.resolveIssuesByIds,
+          ...(this.options.dependencyArtifactManifestVerifier === undefined
+            ? {}
+            : {
+                dependencyArtifactManifestVerifier:
+                  this.options.dependencyArtifactManifestVerifier,
+              }),
+        });
+      await persistCompletionSuccessionVerification({
+        verification: successionVerification,
+        lifecycleStore: this.options.lifecycleStore,
+        recordLifecycleEvidence: this.options.recordLifecycleEvidence,
+      });
+      return {
+        accepted: true,
+        replayed: true,
+        report: existing,
+        writebackOperations: [],
+      };
     }
     const pendingReport = pendingPublicationHandoffForRun(lifecycle, {
       runId: input.approval.runId,
@@ -573,20 +640,16 @@ export class CompletionReportService {
       return null;
     }
 
-    const report = completionReportInputFromRecord(existing);
-    const contractSnapshot = contractSnapshotForIssue(input.issue);
-    assertCompletionContractHasNotDrifted(existing, contractSnapshot);
-    await validateCompletionDeliveryEvidence({
+    const successionVerification = await validateCompletionDeliveryEvidence({
       report,
+      issue: liveIssue,
       contractSnapshot,
       lifecycle,
       lifecycleStore: this.options.lifecycleStore,
       config: this.options.config,
-      targetIssueId: input.issue.id,
+      targetIssueId: liveIssue.id,
       workspacePath: input.approval.action.workspacePath,
-      ...(this.options.resolveIssuesByIds === undefined
-        ? {}
-        : { resolveIssuesByIds: this.options.resolveIssuesByIds }),
+      resolveIssuesByIds: this.options.resolveIssuesByIds,
       ...(this.options.dependencyArtifactManifestVerifier === undefined
         ? {}
         : {
@@ -595,7 +658,7 @@ export class CompletionReportService {
           }),
     });
     const context: CompletionReportActiveContext = {
-      issue: input.issue,
+      issue: liveIssue,
       activeRunId: input.approval.runId,
       role: "worker",
       sessionId: null,
@@ -617,6 +680,7 @@ export class CompletionReportService {
       lifecycle,
       existing,
       contractSnapshot,
+      successionVerification,
     });
     await this.processDueForOperations(result.writebackOperations);
     return result;
@@ -812,6 +876,7 @@ export class CompletionReportService {
     lifecycle: ExistingIssueLifecycle;
     existing: IssueCompletionReportRecord | undefined;
     contractSnapshot: IssueContractSnapshot | null;
+    successionVerification: CompletionSuccessionVerification | null;
   }): Promise<CompletionReportResult> {
     const acceptedLocalSnapshot = input.publication
       ? await captureCompletionReportLocalGitSnapshot(
@@ -933,6 +998,11 @@ export class CompletionReportService {
       lastCompletionReportId: storedReport.id,
       completionReports: upsertCompletionReport(lifecycle.completionReports, storedReport),
       summaryPointers: summaryPointersFor(input.context, pullRequest, input.publication, lifecycle),
+    });
+    await persistCompletionSuccessionVerification({
+      verification: input.successionVerification,
+      lifecycleStore: this.options.lifecycleStore,
+      recordLifecycleEvidence: this.options.recordLifecycleEvidence,
     });
     const reportHeadSha = storedReport.pullRequest?.headSha ?? null;
     const reportNumber = storedReport.pullRequest?.number ?? null;
@@ -1477,6 +1547,51 @@ function contractSnapshotForIssue(issue: Issue): IssueContractSnapshot | null {
   };
 }
 
+async function refreshCompletionIssue(
+  dispatchedIssue: Issue,
+  resolveIssuesByIds: (issueIds: string[]) => Promise<Issue[]>,
+): Promise<Issue> {
+  let refreshed: Issue[];
+  try {
+    refreshed = await resolveIssuesByIds([dispatchedIssue.id]);
+  } catch (error) {
+    throw new DependencyArtifactDeferredError(
+      "live_lookup_unavailable",
+      `Completion report could not refresh ${dispatchedIssue.identifier} from the tracker: ${errorMessage(error)}`,
+    );
+  }
+  const liveIssue = refreshed.find(
+    (candidate) =>
+      candidate.id === dispatchedIssue.id ||
+      candidate.identifier.toLowerCase() ===
+        dispatchedIssue.identifier.toLowerCase(),
+  );
+  if (!liveIssue) {
+    throw new DependencyArtifactDeferredError(
+      "live_issue_missing",
+      `Completion report could not refresh current issue ${dispatchedIssue.identifier} from the tracker`,
+    );
+  }
+  return liveIssue;
+}
+
+function assertDispatchedContractHasNotDrifted(
+  dispatchedIssue: Issue,
+  liveIssue: Issue,
+): void {
+  const dispatched = contractSnapshotForIssue(dispatchedIssue);
+  const live = contractSnapshotForIssue(liveIssue);
+  if (dispatched?.fingerprint === live?.fingerprint) return;
+  throw new SymphonyError(
+    "conflict",
+    "Issue Contract changed after this worker was dispatched; restart against the current contract",
+    {
+      dispatchedFingerprint: dispatched?.fingerprint ?? null,
+      liveFingerprint: live?.fingerprint ?? null,
+    },
+  );
+}
+
 function isAcceptedArtifactContract(
   snapshot: IssueContractSnapshot | null | undefined,
 ): snapshot is IssueContractSnapshot & {
@@ -1487,9 +1602,10 @@ function isAcceptedArtifactContract(
 
 async function validateCompletionDeliveryEvidence(input: {
   report: LegacyCompatibleCompletionReportInput;
+  issue: Issue;
   contractSnapshot: IssueContractSnapshot | null;
   lifecycle: ExistingIssueLifecycle;
-  lifecycleStore: Pick<IssueLifecycleStore, "get">;
+  lifecycleStore: Pick<IssueLifecycleStore, "get" | "updateIssue">;
   config: ServiceConfig;
   targetIssueId: string;
   workspacePath: string | null;
@@ -1497,8 +1613,25 @@ async function validateCompletionDeliveryEvidence(input: {
   dependencyArtifactManifestVerifier?: (
     input: DependencyArtifactManifestVerificationInput,
   ) => Promise<void>;
-}): Promise<void> {
+}): Promise<CompletionSuccessionVerification | null> {
+  const relationshipState = buildIssueRelationshipState(input.issue);
+  if (relationshipState.status !== "valid") {
+    const errors =
+      relationshipState.status === "legacy"
+        ? ["Issue Contract must use schemaVersion 2 with explicit relationships"]
+        : relationshipState.validationErrors;
+    throw new SymphonyError(
+      "conflict",
+      `Completion report requires an exact schema-v2 Issue Contract relationship graph: ${errors.join("; ")}`,
+    );
+  }
   const acceptedArtifact = isAcceptedArtifactContract(input.contractSnapshot);
+  const parsedContract = parseIssueContract(input.issue.description);
+  const declaredSuccession = parsedContract.valid
+    ? parsedContract.contract.relationships?.succession
+    : undefined;
+  const declaresSucceededIssue =
+    declaredSuccession?.succeeds !== undefined;
   const artifactEvidence = input.report.artifactEvidence;
   if (acceptedArtifact) {
     if (!artifactEvidence) {
@@ -1517,6 +1650,27 @@ async function validateCompletionDeliveryEvidence(input: {
         "invalid_request",
         "Every expected-red test file must be included in completion report changedFiles",
         { missingTestFiles },
+      );
+    }
+    if (!input.resolveIssuesByIds) {
+      throw new SymphonyError(
+        "conflict",
+        "Accepted expected-red artifact completion requires live reciprocal succession verification",
+      );
+    }
+    const successionAgreement = await resolveIssueSuccessionAgreement(
+      input.issue,
+      { fetchIssueStatesByIds: input.resolveIssuesByIds },
+    );
+    if (
+      successionAgreement.kind !== "agreed" ||
+      successionAgreement.sourceIssue.id !== input.issue.id
+    ) {
+      throw new SymphonyError(
+        "conflict",
+        successionAgreement.kind === "invalid"
+          ? `Accepted expected-red artifact succession is invalid: ${successionAgreement.errors.join("; ")}`
+          : "Accepted expected-red artifact must declare a reciprocal implementation successor",
       );
     }
   } else if (artifactEvidence !== undefined) {
@@ -1541,7 +1695,44 @@ async function validateCompletionDeliveryEvidence(input: {
         "dependencyArtifactResult is only valid for a workspace with a durable accepted-artifact seed",
       );
     }
-    return;
+    if (declaresSucceededIssue) {
+      if (!input.resolveIssuesByIds) {
+        throw new DependencyArtifactDeferredError(
+          "live_lookup_unavailable",
+          "Declared implementation successor completion requires live reciprocal succession verification",
+        );
+      }
+      let successionAgreement: Awaited<
+        ReturnType<typeof resolveIssueSuccessionAgreement>
+      >;
+      try {
+        successionAgreement = await resolveIssueSuccessionAgreement(
+          input.issue,
+          { fetchIssueStatesByIds: input.resolveIssuesByIds },
+        );
+      } catch (error) {
+        throw new DependencyArtifactDeferredError(
+          "live_lookup_unavailable",
+          `Declared implementation successor completion could not refresh its succession agreement: ${errorMessage(error)}`,
+        );
+      }
+      if (
+        successionAgreement.kind !== "agreed" ||
+        successionAgreement.targetIssue.id !== input.issue.id
+      ) {
+        throw new SymphonyError(
+          "conflict",
+          successionAgreement.kind === "invalid"
+            ? `Declared implementation successor completion requires a valid reciprocal succession agreement: ${successionAgreement.errors.join("; ")}`
+            : "Declared implementation successor completion requires a reciprocal expected-red source agreement",
+        );
+      }
+      throw new SymphonyError(
+        "conflict",
+        "Declared implementation successor completion requires the matching durable prepared accepted-artifact workspace seed",
+      );
+    }
+    return null;
   }
   if (seed.status !== "prepared") {
     throw new SymphonyError(
@@ -1598,14 +1789,40 @@ async function validateCompletionDeliveryEvidence(input: {
       "Seeded implementation completion could not verify the live target and accepted-artifact source issues",
     );
   }
+  const successionAgreement = await resolveIssueSuccessionAgreement(
+    liveTarget,
+    {
+      fetchIssueStatesByIds: async (ids) =>
+        liveIssues.filter(
+          (candidate) =>
+            ids.includes(candidate.id) ||
+            ids.includes(candidate.identifier),
+      ),
+    },
+  );
+  const durableSuccession = input.lifecycle?.succession ?? null;
   if (
-    !liveTarget.blockedBy.some(
-      (blocker) => blocker.id === seed.sourceIssueId,
-    )
+    successionAgreement.kind !== "agreed" ||
+    successionAgreement.targetIssue.id !== liveTarget.id ||
+    successionAgreement.sourceIssue.id !== seed.sourceIssueId ||
+    seed.successionId !== successionAgreement.succession.id ||
+    durableSuccession?.id !== successionAgreement.succession.id ||
+    durableSuccession.role !== "successor" ||
+    durableSuccession.succeededIssue.id !==
+      successionAgreement.sourceIssue.id ||
+    durableSuccession.successorIssue.id !== liveTarget.id ||
+    durableSuccession.succeededIssue.contractFingerprint !==
+      successionAgreement.sourceContract.fingerprint ||
+    durableSuccession.successorIssue.contractFingerprint !==
+      successionAgreement.targetContract.fingerprint ||
+    input.contractSnapshot?.fingerprint !==
+      successionAgreement.targetContract.fingerprint
   ) {
     throw new SymphonyError(
       "conflict",
-      "Seeded implementation completion requires the accepted-artifact source to remain a direct dependency",
+      successionAgreement.kind === "invalid"
+        ? `Seeded implementation completion requires a valid reciprocal succession agreement: ${successionAgreement.errors.join("; ")}`
+        : "Seeded implementation completion requires the accepted-artifact source to remain selected by a reciprocal succession agreement",
     );
   }
   if (
@@ -1660,6 +1877,84 @@ async function validateCompletionDeliveryEvidence(input: {
     workspacePath: input.workspacePath,
     artifact,
   });
+  return {
+    sourceIssue: liveSource,
+    targetIssue: liveTarget,
+    succession: successionAgreement.succession,
+    artifactId: artifact.id,
+    workspaceSeedId: seed.id,
+  };
+}
+
+async function persistCompletionSuccessionVerification(input: {
+  verification: CompletionSuccessionVerification | null;
+  lifecycleStore: Pick<IssueLifecycleStore, "get" | "updateIssue">;
+  recordLifecycleEvidence?:
+    | ((input: RecordLifecycleEvidenceInput) => Promise<unknown>)
+    | undefined;
+}): Promise<void> {
+  if (input.verification === null) return;
+  const [sourceLifecycle, targetLifecycle] = await Promise.all([
+    input.lifecycleStore.get(input.verification.sourceIssue.id),
+    input.lifecycleStore.get(input.verification.targetIssue.id),
+  ]);
+  const verifiedAt = new Date().toISOString();
+  const sourcePatch: IssueLifecyclePatch = {
+    succession: mergeIssueSuccessionProgress(
+      sourceLifecycle?.succession,
+      {
+        ...input.verification.succession,
+        role: "succeeded",
+        status: "verified_green",
+        artifactId: input.verification.artifactId,
+        workspaceSeedId: input.verification.workspaceSeedId,
+        updatedAt: verifiedAt,
+      },
+    ),
+  };
+  const targetPatch: IssueLifecyclePatch = {
+    succession: mergeIssueSuccessionProgress(
+      targetLifecycle?.succession,
+      {
+        ...input.verification.succession,
+        role: "successor",
+        status: "verified_green",
+        artifactId: input.verification.artifactId,
+        workspaceSeedId: input.verification.workspaceSeedId,
+        updatedAt: verifiedAt,
+      },
+    ),
+  };
+  const [updatedSource, updatedTarget] = await Promise.all([
+    input.lifecycleStore.updateIssue(
+      input.verification.sourceIssue,
+      sourcePatch,
+    ),
+    input.lifecycleStore.updateIssue(
+      input.verification.targetIssue,
+      targetPatch,
+    ),
+  ]);
+  if (input.recordLifecycleEvidence === undefined) return;
+  const sourceId = `succession:${input.verification.succession.id}:verified_green`;
+  await Promise.all([
+    input.recordLifecycleEvidence({
+      issue: input.verification.sourceIssue,
+      lifecycle: updatedSource,
+      patch: sourcePatch,
+      eventType: "succession_verified_green",
+      sourceId,
+      reason: `succession ${input.verification.succession.id} verified green`,
+    }),
+    input.recordLifecycleEvidence({
+      issue: input.verification.targetIssue,
+      lifecycle: updatedTarget,
+      patch: targetPatch,
+      eventType: "succession_verified_green",
+      sourceId,
+      reason: `succession ${input.verification.succession.id} verified green`,
+    }),
+  ]);
 }
 
 function assertCompletionContractHasNotDrifted(

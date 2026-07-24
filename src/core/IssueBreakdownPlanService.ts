@@ -6,6 +6,7 @@ import {
   analyzeIssueContractDescription,
   hasMeaningfulRemainingBlocker,
   missingRequiredIssueContractSections,
+  parseIssueContractFromDescription,
 } from "./IssueContractLint.js";
 import { SymphonyError } from "./errors.js";
 import type {
@@ -17,8 +18,8 @@ import type {
 import type { RunTranscriptStore } from "./persistence/RunTranscriptStore.js";
 import type { Issue } from "./types.js";
 
-export const ISSUE_BREAKDOWN_PLAN_SCHEMA_VERSION = 1;
-export const ISSUE_CONTENT_FINGERPRINT_VERSION = 1;
+export const ISSUE_BREAKDOWN_PLAN_SCHEMA_VERSION = 2;
+export const ISSUE_CONTENT_FINGERPRINT_VERSION = 2;
 
 const issueBreakdownPlanSchema = z.object({
   runId: z.string().trim().min(1),
@@ -107,6 +108,10 @@ export class IssueBreakdownPlanService {
     }
 
     validateProposedIssues(parsed.proposedIssues, this.options.config);
+    validateProposedIssueRelationshipGraph(
+      parsed.proposedIssues,
+      context.issue.identifier,
+    );
 
     const acceptedAt = new Date().toISOString();
     const plan: IssueBreakdownPlanRecord = {
@@ -211,6 +216,17 @@ export function issueContentFingerprint(issue: Issue): string {
         description: normalizeString(issue.description ?? ""),
         priority: issue.priority,
         labels: normalizeStringList(issue.labels, { lowercase: true }),
+        blocks: (issue.blocks ?? [])
+          .map((blocked) => ({
+            id: normalizeNullableString(blocked.id),
+            identifier: normalizeNullableString(blocked.identifier),
+            state: normalizeNullableString(blocked.state),
+          }))
+          .sort((left, right) =>
+            `${left.identifier ?? ""}\0${left.id ?? ""}\0${left.state ?? ""}`.localeCompare(
+              `${right.identifier ?? ""}\0${right.id ?? ""}\0${right.state ?? ""}`,
+            ),
+          ),
         blockedBy: issue.blockedBy
           .map((blocker) => ({
             id: normalizeNullableString(blocker.id),
@@ -241,9 +257,10 @@ export function issueBreakdownPlanFingerprintsMatch(
 ): boolean {
   if (plan.configFingerprint !== issueBreakdownConfigFingerprint(config)) return false;
   if (plan.issueContentFingerprint.length === 0) return false;
+  const currentFingerprint = issueContentFingerprintForBreakdownPlan(issue, plan);
   if (
-    plan.issueContentFingerprint !==
-    issueContentFingerprintForBreakdownPlan(issue, plan)
+    plan.issueContentFingerprint !== currentFingerprint &&
+    plan.applicationTargetIssueContentFingerprint !== currentFingerprint
   ) {
     return false;
   }
@@ -268,17 +285,159 @@ function issueWithoutPlanCreatedBlockers(issue: Issue, plan: IssueBreakdownPlanR
 }
 
 export function issueBreakdownPlanSatisfiesCurrentValidation(
-  plan: Pick<IssueBreakdownPlanRecord, "proposedIssues">,
+  plan: Pick<IssueBreakdownPlanRecord, "proposedIssues" | "issueIdentifier">,
   config: ServiceConfig,
 ): boolean {
   try {
     validateProposedIssues(plan.proposedIssues, config);
+    validateProposedIssueRelationshipGraph(
+      plan.proposedIssues,
+      plan.issueIdentifier,
+    );
     return true;
   } catch (error) {
     if (error instanceof SymphonyError && error.code === "invalid_request") return false;
     throw error;
   }
 }
+
+function validateProposedIssueRelationshipGraph(
+  proposedIssues: readonly IssueBreakdownProposedIssue[],
+  parentIssueIdentifier: string,
+): void {
+  const titles = proposedIssues.map((item) => item.title.trim());
+  const titleIndex = new Map(
+    titles.map((title, index) => [title.toLowerCase(), index]),
+  );
+  if (titleIndex.size !== titles.length) {
+    throw new SymphonyError(
+      "invalid_request",
+      "Proposed issue titles must be unique before relationship contracts can be resolved",
+    );
+  }
+  for (const [index, proposedIssue] of proposedIssues.entries()) {
+    const contract = parseIssueContractFromDescription(
+      proposedIssue.description,
+    );
+    if (!contract?.relationships) continue;
+    const unknownDependencies = proposedIssue.dependencies.filter(
+      (dependency) => !titleIndex.has(dependency.trim().toLowerCase()),
+    );
+    if (unknownDependencies.length > 0) {
+      throw new SymphonyError(
+        "invalid_request",
+        `${describeProposedIssue(index, proposedIssue.title)} dependencies must name proposed issue titles: ${unknownDependencies.join(", ")}`,
+      );
+    }
+    const dependentTitles = proposedIssues
+      .filter((candidate) =>
+        candidate.dependencies.some(
+          (dependency) =>
+            dependency.trim().toLowerCase() ===
+            proposedIssue.title.trim().toLowerCase(),
+        ),
+      )
+      .map((candidate) => candidate.title.trim());
+    const expectedBlocks = normalizeIssueReferenceSet([
+      parentIssueIdentifier,
+      ...dependentTitles,
+    ]);
+    const expectedBlockedBy = normalizeIssueReferenceSet(
+      proposedIssue.dependencies,
+    );
+    const declaredBlocks = normalizeIssueReferenceSet(
+      contract.relationships.blocks,
+    );
+    const declaredBlockedBy = normalizeIssueReferenceSet(
+      contract.relationships.blockedBy,
+    );
+    if (!sameStringArray(declaredBlocks, expectedBlocks)) {
+      throw new SymphonyError(
+        "invalid_request",
+        `${describeProposedIssue(index, proposedIssue.title)} relationships.blocks must exactly name the parent and dependent proposed issues`,
+        {
+          expected: expectedBlocks,
+          declared: declaredBlocks,
+        },
+      );
+    }
+    if (!sameStringArray(declaredBlockedBy, expectedBlockedBy)) {
+      throw new SymphonyError(
+        "invalid_request",
+        `${describeProposedIssue(index, proposedIssue.title)} relationships.blockedBy must exactly match dependencies`,
+        {
+          expected: expectedBlockedBy,
+          declared: declaredBlockedBy,
+        },
+      );
+    }
+    const succession = contract.relationships.succession;
+    if (succession === undefined) continue;
+    const counterpartReference =
+      succession.successor?.issue ?? succession.succeeds?.issue;
+    const counterpartIndex =
+      counterpartReference === undefined
+        ? undefined
+        : titleIndex.get(counterpartReference.trim().toLowerCase());
+    if (counterpartIndex === undefined) {
+      throw new SymphonyError(
+        "invalid_request",
+        `${describeProposedIssue(index, proposedIssue.title)} succession counterpart must be another proposed issue title`,
+      );
+    }
+    const counterpart = proposedIssues[counterpartIndex]!;
+    const counterpartContract = parseIssueContractFromDescription(
+      counterpart.description,
+    );
+    const reciprocal = counterpartContract?.relationships?.succession;
+    const expectedRole =
+      succession.successor !== undefined ? "succeeds" : "successor";
+    const reciprocalReference =
+      expectedRole === "succeeds"
+        ? reciprocal?.succeeds?.issue
+        : reciprocal?.successor?.issue;
+    if (
+      reciprocal === undefined ||
+      reciprocal.id !== succession.id ||
+      reciprocal.purpose !== succession.purpose ||
+      reciprocalReference?.trim().toLowerCase() !==
+        proposedIssue.title.trim().toLowerCase()
+    ) {
+      throw new SymphonyError(
+        "invalid_request",
+        `${describeProposedIssue(index, proposedIssue.title)} succession is not reciprocally agreed by ${JSON.stringify(counterpart.title)}`,
+      );
+    }
+    const succeededIssue =
+      succession.successor !== undefined ? proposedIssue : counterpart;
+    const successorIssue =
+      succession.successor !== undefined ? counterpart : proposedIssue;
+    if (
+      !successorIssue.dependencies.some(
+        (dependency) =>
+          dependency.trim().toLowerCase() ===
+          succeededIssue.title.trim().toLowerCase(),
+      )
+    ) {
+      throw new SymphonyError(
+        "invalid_request",
+        `${describeProposedIssue(index, proposedIssue.title)} succession requires ${JSON.stringify(successorIssue.title)} to depend on ${JSON.stringify(succeededIssue.title)} so Symphony can create the independent Linear block edge`,
+      );
+    }
+  }
+}
+
+function normalizeIssueReferenceSet(values: readonly string[]): string[] {
+  return [...new Set(values.map((value) => value.trim().toLowerCase()))].sort();
+}
+
+function sameStringArray(left: readonly string[], right: readonly string[]): boolean {
+  return (
+    left.length === right.length &&
+    left.every((value, index) => value === right[index])
+  );
+}
+
 
 export function isCurrentFreshIssueBreakdownPlan(
   lifecycle: IssueLifecycleRecord | null | undefined,

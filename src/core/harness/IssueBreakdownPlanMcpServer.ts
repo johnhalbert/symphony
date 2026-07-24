@@ -129,7 +129,7 @@ export function issueBreakdownPlanInputSchema(): Record<string, unknown> {
               type: "string",
               minLength: 1,
               description:
-                "Agent-eligible issue description using the required headings, including an `Issue Contract` fenced `json` block with schemaVersion, contractVersion, and requirements.",
+                "Agent-eligible issue description using the required headings, including a schema-v2 `Issue Contract` fenced `json` block with contractVersion, requirements, required relationships.blocks/blockedBy arrays, and optional reciprocal succession.",
             },
             acceptanceCriteria: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
             dependencies: { type: "array", items: { type: "string", minLength: 1 } },

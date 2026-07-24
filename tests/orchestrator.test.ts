@@ -22,6 +22,10 @@ import {
   type CompletionReportPullRequestPublisher,
 } from "../src/core/CompletionReportService.js";
 import { SymphonyError } from "../src/core/errors.js";
+import {
+  AcceptedArtifactCompletionError,
+  AcceptedArtifactService,
+} from "../src/core/AcceptedArtifactService.js";
 import { parseIssueContract } from "../src/core/IssueContractLint.js";
 import {
   FileOperatorApprovalStore,
@@ -76,8 +80,10 @@ import {
   type IssueBreakdownCreatedIssueRef,
   type IssueBreakdownPlanRecord,
   type IssueLifecyclePatch,
+  type IssueLifecycleRecord,
   type IssueAcceptedArtifactRecord,
   type IssueWorkspaceSeedRecord,
+  type IssueSuccessionRecord,
   type IssueMergeConflictMetadata,
   type IssueMergeGateState,
   type IssueReviewFeedbackRecord,
@@ -118,7 +124,11 @@ import type {
   TrackerStateLists,
   WorkspaceSeedBinding,
 } from "../src/core/types.js";
-import { agentEligibleIssueContract, issue, testConfig } from "./helpers.js";
+import {
+  agentEligibleIssueContract,
+  issue as baseIssue,
+  testConfig,
+} from "./helpers.js";
 
 type IssueCreateWriteback = Extract<
   NewWritebackOperation,
@@ -133,6 +143,13 @@ type RequestedTransitionCall = {
   candidateSource: string;
   context: ReturnType<typeof mergePolicyChainContext>;
 };
+
+function issue(overrides: Partial<Issue> = {}): Issue {
+  return baseIssue({
+    description: agentEligibleIssueContract(),
+    ...overrides,
+  });
+}
 
 function issuesInStates(issues: Issue[], states: string[]): Issue[] {
   const wanted = new Set(states.map((state) => state.toLowerCase()));
@@ -4739,6 +4756,7 @@ describe("Orchestrator", () => {
     const candidate = issue({
       state: "In Progress",
       branchName: "symphony/TEST-1",
+      description: agentEligibleIssueContract(),
     });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
@@ -5162,6 +5180,7 @@ describe("Orchestrator", () => {
     const candidate = issue({
       state: currentState,
       branchName: "symphony/TEST-1",
+      description: agentEligibleIssueContract(),
     });
     const currentIssue = (): Issue => ({ ...candidate, state: currentState });
     const tracker: TrackerClient = {
@@ -5196,7 +5215,12 @@ describe("Orchestrator", () => {
         proposedIssues: [
           {
             title: "Implement the bounded repair",
-            description: agentEligibleIssueContract(),
+            description: agentEligibleIssueContract({
+              issueContractRelationships: {
+                blocks: [candidate.identifier],
+                blockedBy: [],
+              },
+            }),
             acceptanceCriteria: ["The repair is implemented and tested."],
             dependencies: [],
             labels: ["planning"],
@@ -5214,9 +5238,21 @@ describe("Orchestrator", () => {
     const outboxStore = new FileWritebackOutboxStore(
       config.workspace.stateDir,
     );
-    const writer = new StateChangingWriter((state) => {
-      currentState = state;
-    });
+    const writer = new StateChangingWriter(
+      (state) => {
+        currentState = state;
+      },
+      (issueId, description) => {
+        if (issueId === candidate.id) candidate.description = description;
+      },
+      (relation) => {
+        if (relation.targetIssueId === candidate.id) {
+          candidate.blockedBy = [
+            { id: relation.sourceIssueId, identifier: "TEST-2", state: "Todo" },
+          ];
+        }
+      },
+    );
     const writeback = new WritebackProcessor(
       outboxStore,
       writer,
@@ -5305,6 +5341,7 @@ describe("Orchestrator", () => {
       state: currentState,
       labels: ["planning"],
       branchName: "symphony/TEST-1",
+      description: agentEligibleIssueContract(),
     });
     const currentIssue = (): Issue => ({ ...candidate, state: currentState });
     const tracker: TrackerClient = {
@@ -5334,7 +5371,12 @@ describe("Orchestrator", () => {
         proposedIssues: [
           {
             title: "Implement the planned repair",
-            description: agentEligibleIssueContract(),
+            description: agentEligibleIssueContract({
+              issueContractRelationships: {
+                blocks: [candidate.identifier],
+                blockedBy: [],
+              },
+            }),
             acceptanceCriteria: ["The repair is implemented and tested."],
             dependencies: [],
             labels: ["planning"],
@@ -5349,9 +5391,21 @@ describe("Orchestrator", () => {
       },
     );
     const logger = new StructuredLogger(() => undefined);
-    const writer = new StateChangingWriter((state) => {
-      currentState = state;
-    });
+    const writer = new StateChangingWriter(
+      (state) => {
+        currentState = state;
+      },
+      (issueId, description) => {
+        if (issueId === candidate.id) candidate.description = description;
+      },
+      (relation) => {
+        if (relation.targetIssueId === candidate.id) {
+          candidate.blockedBy = [
+            { id: relation.sourceIssueId, identifier: "TEST-2", state: "Todo" },
+          ];
+        }
+      },
+    );
     const writeback = new WritebackProcessor(
       new FileWritebackOutboxStore(config.workspace.stateDir),
       writer,
@@ -8805,9 +8859,15 @@ describe("Orchestrator", () => {
   it("routes accepted-artifact pass reconciliation to unmerged completion instead of merge policy", async () => {
     const config = testConfig(root);
     const logger = new StructuredLogger(() => undefined);
+    const candidate = issue({ state: "In Review" });
     const orchestrator = new Orchestrator({
       config,
-      tracker: emptyTracker(),
+      tracker: {
+        ...emptyTracker(),
+        async fetchIssueStatesByIds() {
+          return [candidate];
+        },
+      },
       workspaceManager: new WorkspaceManager({
         workspace: config.workspace,
         hooks: config.hooks,
@@ -8840,12 +8900,478 @@ describe("Orchestrator", () => {
     };
 
     await internal.requestMergePolicyAfterPassVerdictAction({
-      issue: issue({ state: "In Review" }),
+      issue: candidate,
       handoffReconciliation: { reviewVerdict: verdict },
     });
 
     expect(completeAcceptedArtifactAction).toHaveBeenCalledOnce();
     expect(processMergePolicyTransitionCandidate).not.toHaveBeenCalled();
+    await orchestrator.stop();
+  });
+
+  it("blocks after the accepted-artifact validation failure budget is exhausted", async () => {
+    const config = testConfig(root);
+    config.writeback.enabled = true;
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.reviewLoop.failureLimits.acceptedArtifactValidationFailures = 2;
+    const logger = new StructuredLogger(() => undefined);
+    const source = issue({
+      state: "In Review",
+      description: agentEligibleIssueContract({
+        issueContractContractVersion: "2026-07-22.live",
+        issueContractDelivery: {
+          mode: "accepted_artifact",
+          artifact: "expected_red_tests",
+        },
+      }),
+    });
+    let currentState = "In Review";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return issuesInStates([{ ...source, state: currentState }], states);
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...source, state: currentState }];
+      },
+    };
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    const reviewedContract = parseIssueContract(
+      agentEligibleIssueContract({
+        issueContractDelivery: {
+          mode: "accepted_artifact",
+          artifact: "expected_red_tests",
+        },
+      }),
+    );
+    if (!reviewedContract.valid) {
+      throw new Error("expected valid accepted-artifact contract");
+    }
+    const acceptedReport = (
+      suffix: string,
+    ): IssueCompletionReportRecord => ({
+      ...completionReportRecord(source),
+      id: `completion-report:${source.id}:${suffix}`,
+      idempotencyKey: `completion-${suffix}`,
+      runId: `worker-${suffix}`,
+      contractSnapshot: {
+        schemaVersion: reviewedContract.contract.schemaVersion,
+        contractVersion: reviewedContract.contract.contractVersion,
+        fingerprint: reviewedContract.fingerprint,
+        delivery: {
+          mode: "accepted_artifact",
+          artifact: "expected_red_tests",
+        },
+      },
+    });
+    const acceptedVerdict = (suffix: string): IssueReviewVerdictRecord => ({
+      ...reviewVerdictRecord(source),
+      id: `review-verdict:${source.id}:${suffix}`,
+      idempotencyKey: `verdict-${suffix}`,
+      runId: `review-${suffix}`,
+      verdict: "pass",
+      passDisposition: "accepted_artifact",
+      acceptanceResults: [
+        {
+          text: "Expected-red artifact is accepted",
+          satisfied: true,
+          evidence: "reviewed",
+        },
+      ],
+      findings: [],
+    });
+    const firstReport = acceptedReport("1");
+    const firstVerdict = acceptedVerdict("1");
+    await lifecycleStore.ensureIssue(source, {
+      phase: "passed",
+      lastCompletionReportId: firstReport.id,
+      completionReports: [firstReport],
+      lastReviewVerdictId: firstVerdict.id,
+      reviewVerdicts: [firstVerdict],
+    });
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(
+      new FileWritebackOutboxStore(config.workspace.stateDir),
+      writer,
+      logger,
+      300_000,
+    );
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      writeback,
+      acceptedArtifactClient: {
+        async getPullRequest() {
+          throw new Error("unexpected GitHub access");
+        },
+        async getBranchHeadSha() {
+          throw new Error("unexpected GitHub access");
+        },
+        async closePullRequest() {
+          throw new Error("unexpected GitHub access");
+        },
+      },
+    });
+    const internal = orchestrator as unknown as {
+      completeAcceptedArtifactAction(context: {
+        issue: Issue;
+        handoffReconciliation: {
+          reviewVerdict: IssueReviewVerdictRecord;
+        };
+      }): Promise<unknown>;
+    };
+
+    await expect(
+      internal.completeAcceptedArtifactAction({
+        issue: source,
+        handoffReconciliation: { reviewVerdict: firstVerdict },
+      }),
+    ).resolves.toMatchObject({
+      details: {
+        disposition: "returned_to_implementation",
+        validationFailureCount: 1,
+        validationFailureLimit: 2,
+        validationFailureReason: "contract_or_review_drift",
+      },
+    });
+    await expect(lifecycleStore.get(source.id)).resolves.toMatchObject({
+      phase: "implementation",
+      reviewRound: 0,
+      acceptedArtifactValidationFailure: {
+        count: 1,
+        limit: 2,
+        reason: "contract_or_review_drift",
+        completionReportId: firstReport.id,
+        reviewVerdictId: firstVerdict.id,
+      },
+    });
+    expect(currentState).toBe("In Progress");
+
+    const firstLifecycle = await lifecycleStore.get(source.id);
+    if (!firstLifecycle) throw new Error("expected lifecycle after first failure");
+    const secondReport = acceptedReport("2");
+    const secondVerdict = acceptedVerdict("2");
+    await lifecycleStore.updateIssue(source, {
+      phase: "passed",
+      blockedReason: null,
+      lastCompletionReportId: secondReport.id,
+      completionReports: [...firstLifecycle.completionReports, secondReport],
+      lastReviewVerdictId: secondVerdict.id,
+      reviewVerdicts: [...firstLifecycle.reviewVerdicts, secondVerdict],
+    });
+    currentState = "In Review";
+
+    await expect(
+      internal.completeAcceptedArtifactAction({
+        issue: source,
+        handoffReconciliation: { reviewVerdict: secondVerdict },
+      }),
+    ).resolves.toMatchObject({
+      status: "skipped",
+      stop: true,
+      details: {
+        disposition: "blocked",
+        validationFailureCount: 2,
+        validationFailureLimit: 2,
+        validationFailureReason: "contract_or_review_drift",
+      },
+    });
+    const blocked = await lifecycleStore.get(source.id);
+    expect(blocked).toMatchObject({
+      phase: "blocked",
+      reviewRound: 0,
+      lastCompletionReportId: null,
+      lastReviewVerdictId: null,
+      acceptedArtifactValidationFailure: {
+        count: 2,
+        limit: 2,
+        completionReportId: secondReport.id,
+        reviewVerdictId: secondVerdict.id,
+      },
+    });
+    expect(blocked?.blockedReason).toContain(
+      "max accepted-artifact validation failures reached (2/2)",
+    );
+    expect(
+      blocked?.completionReports.find(
+        (candidate) => candidate.id === secondReport.id,
+      ),
+    ).toMatchObject({ supersededAt: expect.any(String) });
+    expect(
+      blocked?.reviewVerdicts.find(
+        (candidate) => candidate.id === secondVerdict.id,
+      ),
+    ).toMatchObject({ supersededAt: expect.any(String) });
+    expect(currentState).toBe("Blocked");
+    expect(writer.comments.at(-1)?.body).toContain(
+      "Accepted-artifact validation failures: 2 / 2",
+    );
+    await orchestrator.stop();
+  });
+
+  it("blocks a canonical accepted-artifact delivery-contract defect immediately", async () => {
+    const config = testConfig(root);
+    config.writeback.enabled = true;
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.reviewLoop.failureLimits.acceptedArtifactValidationFailures = 3;
+    const logger = new StructuredLogger(() => undefined);
+    const source = issue({
+      state: "In Review",
+      description: agentEligibleIssueContract({
+        issueContractDelivery: { mode: "merge" },
+      }),
+    });
+    let currentState = "In Review";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return issuesInStates([{ ...source, state: currentState }], states);
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...source, state: currentState }];
+      },
+    };
+    const report = completionReportRecord(source);
+    const verdict: IssueReviewVerdictRecord = {
+      ...reviewVerdictRecord(source),
+      verdict: "pass",
+      passDisposition: "accepted_artifact",
+      acceptanceResults: [
+        {
+          text: "Expected-red artifact is accepted",
+          satisfied: true,
+          evidence: "reviewed",
+        },
+      ],
+      findings: [],
+    };
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    await lifecycleStore.ensureIssue(source, {
+      phase: "passed",
+      lastCompletionReportId: report.id,
+      completionReports: [report],
+      lastReviewVerdictId: verdict.id,
+      reviewVerdicts: [verdict],
+    });
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    vi.spyOn(
+      AcceptedArtifactService.prototype,
+      "completeAcceptedArtifact",
+    ).mockRejectedValue(
+      new AcceptedArtifactCompletionError(
+        "contract_or_head_drift",
+        "contract_or_review_drift",
+        "Current Issue Contract no longer declares expected-red accepted-artifact delivery",
+      ),
+    );
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        logger,
+        300_000,
+      ),
+      acceptedArtifactClient: {
+        async getPullRequest() {
+          throw new Error("unexpected GitHub access");
+        },
+        async getBranchHeadSha() {
+          throw new Error("unexpected GitHub access");
+        },
+        async closePullRequest() {
+          throw new Error("unexpected GitHub access");
+        },
+      },
+    });
+    const internal = orchestrator as unknown as {
+      completeAcceptedArtifactAction(context: {
+        issue: Issue;
+        handoffReconciliation: {
+          reviewVerdict: IssueReviewVerdictRecord;
+        };
+      }): Promise<unknown>;
+    };
+
+    await expect(
+      internal.completeAcceptedArtifactAction({
+        issue: source,
+        handoffReconciliation: { reviewVerdict: verdict },
+      }),
+    ).resolves.toMatchObject({
+      status: "skipped",
+      stop: true,
+      details: {
+        disposition: "blocked",
+        validationFailureCount: 1,
+        validationFailureLimit: 1,
+        validationFailureReason: "contract_or_review_drift",
+      },
+    });
+    await expect(lifecycleStore.get(source.id)).resolves.toMatchObject({
+      phase: "blocked",
+      acceptedArtifactValidationFailure: {
+        count: 1,
+        limit: 1,
+        completionReportId: report.id,
+        reviewVerdictId: verdict.id,
+      },
+    });
+    expect(currentState).toBe("Blocked");
+    await orchestrator.stop();
+  });
+
+  it("clears accepted-artifact validation failures before post-completion refresh", async () => {
+    const config = testConfig(root);
+    config.reviewLoop.reviewStates = ["In Review"];
+    const logger = new StructuredLogger(() => undefined);
+    const source = issue({ state: "In Review" });
+    const artifact = acceptedArtifactRecord(
+      source,
+      "artifact-validation-failure-reset",
+    );
+    const verdict: IssueReviewVerdictRecord = {
+      ...reviewVerdictRecord(source),
+      id: artifact.reviewVerdictId,
+      verdict: "pass",
+      passDisposition: "accepted_artifact",
+      acceptanceResults: [
+        {
+          text: "Expected-red artifact is accepted",
+          satisfied: true,
+          evidence: "reviewed",
+        },
+      ],
+      findings: [],
+    };
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    await lifecycleStore.ensureIssue(source, {
+      phase: "passed",
+      acceptedArtifact: artifact,
+      lastReviewVerdictId: verdict.id,
+      reviewVerdicts: [verdict],
+      acceptedArtifactValidationFailure: {
+        version: 1,
+        count: 1,
+        limit: 3,
+        category: "contract_or_head_drift",
+        reason: "source_checkpoint_drift",
+        signature: "prior-failure",
+        message: "prior checkpoint drift",
+        firstFailedAt: "2026-07-22T10:00:00.000Z",
+        lastFailedAt: "2026-07-22T10:00:00.000Z",
+        completionReportId: artifact.completionReportId,
+        reviewVerdictId: verdict.id,
+        liveContractFingerprint: artifact.contractFingerprint,
+        reviewedContractFingerprint: artifact.contractFingerprint,
+        sourceHeadSha: artifact.sourceHeadSha,
+      },
+    });
+    let refreshCalls = 0;
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        refreshCalls += 1;
+        if (refreshCalls === 1) return [source];
+        throw new SymphonyError(
+          "tracker_unavailable",
+          "post-completion refresh unavailable",
+        );
+      },
+    };
+    vi.spyOn(
+      AcceptedArtifactService.prototype,
+      "completeAcceptedArtifact",
+    ).mockResolvedValue({
+      status: "completed_unmerged",
+      replayed: true,
+      artifact,
+      writebackOperations: [],
+      writebacksSettled: false,
+    });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      acceptedArtifactClient: {
+        async getPullRequest() {
+          throw new Error("unexpected GitHub access");
+        },
+        async getBranchHeadSha() {
+          throw new Error("unexpected GitHub access");
+        },
+        async closePullRequest() {
+          throw new Error("unexpected GitHub access");
+        },
+      },
+    });
+    const internal = orchestrator as unknown as {
+      completeAcceptedArtifactAction(context: {
+        issue: Issue;
+        handoffReconciliation: {
+          reviewVerdict: IssueReviewVerdictRecord;
+        };
+      }): Promise<unknown>;
+    };
+
+    await expect(
+      internal.completeAcceptedArtifactAction({
+        issue: source,
+        handoffReconciliation: { reviewVerdict: verdict },
+      }),
+    ).rejects.toThrow("post-completion refresh unavailable");
+    expect(
+      (await lifecycleStore.get(source.id))
+        ?.acceptedArtifactValidationFailure,
+    ).toBeNull();
     await orchestrator.stop();
   });
 
@@ -9156,7 +9682,7 @@ describe("Orchestrator", () => {
       description: agentEligibleIssueContract(),
       blockedBy: [{ id: source.id, identifier: source.identifier, state: "Done" }],
     });
-    const artifact = acceptedArtifactRecord(source);
+    const artifact = acceptedArtifactRecord(source, undefined, target);
     await lifecycleStore.ensureIssue(source, {
       phase: "terminal",
       acceptedArtifact: artifact,
@@ -9170,7 +9696,9 @@ describe("Orchestrator", () => {
         return issuesInStates([], states);
       },
       async fetchIssueStatesByIds(ids) {
-        return ids.includes(source.id) ? [source] : [];
+        return [target, source].filter((candidate) =>
+          ids.includes(candidate.id),
+        );
       },
     };
     const workspaceManager = new WorkspaceManager({
@@ -9228,6 +9756,22 @@ describe("Orchestrator", () => {
       preparedBaseHeadSha: null,
       preparedHeadSha: null,
     });
+    expect(targetLifecycle?.succession).toMatchObject({
+      id: artifact.successionId,
+      role: "successor",
+      status: "checkpointed",
+      artifactId: artifact.id,
+      workspaceSeedId: `workspace-seed:${target.id}:${artifact.id}`,
+    });
+    await expect(lifecycleStore.get(source.id)).resolves.toMatchObject({
+      succession: {
+        id: artifact.successionId,
+        role: "succeeded",
+        status: "checkpointed",
+        artifactId: artifact.id,
+        workspaceSeedId: null,
+      },
+    });
 
     const entry = shutdownTestRunningEntry(target, new AbortController());
     entry.lifecycle = targetLifecycle;
@@ -9280,7 +9824,7 @@ describe("Orchestrator", () => {
     });
     await lifecycleStore.ensureIssue(source, {
       phase: "terminal",
-      acceptedArtifact: acceptedArtifactRecord(source, "artifact-reopened"),
+      acceptedArtifact: acceptedArtifactRecord(source, "artifact-reopened", target),
     });
     const orchestrator = new Orchestrator({
       config,
@@ -9291,8 +9835,10 @@ describe("Orchestrator", () => {
         async fetchIssuesByStates() {
           return [];
         },
-        async fetchIssueStatesByIds() {
-          return [{ ...source, state: "In Progress" }];
+        async fetchIssueStatesByIds(ids) {
+          return [target, { ...source, state: "In Progress" }].filter(
+            (candidate) => ids.includes(candidate.id),
+          );
         },
       },
       workspaceManager: new WorkspaceManager({
@@ -9318,10 +9864,30 @@ describe("Orchestrator", () => {
     ).resolves.toMatchObject({
       status: "skipped",
       stop: true,
-      message: `Waiting for fresh accepted-artifact evidence from: ${source.identifier}`,
+      message: `Waiting for fresh accepted-artifact evidence from succession source ${source.identifier}`,
     });
     expect(context.dispatch.dependencyArtifactSeed).toBeNull();
-    expect(await lifecycleStore.get(target.id)).toBeNull();
+    await expect(lifecycleStore.get(target.id)).resolves.toMatchObject({
+      phase: "implementation",
+      workspaceSeed: null,
+      relationshipState: {
+        status: "valid",
+        contractBlockedBy: [source.identifier],
+      },
+      succession: {
+        id: `tdd-${source.identifier.toLowerCase()}-${target.identifier.toLowerCase()}`,
+        role: "successor",
+        status: "agreed",
+        succeededIssue: {
+          id: source.id,
+          identifier: source.identifier,
+        },
+        successorIssue: {
+          id: target.id,
+          identifier: target.identifier,
+        },
+      },
+    });
     await orchestrator.stop();
   });
 
@@ -9339,27 +9905,11 @@ describe("Orchestrator", () => {
       identifier: "TEST-RED-DRIFTED",
       state: "Done",
     });
-    const driftedArtifact = acceptedArtifactRecord(
-      driftedSource,
-      "artifact-drifted-source",
-    );
-    driftedSource.description = agentEligibleIssueContract({
-      issueContractContractVersion: "2026-07-14.drifted-after-review",
-      issueContractDelivery: {
-        mode: "accepted_artifact",
-        artifact: "expected_red_tests",
-      },
-    });
     const canceledSource = issue({
       id: "canceled-source",
       identifier: "TEST-RED-CANCELED",
       state: "Done",
     });
-    const canceledArtifact = acceptedArtifactRecord(
-      canceledSource,
-      "artifact-canceled-source",
-    );
-    canceledSource.state = "Canceled";
     const missingSource = issue({
       id: "missing-source",
       identifier: "TEST-RED-MISSING",
@@ -9380,6 +9930,42 @@ describe("Orchestrator", () => {
             },
           ],
         }),
+    );
+    const driftedArtifact = acceptedArtifactRecord(
+      driftedSource,
+      "artifact-drifted-source",
+      targets[0],
+    );
+    const reviewedDriftedContract = parseIssueContract(
+      driftedSource.description,
+    );
+    const driftedSuccession = reviewedDriftedContract.valid
+      ? reviewedDriftedContract.contract.relationships?.succession
+      : undefined;
+    driftedSource.description = agentEligibleIssueContract({
+      issueContractContractVersion: "2026-07-14.drifted-after-review",
+      issueContractDelivery: {
+        mode: "accepted_artifact",
+        artifact: "expected_red_tests",
+      },
+      issueContractRelationships: {
+        blocks: [targets[0]!.identifier],
+        blockedBy: [],
+        ...(driftedSuccession === undefined
+          ? {}
+          : { succession: driftedSuccession }),
+      },
+    });
+    const canceledArtifact = acceptedArtifactRecord(
+      canceledSource,
+      "artifact-canceled-source",
+      targets[1],
+    );
+    canceledSource.state = "Canceled";
+    declareAcceptedArtifactSuccession(
+      missingSource,
+      targets[2]!,
+      "tdd-missing-source-target",
     );
     await lifecycleStore.ensureIssue(driftedSource, {
       phase: "terminal",
@@ -9402,8 +9988,8 @@ describe("Orchestrator", () => {
           return [];
         },
         async fetchIssueStatesByIds(ids) {
-          return [driftedSource, canceledSource].filter((source) =>
-            ids.includes(source.id),
+          return [...targets, driftedSource, canceledSource].filter((candidate) =>
+            ids.includes(candidate.id),
           );
         },
       },
@@ -9433,7 +10019,7 @@ describe("Orchestrator", () => {
       status: "skipped",
       stop: true,
       message: expect.stringContaining(
-        "only superseded accepted-artifact evidence",
+        "has no current completed accepted-artifact checkpoint",
       ),
     });
     await expect(
@@ -9444,7 +10030,7 @@ describe("Orchestrator", () => {
       status: "skipped",
       stop: true,
       message: expect.stringContaining(
-        "only superseded accepted-artifact evidence",
+        "is Canceled",
       ),
     });
     await expect(
@@ -9455,7 +10041,7 @@ describe("Orchestrator", () => {
       status: "skipped",
       stop: true,
       message: expect.stringContaining(
-        "waiting for fresh Linear state",
+        "succession contract is not a valid bilateral agreement",
       ),
     });
     await expect(lifecycleStore.get(targets[0]!.id)).resolves.toMatchObject({
@@ -9465,8 +10051,8 @@ describe("Orchestrator", () => {
       phase: "blocked",
     });
     await expect(lifecycleStore.get(targets[2]!.id)).resolves.toMatchObject({
-      phase: "implementation",
-      blockedReason: null,
+      phase: "blocked",
+      blockedReason: expect.stringContaining("counterpart"),
     });
     expect(
       (await lifecycleStore.get(driftedSource.id))?.acceptedArtifact
@@ -9492,10 +10078,6 @@ describe("Orchestrator", () => {
       identifier: "TEST-RED-REVIEW-FRESHNESS",
       state: "Done",
     });
-    const artifact = acceptedArtifactRecord(
-      source,
-      "artifact-review-freshness",
-    );
     const target = issue({
       id: "review-freshness-target",
       identifier: "TEST-IMPLEMENT-REVIEW-FRESHNESS",
@@ -9505,6 +10087,11 @@ describe("Orchestrator", () => {
         { id: source.id, identifier: source.identifier, state: "Done" },
       ],
     });
+    const artifact = acceptedArtifactRecord(
+      source,
+      "artifact-review-freshness",
+      target,
+    );
     const seed = {
       ...plannedWorkspaceSeed(target, acceptedArtifactSeed(artifact)),
       status: "prepared" as const,
@@ -9611,6 +10198,291 @@ describe("Orchestrator", () => {
     await orchestrator.stop();
   });
 
+  it("blocks ordinary review when the live relationship graph drifts after completion", async () => {
+    const config = testConfig(root);
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.blockedStates = ["Blocked"];
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    const dispatchedIssue = issue({
+      id: "ordinary-review-target",
+      identifier: "TEST-ORDINARY-REVIEW",
+      state: "In Review",
+      branchName: "symphony/TEST-ORDINARY-REVIEW",
+    });
+    const report = completionReportRecord(dispatchedIssue);
+    await lifecycleStore.ensureIssue(dispatchedIssue, {
+      phase: "review",
+      lastCompletionReportId: report.id,
+      completionReports: [report],
+    });
+    const liveIssue: Issue = {
+      ...dispatchedIssue,
+      blocks: [
+        {
+          id: "unexpected-dependent",
+          identifier: "TEST-UNEXPECTED",
+          state: "Todo",
+        },
+      ],
+    };
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds(ids) {
+        return ids.includes(liveIssue.id) ? [liveIssue] : [];
+      },
+    };
+    let trackerState = dispatchedIssue.state;
+    const writer = new StateChangingWriter((state) => {
+      trackerState = state;
+    });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        logger,
+        config.writeback.maxBackoffMs,
+      ),
+    });
+    const internal = orchestrator as unknown as {
+      validateDependencyArtifactBeforeReviewOrMerge(context: {
+        issue: Issue;
+      }): Promise<unknown>;
+    };
+
+    await expect(
+      internal.validateDependencyArtifactBeforeReviewOrMerge({
+        issue: dispatchedIssue,
+      }),
+    ).resolves.toMatchObject({
+      status: "skipped",
+      stop: true,
+      message: expect.stringContaining(
+        "Issue relationship contract changed or no longer matches Linear",
+      ),
+    });
+    expect(trackerState).toBe("Blocked");
+    expect(writer.comments[0]?.body).toContain(
+      "Linear relationship graph to the exact contract accepted by the completion report",
+    );
+    expect(writer.comments[0]?.body).not.toContain(
+      "declare the same succession id",
+    );
+    await expect(lifecycleStore.get(dispatchedIssue.id)).resolves.toMatchObject({
+      phase: "blocked",
+      succession: null,
+      relationshipState: {
+        status: "invalid",
+        contractBlocks: [],
+        trackerBlocks: [
+          {
+            id: "unexpected-dependent",
+            identifier: "TEST-UNEXPECTED",
+          },
+        ],
+      },
+    });
+    await orchestrator.stop();
+  });
+
+  it("blocks unrelated graph drift without downgrading a valid seeded succession", async () => {
+    const config = testConfig(root);
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.blockedStates = ["Blocked"];
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    const source = issue({
+      id: "graph-drift-source",
+      identifier: "TEST-RED-GRAPH-DRIFT",
+      state: "Done",
+    });
+    const target = issue({
+      id: "graph-drift-target",
+      identifier: "TEST-IMPLEMENT-GRAPH-DRIFT",
+      state: "In Review",
+      branchName: "symphony/TEST-IMPLEMENT-GRAPH-DRIFT",
+    });
+    const artifact = acceptedArtifactRecord(
+      source,
+      "artifact-graph-drift",
+      target,
+    );
+    const seed = {
+      ...plannedWorkspaceSeed(target, acceptedArtifactSeed(artifact)),
+      status: "prepared" as const,
+      preparedBaseHeadSha: "4".repeat(40),
+      preparedHeadSha: "5".repeat(40),
+      preparedAt: "2026-07-14T00:05:00.000Z",
+    };
+    const report = completionReportRecord(target);
+    await lifecycleStore.ensureIssue(source, {
+      phase: "terminal",
+      acceptedArtifact: artifact,
+      succession: successionRecordForIssues(
+        source,
+        target,
+        "succeeded",
+        "verified_green",
+        artifact.id,
+        seed.id,
+      ),
+    });
+    await lifecycleStore.ensureIssue(target, {
+      phase: "review",
+      workspaceSeed: seed,
+      succession: successionRecordForIssues(
+        source,
+        target,
+        "successor",
+        "verified_green",
+        artifact.id,
+        seed.id,
+      ),
+      lastCompletionReportId: report.id,
+      completionReports: [report],
+    });
+    const liveTarget: Issue = {
+      ...target,
+      blocks: [
+        {
+          id: "unexpected-dependent",
+          identifier: "TEST-UNEXPECTED",
+          state: "Todo",
+        },
+      ],
+    };
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds(ids) {
+        return [liveTarget, source].filter(
+          (candidate) =>
+            ids.includes(candidate.id) ||
+            ids.includes(candidate.identifier),
+        );
+      },
+    };
+    let trackerState = target.state;
+    const writer = new StateChangingWriter((state) => {
+      trackerState = state;
+    });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        logger,
+        config.writeback.maxBackoffMs,
+      ),
+    });
+    const internal = orchestrator as unknown as {
+      validateDependencyArtifactBeforeReviewOrMerge(context: {
+        issue: Issue;
+      }): Promise<unknown>;
+    };
+
+    await expect(
+      internal.validateDependencyArtifactBeforeReviewOrMerge({
+        issue: target,
+      }),
+    ).resolves.toMatchObject({
+      status: "skipped",
+      stop: true,
+      message: expect.stringContaining(
+        "Issue relationship contract changed or no longer matches Linear",
+      ),
+    });
+
+    expect(trackerState).toBe("Blocked");
+    expect(writer.comments[0]?.body).toContain(
+      "Linear relationship graph to the exact contract accepted by the completion report",
+    );
+    expect(writer.comments[0]?.body).not.toContain(
+      "declare the same succession id",
+    );
+    await expect(lifecycleStore.get(target.id)).resolves.toMatchObject({
+      phase: "blocked",
+      workspaceSeed: {
+        id: seed.id,
+        status: "prepared",
+      },
+      succession: {
+        id: artifact.successionId,
+        status: "verified_green",
+        artifactId: artifact.id,
+        workspaceSeedId: seed.id,
+        validationErrors: [],
+      },
+      relationshipState: {
+        status: "invalid",
+      },
+      completionReports: [
+        {
+          id: report.id,
+          supersededAt: null,
+        },
+      ],
+    });
+    await expect(lifecycleStore.get(source.id)).resolves.toMatchObject({
+      succession: {
+        status: "verified_green",
+      },
+    });
+    await expect(
+      orchestrator.inspectIssueHistory(target.id),
+    ).resolves.toMatchObject({
+      found: true,
+      record: {
+        relationshipState: {
+          status: "invalid",
+        },
+        succession: {
+          status: "verified_green",
+          linearBlockVerified: true,
+        },
+      },
+    });
+    await orchestrator.stop();
+  });
+
   it("blocks a successor from consuming a superseded accepted-artifact checkpoint", async () => {
     const config = testConfig(root);
     config.workspace.source = {
@@ -9636,7 +10508,7 @@ describe("Orchestrator", () => {
       ],
     });
     const artifact: IssueAcceptedArtifactRecord = {
-      ...acceptedArtifactRecord(source, "artifact-superseded"),
+      ...acceptedArtifactRecord(source, "artifact-superseded", target),
       supersededAt: "2026-07-14T01:00:00.000Z",
       supersededBy: "source_reopened",
       supersededReason: "The source contract changed",
@@ -9655,8 +10527,10 @@ describe("Orchestrator", () => {
         async fetchIssuesByStates() {
           return [];
         },
-        async fetchIssueStatesByIds() {
-          return [source];
+        async fetchIssueStatesByIds(ids) {
+          return [target, source].filter((candidate) =>
+            ids.includes(candidate.id),
+          );
         },
       },
       workspaceManager: new WorkspaceManager({
@@ -9718,7 +10592,7 @@ describe("Orchestrator", () => {
         { id: source.id, identifier: source.identifier, state: "Done" },
       ],
     });
-    const artifact = acceptedArtifactRecord(source, "artifact-base-drift");
+    const artifact = acceptedArtifactRecord(source, "artifact-base-drift", target);
     await lifecycleStore.ensureIssue(source, {
       phase: "terminal",
       acceptedArtifact: artifact,
@@ -9733,8 +10607,10 @@ describe("Orchestrator", () => {
         async fetchIssuesByStates() {
           return [];
         },
-        async fetchIssueStatesByIds() {
-          return [source];
+        async fetchIssueStatesByIds(ids) {
+          return [target, source].filter((candidate) =>
+            ids.includes(candidate.id),
+          );
         },
       },
       workspaceManager: new WorkspaceManager({
@@ -9800,9 +10676,25 @@ describe("Orchestrator", () => {
         { id: source.id, identifier: source.identifier, state: source.state },
       ],
     });
-    const artifact = acceptedArtifactRecord(source, "artifact-conflict");
+    const artifact = acceptedArtifactRecord(source, "artifact-conflict", target);
     const seed = acceptedArtifactSeed(artifact);
     const plannedSeed = plannedWorkspaceSeed(target, seed);
+    const sourceSuccession = successionRecordForIssues(
+      source,
+      target,
+      "succeeded",
+      "checkpointed",
+      artifact.id,
+      plannedSeed.id,
+    );
+    const targetSuccession = successionRecordForIssues(
+      source,
+      target,
+      "successor",
+      "checkpointed",
+      artifact.id,
+      plannedSeed.id,
+    );
     const conflictedSeed = acceptedArtifactSeedBinding(seed, target, {
       preparedHeadSha: null,
       conflictedFiles: [artifact.artifactEvidence.testFiles[0]!],
@@ -9814,10 +10706,12 @@ describe("Orchestrator", () => {
     await lifecycleStore.ensureIssue(source, {
       phase: "terminal",
       acceptedArtifact: artifact,
+      succession: sourceSuccession,
     });
     const initialLifecycle = await lifecycleStore.ensureIssue(target, {
       phase: "implementation",
       workspaceSeed: plannedSeed,
+      succession: targetSuccession,
     });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
@@ -9936,10 +10830,241 @@ describe("Orchestrator", () => {
         preparedAt: expect.any(String),
         failureReason: null,
       },
+      succession: {
+        id: artifact.successionId,
+        role: "successor",
+        status: "seeded",
+        artifactId: artifact.id,
+        workspaceSeedId: plannedSeed.id,
+      },
+    });
+    await expect(lifecycleStore.get(source.id)).resolves.toMatchObject({
+      succession: {
+        id: artifact.successionId,
+        role: "succeeded",
+        status: "seeded",
+        artifactId: artifact.id,
+        workspaceSeedId: plannedSeed.id,
+      },
     });
     await expect(
       runStore.getRun("seed-conflict-continuation-run"),
     ).resolves.toMatchObject({ status: "succeeded" });
+    await orchestrator.stop();
+  });
+
+  it("persists integrated succession monotonically on both endpoints", async () => {
+    const config = testConfig(root);
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    const source = issue({
+      id: "integrated-source",
+      identifier: "TEST-RED-INTEGRATED",
+      state: "Done",
+    });
+    const target = issue({
+      id: "integrated-target",
+      identifier: "TEST-IMPLEMENT-INTEGRATED",
+      state: "Ready to Merge",
+    });
+    const artifact = acceptedArtifactRecord(
+      source,
+      "artifact-integrated",
+      target,
+    );
+    const seedId = `workspace-seed:${target.id}:${artifact.id}`;
+    await lifecycleStore.ensureIssue(source, {
+      phase: "terminal",
+      succession: successionRecordForIssues(
+        source,
+        target,
+        "succeeded",
+        "verified_green",
+        artifact.id,
+        seedId,
+      ),
+    });
+    await lifecycleStore.ensureIssue(target, {
+      phase: "passed",
+      succession: successionRecordForIssues(
+        source,
+        target,
+        "successor",
+        "verified_green",
+        artifact.id,
+        seedId,
+      ),
+    });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds(ids) {
+        return [source, target].filter((candidate) =>
+          ids.includes(candidate.id),
+        );
+      },
+    };
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+    });
+    const internal = orchestrator as unknown as {
+      advanceSuccessionMilestone(
+        issue: Issue,
+        status: Exclude<IssueSuccessionRecord["status"], "invalid">,
+        links?: { mergeCommitSha?: string | null },
+      ): Promise<void>;
+    };
+
+    await internal.advanceSuccessionMilestone(target, "integrated", {
+      mergeCommitSha: "merge-commit-sha",
+    });
+    await internal.advanceSuccessionMilestone(target, "seeded");
+
+    await expect(lifecycleStore.get(target.id)).resolves.toMatchObject({
+      succession: {
+        role: "successor",
+        status: "integrated",
+        artifactId: artifact.id,
+        workspaceSeedId: seedId,
+        mergeCommitSha: "merge-commit-sha",
+      },
+    });
+    await expect(lifecycleStore.get(source.id)).resolves.toMatchObject({
+      succession: {
+        role: "succeeded",
+        status: "integrated",
+        artifactId: artifact.id,
+        workspaceSeedId: seedId,
+        mergeCommitSha: "merge-commit-sha",
+      },
+    });
+    await expect(
+      orchestrator.inspectIssueHistory(target.id),
+    ).resolves.toMatchObject({
+      found: true,
+      record: {
+        succession: {
+          role: "successor",
+          status: "integrated",
+          mergeCommitSha: "merge-commit-sha",
+        },
+      },
+    });
+    await expect(
+      orchestrator.inspectIssueHistory(source.id),
+    ).resolves.toMatchObject({
+      found: true,
+      record: {
+        succession: {
+          role: "succeeded",
+          status: "integrated",
+          mergeCommitSha: "merge-commit-sha",
+        },
+      },
+    });
+    await orchestrator.stop();
+  });
+
+  it("does not partially advance succession when its counterpart cannot be refreshed", async () => {
+    const config = testConfig(root);
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    const source = issue({
+      id: "unavailable-source",
+      identifier: "TEST-RED-UNAVAILABLE",
+      state: "Done",
+    });
+    const target = issue({
+      id: "unavailable-target",
+      identifier: "TEST-IMPLEMENT-UNAVAILABLE",
+      state: "Ready to Merge",
+    });
+    const artifact = acceptedArtifactRecord(
+      source,
+      "artifact-unavailable",
+      target,
+    );
+    await lifecycleStore.ensureIssue(source, {
+      phase: "terminal",
+      succession: successionRecordForIssues(
+        source,
+        target,
+        "succeeded",
+        "verified_green",
+        artifact.id,
+      ),
+    });
+    await lifecycleStore.ensureIssue(target, {
+      phase: "passed",
+      succession: successionRecordForIssues(
+        source,
+        target,
+        "successor",
+        "verified_green",
+        artifact.id,
+      ),
+    });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: emptyTracker(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+    });
+    const internal = orchestrator as unknown as {
+      advanceSuccessionMilestone(
+        issue: Issue,
+        status: Exclude<IssueSuccessionRecord["status"], "invalid">,
+        links?: { mergeCommitSha?: string | null },
+      ): Promise<void>;
+    };
+
+    await expect(
+      internal.advanceSuccessionMilestone(target, "integrated", {
+        mergeCommitSha: "must-not-persist",
+      }),
+    ).rejects.toMatchObject({
+      code: "tracker_error",
+      message: expect.stringContaining(
+        "was not returned before advancing to integrated",
+      ),
+    });
+    await expect(lifecycleStore.get(target.id)).resolves.toMatchObject({
+      succession: {
+        status: "verified_green",
+        mergeCommitSha: null,
+      },
+    });
+    await expect(lifecycleStore.get(source.id)).resolves.toMatchObject({
+      succession: {
+        status: "verified_green",
+        mergeCommitSha: null,
+      },
+    });
     await orchestrator.stop();
   });
 
@@ -9967,7 +11092,7 @@ describe("Orchestrator", () => {
       state: "Todo",
       description: agentEligibleIssueContract(),
     });
-    const artifact = acceptedArtifactRecord(source, "artifact-one-turn");
+    const artifact = acceptedArtifactRecord(source, "artifact-one-turn", target);
     const seed = acceptedArtifactSeed(artifact);
     const conflictedSeed = acceptedArtifactSeedBinding(seed, target, {
       preparedHeadSha: null,
@@ -10100,7 +11225,7 @@ describe("Orchestrator", () => {
       state: "Todo",
       description: agentEligibleIssueContract(),
     });
-    const artifact = acceptedArtifactRecord(source, "artifact-retry");
+    const artifact = acceptedArtifactRecord(source, "artifact-retry", target);
     const seed = acceptedArtifactSeed(artifact);
     const conflictedSeed = acceptedArtifactSeedBinding(seed, target, {
       preparedHeadSha: null,
@@ -10234,7 +11359,7 @@ describe("Orchestrator", () => {
       state: "Todo",
       description: agentEligibleIssueContract(),
     });
-    const artifact = acceptedArtifactRecord(source, "artifact-diagnostic");
+    const artifact = acceptedArtifactRecord(source, "artifact-diagnostic", target);
     const seed = acceptedArtifactSeed(artifact);
     const conflictedSeed = acceptedArtifactSeedBinding(seed, target, {
       preparedHeadSha: null,
@@ -10359,7 +11484,7 @@ describe("Orchestrator", () => {
       state: "Todo",
       description: agentEligibleIssueContract(),
     });
-    const artifact = acceptedArtifactRecord(source, "artifact-cancel");
+    const artifact = acceptedArtifactRecord(source, "artifact-cancel", target);
     const seed = acceptedArtifactSeed(artifact);
     const conflictedSeed = acceptedArtifactSeedBinding(seed, target, {
       preparedHeadSha: null,
@@ -10541,7 +11666,7 @@ describe("Orchestrator", () => {
     await orchestrator.stop();
   });
 
-  it("blocks a successor that directly depends on multiple distinct accepted artifacts", async () => {
+  it("selects only the reciprocal successor artifact when other accepted-artifact blockers are ordinary ordering edges", async () => {
     const config = testConfig(root);
     config.workspace.source = {
       kind: "git_worktree",
@@ -10574,7 +11699,7 @@ describe("Orchestrator", () => {
         { id: secondSource.id, identifier: secondSource.identifier, state: "Done" },
       ],
     });
-    const firstArtifact = acceptedArtifactRecord(firstSource, "artifact-one");
+    const firstArtifact = acceptedArtifactRecord(firstSource, "artifact-one", target);
     const secondArtifact = acceptedArtifactRecord(secondSource, "artifact-two");
     await lifecycleStore.ensureIssue(firstSource, {
       phase: "terminal",
@@ -10588,6 +11713,7 @@ describe("Orchestrator", () => {
     const sourcesById = new Map([
       [firstSource.id, firstSource],
       [secondSource.id, secondSource],
+      [target.id, target],
     ]);
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
@@ -10640,27 +11766,24 @@ describe("Orchestrator", () => {
         dependencyArtifactDispatchContext(target),
       ),
     ).resolves.toMatchObject({
-      status: "skipped",
-      stop: true,
-      message: expect.stringContaining(
-        "multiple accepted artifacts require integration before dispatch",
-      ),
+      details: {
+        artifactId: firstArtifact.id,
+        sourceIssueIdentifier: firstSource.identifier,
+      },
     });
     expect(await lifecycleStore.get(target.id)).toMatchObject({
-      phase: "blocked",
-      blockedReason: expect.stringContaining(firstArtifact.id),
+      phase: "implementation",
+      blockedReason: null,
+      workspaceSeed: {
+        artifactId: firstArtifact.id,
+        sourceIssueId: firstSource.id,
+      },
     });
-    expect((await lifecycleStore.get(target.id))?.blockedReason).toContain(
+    expect((await lifecycleStore.get(target.id))?.workspaceSeed?.artifactId).not.toBe(
       secondArtifact.id,
     );
-    expect(targetState).toBe("Blocked");
-    expect(writer.transitions).toEqual([
-      expect.objectContaining({
-        issueId: target.id,
-        fromStates: expect.arrayContaining(["Todo"]),
-        toState: "Blocked",
-      }),
-    ]);
+    expect(targetState).toBe("Todo");
+    expect(writer.transitions).toEqual([]);
     await orchestrator.stop();
   });
 
@@ -10682,10 +11805,27 @@ describe("Orchestrator", () => {
       id: "ordinary-target",
       identifier: "TEST-AFTER-NORMAL",
       state: "Todo",
+      description: agentEligibleIssueContract({
+        issueContractRelationships: {
+          blocks: [],
+          blockedBy: [source.identifier],
+        },
+      }),
       blockedBy: [{ id: source.id, identifier: source.identifier, state: "Done" }],
     });
     await lifecycleStore.ensureIssue(source, { phase: "terminal" });
-    await lifecycleStore.ensureIssue(target, { phase: "implementation" });
+    await lifecycleStore.ensureIssue(target, {
+      phase: "implementation",
+      succession: successionRecordForIssues(
+        source,
+        target,
+        "successor",
+        "integrated",
+        null,
+        null,
+        "stale-ordinary-edge-succession",
+      ),
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [];
@@ -10694,7 +11834,9 @@ describe("Orchestrator", () => {
         return issuesInStates([], states);
       },
       async fetchIssueStatesByIds(ids) {
-        return ids.includes(source.id) ? [source] : [];
+        return [target, source].filter((candidate) =>
+          ids.includes(candidate.id),
+        );
       },
     };
     const orchestrator = new Orchestrator({
@@ -10722,11 +11864,514 @@ describe("Orchestrator", () => {
       internal.resolveDependencyArtifactSeedAction(context),
     ).resolves.toMatchObject({
       status: "skipped",
-      message: "No completed accepted-artifact dependency applies",
+      message: "No succession contract selects an accepted artifact",
     });
     expect(context.dispatch.dependencyArtifactSeed).toBeNull();
     expect(context.dispatch.dependencyArtifact).toBeNull();
-    expect((await lifecycleStore.get(target.id))?.workspaceSeed).toBeNull();
+    await expect(lifecycleStore.get(target.id)).resolves.toMatchObject({
+      workspaceSeed: null,
+      succession: null,
+      relationshipState: {
+        status: "valid",
+        contractBlocks: [],
+        contractBlockedBy: [source.identifier],
+      },
+    });
+    await orchestrator.stop();
+  });
+
+  it("blocks dispatch and review when a successor unilaterally removes its succession declaration", async () => {
+    const config = testConfig(root);
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    const source = issue({
+      id: "unilateral-source",
+      identifier: "TEST-RED-UNILATERAL",
+      state: "Done",
+    });
+    const target = issue({
+      id: "unilateral-target",
+      identifier: "TEST-IMPLEMENT-UNILATERAL",
+      state: "Todo",
+    });
+    declareAcceptedArtifactSuccession(
+      source,
+      target,
+      "tdd-unilateral-removal",
+    );
+    const sourceSuccession = successionRecordForIssues(
+      source,
+      target,
+      "succeeded",
+      "integrated",
+    );
+    const targetSuccession = successionRecordForIssues(
+      source,
+      target,
+      "successor",
+      "integrated",
+    );
+    await lifecycleStore.ensureIssue(source, {
+      phase: "terminal",
+      succession: sourceSuccession,
+    });
+    await lifecycleStore.ensureIssue(target, {
+      phase: "implementation",
+      succession: targetSuccession,
+    });
+
+    target.description = agentEligibleIssueContract({
+      issueContractDelivery: { mode: "merge" },
+      issueContractRelationships: {
+        blocks: [],
+        blockedBy: [source.identifier],
+      },
+    });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds(ids) {
+        return [source, target].filter(
+          (candidate) =>
+            ids.includes(candidate.id) ||
+            ids.includes(candidate.identifier),
+        );
+      },
+    };
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+    });
+    const internal = orchestrator as unknown as {
+      dependencyArtifactFreshness(
+        issue: Issue,
+        lifecycle: IssueLifecycleRecord | null,
+      ): Promise<{
+        status: string;
+        scope?: string;
+        reason?: string;
+      }>;
+      resolveDependencyArtifactSeedAction(context: unknown): Promise<{
+        status?: string;
+        stop?: boolean;
+        message?: string;
+      }>;
+    };
+
+    await expect(
+      internal.dependencyArtifactFreshness(
+        target,
+        await lifecycleStore.get(target.id),
+      ),
+    ).resolves.toMatchObject({
+      status: "invalid",
+      scope: "succession",
+      reason: expect.stringContaining(
+        "does not declare `relationships.succession.succeeds`",
+      ),
+    });
+    await expect(
+      internal.resolveDependencyArtifactSeedAction(
+        dependencyArtifactDispatchContext(target),
+      ),
+    ).resolves.toMatchObject({
+      status: "skipped",
+      stop: true,
+      message: expect.stringContaining(
+        "does not declare `relationships.succession.succeeds`",
+      ),
+    });
+    await expect(lifecycleStore.get(target.id)).resolves.toMatchObject({
+      phase: "blocked",
+      succession: {
+        id: "tdd-unilateral-removal",
+        role: "successor",
+        status: "invalid",
+        validationErrors: expect.arrayContaining([
+          expect.stringContaining(
+            "does not declare `relationships.succession.succeeds`",
+          ),
+        ]),
+      },
+    });
+    await expect(lifecycleStore.get(source.id)).resolves.toMatchObject({
+      succession: {
+        id: "tdd-unilateral-removal",
+        role: "succeeded",
+        status: "invalid",
+      },
+    });
+    await expect(
+      orchestrator.inspectIssueHistory(target.id),
+    ).resolves.toMatchObject({
+      found: true,
+      record: {
+        succession: {
+          id: "tdd-unilateral-removal",
+          status: "invalid",
+        },
+      },
+    });
+    await expect(
+      orchestrator.inspectIssueHistory(source.id),
+    ).resolves.toMatchObject({
+      found: true,
+      record: {
+        succession: {
+          id: "tdd-unilateral-removal",
+          status: "invalid",
+        },
+      },
+    });
+    await orchestrator.stop();
+  });
+
+  it("blocks an expected-red issue that does not declare a successor", async () => {
+    const config = testConfig(root);
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    const source = issue({
+      id: "missing-successor-source",
+      identifier: "TEST-RED-MISSING-SUCCESSOR",
+      state: "Todo",
+      description: agentEligibleIssueContract({
+        issueContractDelivery: {
+          mode: "accepted_artifact",
+          artifact: "expected_red_tests",
+        },
+        issueContractRelationships: {
+          blocks: [],
+          blockedBy: [],
+        },
+      }),
+    });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: {
+        async fetchCandidateIssues() {
+          return [];
+        },
+        async fetchIssuesByStates() {
+          return [];
+        },
+        async fetchIssueStatesByIds(ids) {
+          return ids.includes(source.id) ? [source] : [];
+        },
+      },
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+    });
+    const internal = orchestrator as unknown as {
+      resolveDependencyArtifactSeedAction(context: unknown): Promise<{
+        status?: string;
+        stop?: boolean;
+        message?: string;
+      }>;
+    };
+
+    await expect(
+      internal.resolveDependencyArtifactSeedAction(
+        dependencyArtifactDispatchContext(source),
+      ),
+    ).resolves.toMatchObject({
+      status: "skipped",
+      stop: true,
+      message: expect.stringContaining(
+        "Expected-red accepted-artifact delivery requires `relationships.succession.successor`",
+      ),
+    });
+    await expect(lifecycleStore.get(source.id)).resolves.toMatchObject({
+      phase: "blocked",
+      relationshipState: {
+        status: "invalid",
+        validationErrors: [
+          expect.stringContaining(
+            "requires `relationships.succession.successor`",
+          ),
+        ],
+      },
+      succession: null,
+    });
+    await orchestrator.stop();
+  });
+
+  it("marks both endpoints invalid when a declared successor loses its source declaration during review", async () => {
+    const config = testConfig(root);
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    const source = issue({
+      id: "review-unilateral-source",
+      identifier: "TEST-RED-REVIEW-UNILATERAL",
+      state: "Done",
+    });
+    const target = issue({
+      id: "review-unilateral-target",
+      identifier: "TEST-IMPLEMENT-REVIEW-UNILATERAL",
+      state: "In Review",
+    });
+    declareAcceptedArtifactSuccession(
+      source,
+      target,
+      "tdd-review-unilateral-removal",
+    );
+    const artifactId = "artifact-review-unilateral";
+    const workspaceSeedId = "seed-review-unilateral";
+    await lifecycleStore.ensureIssue(source, {
+      phase: "terminal",
+      succession: successionRecordForIssues(
+        source,
+        target,
+        "succeeded",
+        "integrated",
+        artifactId,
+        workspaceSeedId,
+      ),
+    });
+    await lifecycleStore.ensureIssue(target, {
+      phase: "review",
+      succession: successionRecordForIssues(
+        source,
+        target,
+        "successor",
+        "integrated",
+        artifactId,
+        workspaceSeedId,
+      ),
+    });
+
+    source.description = agentEligibleIssueContract({
+      issueContractDelivery: { mode: "merge" },
+      issueContractRelationships: {
+        blocks: [target.identifier],
+        blockedBy: [],
+      },
+    });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds(ids) {
+        return [source, target].filter(
+          (candidate) =>
+            ids.includes(candidate.id) ||
+            ids.includes(candidate.identifier),
+        );
+      },
+    };
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+    });
+    const internal = orchestrator as unknown as {
+      dependencyArtifactFreshness(
+        issue: Issue,
+        lifecycle: IssueLifecycleRecord | null,
+      ): Promise<{
+        status: string;
+        scope?: string;
+        reason?: string;
+      }>;
+    };
+
+    await expect(
+      internal.dependencyArtifactFreshness(
+        target,
+        await lifecycleStore.get(target.id),
+      ),
+    ).resolves.toMatchObject({
+      status: "invalid",
+      scope: "succession",
+      reason: expect.stringContaining(
+        "does not declare a reciprocal succession",
+      ),
+    });
+    await expect(lifecycleStore.get(target.id)).resolves.toMatchObject({
+      succession: {
+        role: "successor",
+        status: "invalid",
+        artifactId,
+        workspaceSeedId,
+      },
+    });
+    await expect(lifecycleStore.get(source.id)).resolves.toMatchObject({
+      succession: {
+        role: "succeeded",
+        status: "invalid",
+        artifactId,
+        workspaceSeedId,
+      },
+    });
+    await expect(
+      orchestrator.inspectIssueHistory(source.id),
+    ).resolves.toMatchObject({
+      found: true,
+      record: {
+        succession: {
+          status: "invalid",
+          artifactId,
+          workspaceSeedId,
+        },
+      },
+    });
+    await orchestrator.stop();
+  });
+
+  it("clears a durable succession only after both Issue Contracts remove it", async () => {
+    const config = testConfig(root);
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    const source = issue({
+      id: "bilateral-source",
+      identifier: "TEST-RED-BILATERAL",
+      state: "Done",
+    });
+    const target = issue({
+      id: "bilateral-target",
+      identifier: "TEST-IMPLEMENT-BILATERAL",
+      state: "Todo",
+    });
+    declareAcceptedArtifactSuccession(
+      source,
+      target,
+      "tdd-bilateral-removal",
+    );
+    await lifecycleStore.ensureIssue(source, {
+      phase: "terminal",
+      succession: successionRecordForIssues(
+        source,
+        target,
+        "succeeded",
+        "integrated",
+      ),
+    });
+    await lifecycleStore.ensureIssue(target, {
+      phase: "implementation",
+      succession: successionRecordForIssues(
+        source,
+        target,
+        "successor",
+        "integrated",
+      ),
+    });
+
+    source.description = agentEligibleIssueContract({
+      issueContractDelivery: { mode: "merge" },
+      issueContractRelationships: {
+        blocks: [target.identifier],
+        blockedBy: [],
+      },
+    });
+    target.description = agentEligibleIssueContract({
+      issueContractDelivery: { mode: "merge" },
+      issueContractRelationships: {
+        blocks: [],
+        blockedBy: [source.identifier],
+      },
+    });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds(ids) {
+        return [source, target].filter(
+          (candidate) =>
+            ids.includes(candidate.id) ||
+            ids.includes(candidate.identifier),
+        );
+      },
+    };
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+    });
+    const internal = orchestrator as unknown as {
+      resolveDependencyArtifactSeedAction(context: unknown): Promise<{
+        status?: string;
+        stop?: boolean;
+        message?: string;
+      }>;
+    };
+
+    await expect(
+      internal.resolveDependencyArtifactSeedAction(
+        dependencyArtifactDispatchContext(target),
+      ),
+    ).resolves.toMatchObject({
+      status: "skipped",
+      message: "No succession contract selects an accepted artifact",
+    });
+    await expect(lifecycleStore.get(target.id)).resolves.toMatchObject({
+      phase: "implementation",
+      succession: null,
+    });
+    await expect(lifecycleStore.get(source.id)).resolves.toMatchObject({
+      phase: "terminal",
+      succession: null,
+    });
+    await expect(
+      orchestrator.inspectIssueHistory(target.id),
+    ).resolves.toMatchObject({
+      found: true,
+      record: { succession: null },
+    });
+    await expect(
+      orchestrator.inspectIssueHistory(source.id),
+    ).resolves.toMatchObject({
+      found: true,
+      record: { succession: null },
+    });
     await orchestrator.stop();
   });
 
@@ -15828,6 +17473,116 @@ describe("Orchestrator", () => {
     });
   });
 
+  it("blocks relationship drift before accepting a submitted pass verdict", async () => {
+    const config = testConfig(root);
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.tracker.handoffStates = ["In Review"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.reviewPassState = "Ready to Merge";
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.reviewLoop.reviewerPromptTemplate = "Review {{ issue.identifier }}.";
+    const candidate = issue({
+      state: "In Review",
+      branchName: "symphony/TEST-1",
+    });
+    let currentState = "In Review";
+    let relationshipDrifted = false;
+    const liveCandidate = () => ({
+      ...candidate,
+      state: currentState,
+      blockedBy: relationshipDrifted
+        ? [
+            {
+              id: "other-issue",
+              identifier: "OTHER-1",
+              state: "Todo",
+            },
+          ]
+        : [],
+    });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [liveCandidate()];
+      },
+      async fetchIssuesByStates(states) {
+        return states.includes(currentState) ? [liveCandidate()] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [liveCandidate()];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = config.workspace.stateDir;
+    const outboxStore = new FileWritebackOutboxStore(stateDir);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(
+      outboxStore,
+      writer,
+      logger,
+      300_000,
+    );
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const report = completionReportRecord(candidate);
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "review",
+      lastCompletionReportId: report.id,
+      completionReports: [report],
+    });
+    const harness = new ReviewVerdictSubmittingHarness(
+      "pass",
+      lifecycleStore,
+      outboxStore,
+      async () => {
+        relationshipDrifted = true;
+      },
+    );
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(
+      () => harness.runs.length === 1 && currentState === "Blocked",
+      "relationship drift to block pass verdict reconciliation",
+    );
+    await orchestrator.stop();
+
+    expect(currentState).toBe("Blocked");
+    expect(
+      writer.transitions.some(
+        (transition) => transition.toState === "Ready to Merge",
+      ),
+    ).toBe(false);
+    expect(
+      writer.comments.some((comment) =>
+        comment.body.includes("Symphony review passed"),
+      ),
+    ).toBe(false);
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      phase: "blocked",
+      lastReviewVerdictId: null,
+      relationshipState: {
+        status: "invalid",
+      },
+    });
+  });
+
   it("records blocked review verdict handoffs without transitioning Linear even when base advances during review", async () => {
     const config = testConfig(root);
     config.writeback.enabled = true;
@@ -18514,6 +20269,7 @@ describe("Orchestrator", () => {
 function completionReportRecord(
   candidate = issue(),
 ): IssueCompletionReportRecord {
+  const parsedContract = parseIssueContract(candidate.description);
   return {
     id: `completion-report:${candidate.id}:idem-1`,
     idempotencyKey: "idem-1",
@@ -18538,6 +20294,25 @@ function completionReportRecord(
       branch: candidate.branchName,
     },
     risks: [],
+    ...(parsedContract.valid
+      ? {
+          contractSnapshot: {
+            schemaVersion: parsedContract.contract.schemaVersion,
+            contractVersion: parsedContract.contract.contractVersion,
+            fingerprint: parsedContract.fingerprint,
+            delivery:
+              parsedContract.contract.delivery.mode === "accepted_artifact"
+                ? {
+                    mode: "accepted_artifact" as const,
+                    artifact: "expected_red_tests" as const,
+                  }
+                : {
+                    mode: "merge" as const,
+                    artifact: null,
+                  },
+          },
+        }
+      : {}),
     acceptedAt: "2026-01-01T00:00:01Z",
     writebackOperationKeys: [],
   };
@@ -18546,7 +20321,15 @@ function completionReportRecord(
 function acceptedArtifactRecord(
   sourceIssue: Issue,
   artifactId = `accepted-artifact:${sourceIssue.id}`,
+  successorIssue?: Issue,
 ): IssueAcceptedArtifactRecord {
+  if (successorIssue) {
+    declareAcceptedArtifactSuccession(
+      sourceIssue,
+      successorIssue,
+      `tdd-${sourceIssue.identifier.toLowerCase()}-${successorIssue.identifier.toLowerCase()}`,
+    );
+  }
   let sourceContract = parseIssueContract(sourceIssue.description);
   if (!sourceContract.valid) {
     sourceIssue.description = agentEligibleIssueContract({
@@ -18563,6 +20346,12 @@ function acceptedArtifactRecord(
   return {
     version: 1,
     id: artifactId,
+    ...(sourceContract.contract.relationships?.succession === undefined
+      ? {}
+      : {
+          successionId:
+            sourceContract.contract.relationships.succession.id,
+        }),
     kind: "expected_red_tests",
     status: "completed_unmerged",
     sourceIssueId: sourceIssue.id,
@@ -18607,6 +20396,120 @@ function acceptedArtifactRecord(
   };
 }
 
+function declareAcceptedArtifactSuccession(
+  sourceIssue: Issue,
+  successorIssue: Issue,
+  successionId: string,
+): void {
+  sourceIssue.blocks = upsertIssueRelationship(
+    sourceIssue.blocks ?? [],
+    successorIssue,
+  );
+  successorIssue.blockedBy = upsertIssueRelationship(
+    successorIssue.blockedBy,
+    sourceIssue,
+  );
+  sourceIssue.description = agentEligibleIssueContract({
+    issueContractContractVersion: `2026-07-23.${sourceIssue.identifier}`,
+    issueContractDelivery: {
+      mode: "accepted_artifact",
+      artifact: "expected_red_tests",
+    },
+    issueContractRelationships: {
+      blocks: (sourceIssue.blocks ?? []).map(
+        (edge) => edge.identifier ?? edge.id!,
+      ),
+      blockedBy: sourceIssue.blockedBy.map(
+        (edge) => edge.identifier ?? edge.id!,
+      ),
+      succession: {
+        id: successionId,
+        purpose: "expected_red_implementation",
+        successor: { issue: successorIssue.identifier },
+      },
+    },
+  });
+  successorIssue.description = agentEligibleIssueContract({
+    issueContractDelivery: { mode: "merge" },
+    issueContractRelationships: {
+      blocks: (successorIssue.blocks ?? []).map(
+        (edge) => edge.identifier ?? edge.id!,
+      ),
+      blockedBy: successorIssue.blockedBy.map(
+        (edge) => edge.identifier ?? edge.id!,
+      ),
+      succession: {
+        id: successionId,
+        purpose: "expected_red_implementation",
+        succeeds: { issue: sourceIssue.identifier },
+      },
+    },
+  });
+}
+
+function successionRecordForIssues(
+  sourceIssue: Issue,
+  successorIssue: Issue,
+  role: IssueSuccessionRecord["role"],
+  status: Exclude<IssueSuccessionRecord["status"], "invalid">,
+  artifactId: string | null = null,
+  workspaceSeedId: string | null = null,
+  successionId?: string,
+): IssueSuccessionRecord {
+  const sourceContract = parseIssueContract(sourceIssue.description);
+  const successorContract = parseIssueContract(successorIssue.description);
+  if (!sourceContract.valid || !successorContract.valid) {
+    throw new Error("Succession test contracts must be valid");
+  }
+  const sourceDeclaration =
+    sourceContract.contract.relationships?.succession;
+  const id = sourceDeclaration?.id ?? successionId;
+  if (!id) {
+    throw new Error("Succession test source must declare a successor");
+  }
+  return {
+    version: 1,
+    id,
+    purpose: "expected_red_implementation",
+    role,
+    succeededIssue: {
+      id: sourceIssue.id,
+      identifier: sourceIssue.identifier,
+      contractFingerprint: sourceContract.fingerprint,
+    },
+    successorIssue: {
+      id: successorIssue.id,
+      identifier: successorIssue.identifier,
+      contractFingerprint: successorContract.fingerprint,
+    },
+    linearBlockVerified: true,
+    status,
+    artifactId,
+    workspaceSeedId,
+    mergeCommitSha: null,
+    validationErrors: [],
+    declaredAt: "2026-07-14T00:00:00.000Z",
+    agreedAt: "2026-07-14T00:00:00.000Z",
+    updatedAt: "2026-07-14T00:00:00.000Z",
+  };
+}
+
+function upsertIssueRelationship(
+  relationships: Issue["blockedBy"],
+  related: Pick<Issue, "id" | "identifier" | "state">,
+): Issue["blockedBy"] {
+  return relationships.some((edge) => edge.id === related.id)
+    ? relationships
+    : [
+        ...relationships,
+        {
+          id: related.id,
+          identifier: related.identifier,
+          state: related.state,
+        },
+      ];
+}
+
 function acceptedArtifactSeed(
   artifact: IssueAcceptedArtifactRecord,
 ): AcceptedArtifactWorkspaceSeed {
@@ -18614,6 +20517,9 @@ function acceptedArtifactSeed(
     version: 1,
     kind: "accepted_artifact",
     artifactId: artifact.id,
+    ...(artifact.successionId === undefined
+      ? {}
+      : { successionId: artifact.successionId }),
     sourceIssueId: artifact.sourceIssueId,
     sourceIssueIdentifier: artifact.sourceIssueIdentifier,
     repositoryFingerprint: artifact.repositoryFingerprint,
@@ -18636,6 +20542,9 @@ function plannedWorkspaceSeed(
     kind: "accepted_artifact",
     status: "planned",
     artifactId: seed.artifactId,
+    ...(seed.successionId === undefined
+      ? {}
+      : { successionId: seed.successionId }),
     sourceIssueId: seed.sourceIssueId,
     sourceIssueIdentifier: seed.sourceIssueIdentifier,
     repositoryFingerprint: seed.repositoryFingerprint,
@@ -18905,6 +20814,21 @@ function pendingApprovalLifecyclePatch(
   runId: string,
   blockedReason = PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
 ): IssueLifecyclePatch {
+  const parsedContract = parseIssueContract(candidate.description);
+  const contractSnapshot = parsedContract.valid
+    ? {
+        schemaVersion: parsedContract.contract.schemaVersion,
+        contractVersion: parsedContract.contract.contractVersion,
+        fingerprint: parsedContract.fingerprint,
+        delivery: {
+          mode: parsedContract.contract.delivery.mode,
+          artifact:
+            parsedContract.contract.delivery.mode === "accepted_artifact"
+              ? parsedContract.contract.delivery.artifact
+              : null,
+        },
+      }
+    : null;
   return {
     phase: "blocked",
     blockedReason,
@@ -18915,6 +20839,7 @@ function pendingApprovalLifecyclePatch(
         runId,
         branchName: candidate.branchName,
         pullRequest: null,
+        contractSnapshot,
       },
     ],
     summaryPointers: {
@@ -19360,14 +21285,24 @@ async function submitTwoChildPlan(
       proposedIssues: [
         {
           title: "Build child",
-          description: agentEligibleIssueContract(),
+          description: agentEligibleIssueContract({
+            issueContractRelationships: {
+              blocks: [parentIssue.identifier, "Build dependent child"],
+              blockedBy: [],
+            },
+          }),
           acceptanceCriteria: ["Done"],
           dependencies: [],
           labels: ["planning"],
         },
         {
           title: "Build dependent child",
-          description: agentEligibleIssueContract(),
+          description: agentEligibleIssueContract({
+            issueContractRelationships: {
+              blocks: [parentIssue.identifier],
+              blockedBy: ["Build child"],
+            },
+          }),
           acceptanceCriteria: ["Done"],
           dependencies: ["Build child"],
           labels: ["planning"],
@@ -19977,6 +21912,7 @@ function mergePolicyRulesetSnapshot(
     delegateId: candidate.delegateId,
     assignedToWorker: candidate.assignedToWorker,
     labels: candidate.labels,
+    blocks: candidate.blocks ?? [],
     blockedBy: candidate.blockedBy,
     hasChildren: candidate.hasChildren === true,
     trackerCreatedAt: candidate.createdAt,
@@ -20217,7 +22153,12 @@ function mergePolicyLoopHarness(
   });
   const orchestrator = new Orchestrator({
     config,
-    tracker: emptyTracker(),
+    tracker: {
+      ...emptyTracker(),
+      async fetchIssueStatesByIds(ids) {
+        return ids.includes(candidate.id) ? [candidate] : [];
+      },
+    },
     workspaceManager: new WorkspaceManager({
       workspace: config.workspace,
       hooks: config.hooks,
@@ -20604,6 +22545,11 @@ class ManualDispatchRecordingHarness implements AgentHarness {
         lifecycleStore: this.lifecycleStore,
         writebackOutbox: this.outboxStore,
         runStore: this.runStore,
+        resolveIssuesByIds: async (ids) =>
+          ids.includes(ctx.issue.id) ||
+          ids.includes(ctx.issue.identifier)
+            ? [ctx.issue]
+            : [],
       }).submitCompletionReport(
         {
           runId,
@@ -21044,7 +22990,12 @@ class IssueBreakdownAcceptingHarness implements AgentHarness {
           proposedIssues: [
             {
               title: "Create implementation task",
-              description: agentEligibleIssueContract(),
+              description: agentEligibleIssueContract({
+                issueContractRelationships: {
+                  blocks: [ctx.issue.identifier],
+                  blockedBy: [],
+                },
+              }),
               acceptanceCriteria: ["Behavior is implemented and tested."],
               dependencies: [],
               labels: ["planning"],
@@ -21160,7 +23111,12 @@ class IssueBreakdownHandoffHarness implements AgentHarness {
         proposedIssues: [
           {
             title: "Create implementation task",
-            description: agentEligibleIssueContract(),
+            description: agentEligibleIssueContract({
+              issueContractRelationships: {
+                blocks: [ctx.issue.identifier],
+                blockedBy: [],
+              },
+            }),
             acceptanceCriteria: ["Behavior is implemented and tested."],
             dependencies: [],
             labels: ["planning"],
@@ -21341,6 +23297,11 @@ class RejectedCompletionReportHarness implements AgentHarness {
           lifecycleStore: this.lifecycleStore,
           writebackOutbox: this.outboxStore,
           runStore: this.runStore,
+          resolveIssuesByIds: async (ids) =>
+            ids.includes(ctx.issue.id) ||
+            ids.includes(ctx.issue.identifier)
+              ? [ctx.issue]
+              : [],
         }).submitCompletionReport(
           {
             runId,
@@ -21422,6 +23383,11 @@ class ReportingHarness implements AgentHarness {
           : {}),
         runStore: this.runStore,
         pullRequestPublisher: this.publisher,
+        resolveIssuesByIds: async (ids) =>
+          ids.includes(ctx.issue.id) ||
+          ids.includes(ctx.issue.identifier)
+            ? [ctx.issue]
+            : [],
         ...(this.operatorApproval
           ? { operatorApproval: this.operatorApproval }
           : {}),
@@ -21516,6 +23482,11 @@ class ManufacturedReviewLoopHarness implements AgentHarness {
       lifecycleStore: this.lifecycleStore,
       writebackOutbox: this.outboxStore,
       runStore: this.runStore,
+      resolveIssuesByIds: async (ids) =>
+        ids.includes(ctx.issue.id) ||
+        ids.includes(ctx.issue.identifier)
+          ? [ctx.issue]
+          : [],
     }).submitCompletionReport(
       {
         runId,
@@ -21942,8 +23913,18 @@ class StateChangingWriter implements TrackerWriter {
   readonly comments: TrackerCommentInput[] = [];
   readonly issueCreates: TrackerIssueCreateInput[] = [];
   readonly issueRelations: TrackerIssueRelationInput[] = [];
+  readonly descriptionUpdates: Array<{ issueId: string; description: string }> = [];
 
-  constructor(private readonly setState: (state: string) => void) {}
+  constructor(
+    private readonly setState: (state: string) => void,
+    private readonly setDescription: (
+      issueId: string,
+      description: string,
+    ) => void = () => undefined,
+    private readonly setRelation: (
+      relation: TrackerIssueRelationInput,
+    ) => void = () => undefined,
+  ) {}
 
   async transitionIssueState(
     input: TrackerTransitionInput,
@@ -21988,6 +23969,17 @@ class StateChangingWriter implements TrackerWriter {
     input: TrackerIssueRelationInput,
   ): Promise<TrackerWriteResult> {
     this.issueRelations.push(input);
+    this.setRelation(input);
+    return { status: "applied" };
+  }
+
+  async updateIssueDescription(input: {
+    issueId: string;
+    description: string;
+    dedupeKey: string;
+  }): Promise<TrackerWriteResult> {
+    this.descriptionUpdates.push(input);
+    this.setDescription(input.issueId, input.description);
     return { status: "applied" };
   }
 }

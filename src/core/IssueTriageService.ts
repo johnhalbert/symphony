@@ -465,6 +465,7 @@ export function isIssueTriageBlockedReason(reason: string | null | undefined): b
     normalized.includes("max reviewer failures") ||
     normalized.includes("max review rounds") ||
     normalized.includes("max merge gate failures") ||
+    normalized.includes("max accepted-artifact validation failures") ||
     normalized.includes("merge gate required checks failed")
   );
 }
@@ -519,6 +520,16 @@ export function issueTriageTriggerFingerprint(lifecycle: IssueLifecycleRecord): 
         lastCompletionReportId: lifecycle.lastCompletionReportId,
         lastReviewVerdictId: lifecycle.lastReviewVerdictId,
         lastMergeGateResultId: lifecycle.lastMergeGateResultId ?? null,
+        acceptedArtifactValidationFailure:
+          lifecycle.acceptedArtifactValidationFailure
+            ? {
+                signature:
+                  lifecycle.acceptedArtifactValidationFailure.signature,
+                count: lifecycle.acceptedArtifactValidationFailure.count,
+                limit: lifecycle.acceptedArtifactValidationFailure.limit,
+                reason: lifecycle.acceptedArtifactValidationFailure.reason,
+              }
+            : null,
         mergeGate: lifecycle.mergeGate
           ? {
               id: lifecycle.mergeGate.id,

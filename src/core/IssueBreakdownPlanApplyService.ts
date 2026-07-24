@@ -1,7 +1,15 @@
 import { createHash } from "node:crypto";
 import type { ServiceConfig } from "./config/Config.js";
-import { parseIssueContract } from "./IssueContractLint.js";
-import { issueBreakdownPlanFingerprintsMatch, latestFreshIssueBreakdownPlan } from "./IssueBreakdownPlanService.js";
+import {
+  parseIssueContract,
+  replaceIssueContractJson,
+} from "./IssueContractLint.js";
+import { errorMessage } from "./errors.js";
+import {
+  issueBreakdownPlanFingerprintsMatch,
+  issueContentFingerprintForBreakdownPlan,
+  latestFreshIssueBreakdownPlan,
+} from "./IssueBreakdownPlanService.js";
 import { issueTriageTriggerFingerprint } from "./IssueTriageService.js";
 import type {
   IssueBreakdownCreatedIssueRef,
@@ -32,7 +40,12 @@ export interface IssueBreakdownPlanApplyServiceOptions {
   lifecycleStore: IssueLifecycleStore;
   writeback?:
     | (Pick<WritebackProcessor, "enqueueAndProcess"> &
-        Partial<Pick<WritebackProcessor, "getOperation" | "retryRegistered">>)
+        Partial<
+          Pick<
+            WritebackProcessor,
+            "getOperation" | "retryRegistered" | "updateIssueDescription"
+          >
+        >)
     | undefined;
 }
 
@@ -252,6 +265,23 @@ export class IssueBreakdownPlanApplyService {
       return { status: "pending", plan: pending, operations: processed };
     }
 
+    const descriptionUpdateError = await this.updateResolvedIssueContracts(
+      issue,
+      workingPlan,
+    );
+    if (descriptionUpdateError !== null) {
+      const updated = await this.updatePlan(issue, workingPlan, {
+        applicationStatus: "blocked",
+        applicationBlockedReason: descriptionUpdateError,
+      });
+      return {
+        status: "blocked",
+        plan: updated,
+        operations: processed,
+        reason: descriptionUpdateError,
+      };
+    }
+
     const finalOperations = planIssueBreakdownFinalizationWritebacks(issue, workingPlan, this.options.config);
     workingPlan = await this.updatePlan(issue, workingPlan, {
       applicationOperationKeys: mergeOperationKeys(workingPlan.applicationOperationKeys, finalOperations),
@@ -320,6 +350,93 @@ export class IssueBreakdownPlanApplyService {
       applicationBlockedReason: null,
     });
     return { status: "pending", plan: pending, operations: processed };
+  }
+
+  private async updateResolvedIssueContracts(
+    parent: Issue,
+    plan: IssueBreakdownPlanRecord,
+  ): Promise<string | null> {
+    const updateDescription = this.options.writeback?.updateIssueDescription;
+    if (!updateDescription) {
+      return "issue breakdown apply requires tracker issue-description updates to resolve relationship contracts";
+    }
+    const refsByIndex = new Map(
+      plan.createdIssueRefs.map((ref) => [ref.proposedIssueIndex, ref]),
+    );
+    const identifierByTitle = new Map<string, string>();
+    for (const [index, proposed] of plan.proposedIssues.entries()) {
+      const ref = refsByIndex.get(index);
+      if (!ref?.identifier) {
+        return `issue breakdown relationship contract is waiting for a Linear identifier for ${JSON.stringify(proposed.title)}`;
+      }
+      identifierByTitle.set(
+        proposed.title.trim().toLowerCase(),
+        ref.identifier,
+      );
+    }
+
+    try {
+      const parentContract = parseIssueContract(parent.description);
+      if (!parentContract.valid) {
+        return `parent ${parent.identifier} no longer has a valid Issue Contract`;
+      }
+      const parentDescription = resolveParentIssueContractDescription(
+        parent,
+        [...identifierByTitle.values()],
+      );
+      const applicationTargetIssueContentFingerprint =
+        issueContentFingerprintForBreakdownPlan(
+          { ...parent, description: parentDescription },
+          plan,
+        );
+      await this.updatePlan(parent, plan, {
+        applicationTargetIssueContentFingerprint,
+      });
+
+      for (const [index, proposed] of plan.proposedIssues.entries()) {
+        const ref = refsByIndex.get(index)!;
+        const proposedContract = parseIssueContract(proposed.description);
+        if (!proposedContract.valid) {
+          return `proposed issue ${JSON.stringify(proposed.title)} no longer has a valid source Issue Contract`;
+        }
+        const description = resolveProposedIssueContractDescription({
+          parentIdentifier: parent.identifier,
+          proposedIssueIndex: index,
+          plan,
+          identifierByTitle,
+        });
+        const result = await updateDescription.call(this.options.writeback, {
+          issueId: ref.id,
+          description,
+          planId: plan.id,
+          dedupeKey: `issue-breakdown-contract:${plan.id}:${index}`,
+          expectedContractFingerprint: proposedContract.fingerprint,
+        });
+        if (result.status !== "applied" && result.status !== "verified") {
+          return `issue breakdown child relationship contract update did not succeed for ${ref.identifier}: ${result.message ?? result.status}`;
+        }
+      }
+
+      const parentResult = await updateDescription.call(
+        this.options.writeback,
+        {
+          issueId: parent.id,
+          description: parentDescription,
+          planId: plan.id,
+          dedupeKey: `issue-breakdown-contract:${plan.id}:parent`,
+          expectedContractFingerprint: parentContract.fingerprint,
+        },
+      );
+      if (
+        parentResult.status !== "applied" &&
+        parentResult.status !== "verified"
+      ) {
+        return `issue breakdown parent relationship contract update did not succeed: ${parentResult.message ?? parentResult.status}`;
+      }
+      return null;
+    } catch (error) {
+      return `issue breakdown relationship contract update failed: ${errorMessage(error)}`;
+    }
   }
 
   private async hydrateCreatedIssueRefs(
@@ -400,6 +517,7 @@ export class IssueBreakdownPlanApplyService {
         | "createdIssueRefs"
         | "appliedAt"
         | "applicationBlockedReason"
+        | "applicationTargetIssueContentFingerprint"
       >
     >,
   ): Promise<IssueBreakdownPlanRecord> {
@@ -686,6 +804,104 @@ function createdIssueRefFromOperation(operation: WritebackOperation): IssueBreak
     identifier: operation.resultEvidence.issue.identifier,
     url: operation.resultEvidence.issue.url,
   };
+}
+
+function resolveProposedIssueContractDescription(input: {
+  parentIdentifier: string;
+  proposedIssueIndex: number;
+  plan: IssueBreakdownPlanRecord;
+  identifierByTitle: ReadonlyMap<string, string>;
+}): string {
+  const proposed = input.plan.proposedIssues[input.proposedIssueIndex]!;
+  const parsed = parseIssueContract(proposed.description);
+  if (!parsed.valid || !parsed.contract.relationships) {
+    throw new Error(
+      `Proposed issue ${JSON.stringify(proposed.title)} no longer has a schema-v2 relationship contract`,
+    );
+  }
+  const resolveTitle = (reference: string): string =>
+    input.identifierByTitle.get(reference.trim().toLowerCase()) ??
+    reference.trim();
+  const dependencyIdentifiers = proposed.dependencies.map(resolveTitle);
+  const dependentIdentifiers = dependencyRelations(input.plan)
+    .filter(
+      (relation) =>
+        relation.sourceProposedIssueIndex === input.proposedIssueIndex,
+    )
+    .map((relation) => {
+      const dependent =
+        input.plan.proposedIssues[relation.targetProposedIssueIndex]!;
+      return resolveTitle(dependent.title);
+    });
+  const succession = parsed.contract.relationships.succession;
+  const resolvedSuccession =
+    succession === undefined
+      ? undefined
+      : succession.successor !== undefined
+        ? {
+            id: succession.id,
+            purpose: succession.purpose,
+            successor: { issue: resolveTitle(succession.successor.issue) },
+          }
+        : {
+            id: succession.id,
+            purpose: succession.purpose,
+            succeeds: { issue: resolveTitle(succession.succeeds.issue) },
+          };
+  const document = JSON.parse(parsed.canonicalJson) as Record<string, unknown>;
+  document.relationships = {
+    blocks: uniqueSortedReferences([
+      input.parentIdentifier,
+      ...dependentIdentifiers,
+    ]),
+    blockedBy: uniqueSortedReferences(dependencyIdentifiers),
+    ...(resolvedSuccession === undefined
+      ? {}
+      : { succession: resolvedSuccession }),
+  };
+  return replaceIssueContractJson(
+    proposed.description,
+    JSON.stringify(document, null, 2),
+  );
+}
+
+function resolveParentIssueContractDescription(
+  parent: Issue,
+  childIdentifiers: readonly string[],
+): string {
+  const parsed = parseIssueContract(parent.description);
+  if (!parsed.valid || !parsed.contract.relationships) {
+    throw new Error(
+      `Parent ${parent.identifier} no longer has a schema-v2 relationship contract`,
+    );
+  }
+  const document = JSON.parse(parsed.canonicalJson) as Record<string, unknown>;
+  document.relationships = {
+    blocks: uniqueSortedReferences(parsed.contract.relationships.blocks),
+    blockedBy: uniqueSortedReferences([
+      ...parsed.contract.relationships.blockedBy,
+      ...childIdentifiers,
+    ]),
+    ...(parsed.contract.relationships.succession === undefined
+      ? {}
+      : { succession: parsed.contract.relationships.succession }),
+  };
+  return replaceIssueContractJson(
+    parent.description ?? "",
+    JSON.stringify(document, null, 2),
+  );
+}
+
+function uniqueSortedReferences(values: readonly string[]): string[] {
+  const byNormalized = new Map<string, string>();
+  for (const value of values) {
+    const trimmed = value.trim();
+    if (trimmed.length === 0) continue;
+    byNormalized.set(trimmed.toLowerCase(), trimmed);
+  }
+  return [...byNormalized.values()].sort((left, right) =>
+    left.localeCompare(right, undefined, { sensitivity: "base" }),
+  );
 }
 
 function issueBreakdownRetryOptions(

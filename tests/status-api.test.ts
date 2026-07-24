@@ -21,7 +21,7 @@ import { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
 import type { AgentEvent, AgentHarness, AgentRunContext } from "../src/core/harness/AgentHarness.js";
 import type { Issue, IssueDetailsEnvelope, IssueStatusView, TrackerStateLists } from "../src/core/types.js";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
-import { issue, testConfig } from "./helpers.js";
+import { agentEligibleIssueContract, issue, testConfig } from "./helpers.js";
 
 function issuesInStates(issues: Issue[], states: string[]): Issue[] {
   const wanted = new Set(states.map((state) => state.toLowerCase()));
@@ -765,7 +765,10 @@ describe("StatusServer durable API", () => {
   it("surfaces provider-limit gates in state and dashboard and lets operators clear them", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     config.hermes.provider = "openai-codex";
-    const candidate = issue({ state: "Todo" });
+    const candidate = issue({
+      state: "Todo",
+      description: agentEligibleIssueContract(),
+    });
     let candidateAvailable = true;
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {

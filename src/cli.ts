@@ -1054,6 +1054,11 @@ function formatIssueInspectionResult(result: IssueInspectionResult): string {
     `  Blocked reason: ${lifecycle?.blockedReason ?? "n/a"}`,
     `  Review round: ${lifecycle?.reviewRound ?? "n/a"}`,
     `  Incomplete turns: ${lifecycle?.incompleteTurnCount ?? "n/a"}`,
+    `  Accepted-artifact validation failures: ${
+      lifecycle?.acceptedArtifactValidationFailure
+        ? `${lifecycle.acceptedArtifactValidationFailure.count}/${lifecycle.acceptedArtifactValidationFailure.limit} (${lifecycle.acceptedArtifactValidationFailure.reason})`
+        : "none"
+    }`,
     `  Planning failures: ${lifecycle?.planningFailureCount ?? "n/a"}`,
     `  Last run pointer: ${lifecycle?.summaryPointers.lastRunId ?? "n/a"}`,
     `  PR: ${formatCliPullRequest(lifecycle?.summaryPointers.prNumber ?? null, lifecycle?.summaryPointers.prUrl ?? null)}`,

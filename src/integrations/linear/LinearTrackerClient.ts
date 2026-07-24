@@ -1,5 +1,10 @@
 import type { TrackerConfig } from "../../core/config/Config.js";
 import { SymphonyError } from "../../core/errors.js";
+import {
+  parseIssueContract,
+  replaceIssueContractJson,
+  summarizeIssueContractForPrompt,
+} from "../../core/IssueContractLint.js";
 import type {
   FetchIssuesByStatesOptions,
   TrackerClient,
@@ -11,6 +16,7 @@ import type {
 import type {
   TrackerCommentInput,
   TrackerIssueCreateInput,
+  TrackerIssueDescriptionUpdateInput,
   TrackerIssueRelationInput,
   TrackerIssueRef,
   TrackerTransitionInput,
@@ -48,6 +54,11 @@ interface LinearRelationNode {
     identifier?: unknown;
     state?: { name?: unknown } | null;
   } | null;
+  relatedIssue?: {
+    id?: unknown;
+    identifier?: unknown;
+    state?: { name?: unknown } | null;
+  } | null;
 }
 
 interface LinearIssueNode {
@@ -80,9 +91,8 @@ interface LinearIssueNode {
     }>;
     pageInfo?: LinearPageInfoNode;
   } | null;
-  inverseRelations?: {
-    nodes?: LinearRelationNode[];
-  } | null;
+  inverseRelations?: LinearConnection<LinearRelationNode> | null;
+  relations?: LinearConnection<LinearRelationNode> | null;
 }
 
 interface LinearWorkflowStateNode {
@@ -107,6 +117,7 @@ interface LinearIssueWriteContext {
   id?: unknown;
   identifier?: unknown;
   state?: { id?: unknown; name?: unknown } | null;
+  description?: unknown;
   team?: { states?: { nodes?: LinearWorkflowStateNode[] } } | null;
   comments?: { nodes?: Array<{ id?: unknown; body?: unknown }> } | null;
 }
@@ -121,26 +132,19 @@ interface LinearIssueCreateContext {
   identifier?: unknown;
   team?: { id?: unknown; labels?: { nodes?: LinearIssueLabelNode[] } | null } | null;
   project?: { id?: unknown } | null;
-  children?: {
-    nodes?: Array<{
-      id?: unknown;
-      identifier?: unknown;
-      title?: unknown;
-      description?: unknown;
-      url?: unknown;
-      parent?: { id?: unknown } | null;
-    }>;
-  } | null;
+  children?: LinearConnection<{
+    id?: unknown;
+    identifier?: unknown;
+    title?: unknown;
+    description?: unknown;
+    url?: unknown;
+    parent?: { id?: unknown } | null;
+  }> | null;
 }
 
 interface LinearIssueRelationContext {
   id?: unknown;
-  relations?: {
-    nodes?: Array<{
-      type?: unknown;
-      relatedIssue?: { id?: unknown } | null;
-    }>;
-  } | null;
+  relations?: LinearConnection<LinearRelationNode> | null;
 }
 
 export interface AssigneeFilter {
@@ -171,7 +175,14 @@ const ISSUE_FIELDS = `
   delegate { id }
   labels { nodes { name } }
   children(first: 100) { nodes { id identifier state { name } } pageInfo { hasNextPage endCursor } }
-  inverseRelations { nodes { type issue { id identifier state { name } } } }
+  inverseRelations(first: 100) {
+    nodes { type issue { id identifier state { name } } }
+    pageInfo { hasNextPage endCursor }
+  }
+  relations(first: 100) {
+    nodes { type relatedIssue { id identifier state { name } } }
+    pageInfo { hasNextPage endCursor }
+  }
 `;
 
 const VIEWER_QUERY = `
@@ -235,11 +246,36 @@ const ISSUE_STATES_QUERY = `
   }
 `;
 
+const ISSUE_RELATIONS_PAGE_QUERY = `
+  query SymphonyIssueRelationsPage($id: String!, $after: String) {
+    issue(id: $id) {
+      id
+      relations(first: 100, after: $after) {
+        nodes { type relatedIssue { id identifier state { name } } }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+`;
+
+const ISSUE_INVERSE_RELATIONS_PAGE_QUERY = `
+  query SymphonyIssueInverseRelationsPage($id: String!, $after: String) {
+    issue(id: $id) {
+      id
+      inverseRelations(first: 100, after: $after) {
+        nodes { type issue { id identifier state { name } } }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+`;
+
 const ISSUE_WRITE_CONTEXT_QUERY = `
   query SymphonyIssueWriteContext($id: String!) {
     issue(id: $id) {
       id
       identifier
+      description
       state { id name }
       team { states { nodes { id name } } }
       comments(first: 50) { nodes { id body } }
@@ -254,7 +290,22 @@ const ISSUE_CREATE_CONTEXT_QUERY = `
       identifier
       team { id labels(first: 100) { nodes { id name } } }
       project { id }
-      children(first: 100) { nodes { id identifier title description url parent { id } } }
+      children(first: 100) {
+        nodes { id identifier title description url parent { id } }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+`;
+
+const ISSUE_CHILDREN_PAGE_QUERY = `
+  query SymphonyIssueChildrenPage($id: String!, $after: String) {
+    issue(id: $id) {
+      id
+      children(first: 100, after: $after) {
+        nodes { id identifier title description url parent { id } }
+        pageInfo { hasNextPage endCursor }
+      }
     }
   }
 `;
@@ -311,6 +362,15 @@ const ISSUE_UPDATE_MUTATION = `
   }
 `;
 
+const ISSUE_DESCRIPTION_UPDATE_MUTATION = `
+  mutation SymphonyIssueDescriptionUpdate($id: String!, $description: String!) {
+    issueUpdate(id: $id, input: { description: $description }) {
+      success
+      issue { id identifier description updatedAt }
+    }
+  }
+`;
+
 const COMMENT_CREATE_MUTATION = `
   mutation SymphonyCommentCreate($input: CommentCreateInput!) {
     commentCreate(input: $input) {
@@ -333,7 +393,10 @@ const ISSUE_RELATION_CONTEXT_QUERY = `
   query SymphonyIssueRelationContext($id: String!) {
     issue(id: $id) {
       id
-      relations(first: 100) { nodes { type relatedIssue { id } } }
+      relations(first: 100) {
+        nodes { type relatedIssue { id identifier state { name } } }
+        pageInfo { hasNextPage endCursor }
+      }
     }
   }
 `;
@@ -653,6 +716,62 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
     return { status: "applied", message: input.dedupeKey };
   }
 
+  async updateIssueDescription(
+    input: TrackerIssueDescriptionUpdateInput,
+  ): Promise<TrackerWriteResult> {
+    const context = await this.fetchIssueWriteContext(input.issueId);
+    const currentDescription = asNullableString(context.description);
+    const desiredContractJson = summarizeIssueContractForPrompt(
+      input.description,
+    ).issueContractJson;
+    const currentContract = parseIssueContract(currentDescription);
+    const desiredContract = parseIssueContract(input.description);
+    if (
+      input.expectedContractFingerprint !== undefined &&
+      (!currentContract.valid ||
+        !desiredContract.valid ||
+        (currentContract.fingerprint !== input.expectedContractFingerprint &&
+          currentContract.fingerprint !== desiredContract.fingerprint))
+    ) {
+      throw new SymphonyError(
+        "conflict",
+        `Linear issue ${input.issueId} Issue Contract changed after the breakdown plan created it`,
+        {
+          expectedFingerprint: input.expectedContractFingerprint,
+          currentFingerprint: currentContract.valid
+            ? currentContract.fingerprint
+            : null,
+          targetFingerprint: desiredContract.valid
+            ? desiredContract.fingerprint
+            : null,
+        },
+      );
+    }
+    const nextDescription =
+      currentDescription !== null && desiredContractJson !== null
+        ? replaceIssueContractJson(currentDescription, desiredContractJson)
+        : input.description;
+    if (currentDescription === nextDescription) {
+      return {
+        status: "verified",
+        message: `Issue description already matches ${input.dedupeKey}`,
+      };
+    }
+    const response = await this.graphql<{
+      issueUpdate: { success?: unknown };
+    }>(ISSUE_DESCRIPTION_UPDATE_MUTATION, {
+      id: input.issueId,
+      description: nextDescription,
+    });
+    if (response.issueUpdate.success !== true) {
+      throw new SymphonyError(
+        "tracker_error",
+        `Linear issueUpdate did not report success for ${input.issueId}`,
+      );
+    }
+    return { status: "applied", message: input.dedupeKey };
+  }
+
   private async fetchPagedIssues(
     query: string,
     variables: Record<string, unknown>,
@@ -692,10 +811,98 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
       response.issues.pageInfo,
       "Linear issues",
     );
+    const completeNodes = await Promise.all(
+      response.issues.nodes.map((node) =>
+        this.fetchCompleteIssueRelationConnections(node),
+      ),
+    );
     return {
-      issues: response.issues.nodes
+      issues: completeNodes
         .map((node) => normalizeIssue(node, assigneeFilter))
         .filter((issue): issue is Issue => issue !== null),
+      pageInfo,
+    };
+  }
+
+  private async fetchCompleteIssueRelationConnections(
+    node: LinearIssueNode,
+  ): Promise<LinearIssueNode> {
+    const issueId = asString(node.id);
+    if (!issueId) {
+      throw new SymphonyError(
+        "tracker_error",
+        "Linear issue relation pagination requires an issue id",
+      );
+    }
+    const issueLabel = asString(node.identifier) ?? issueId;
+    const [relations, inverseRelations] = await Promise.all([
+      this.fetchCompleteIssueRelationConnection(
+        issueId,
+        issueLabel,
+        "relations",
+        node.relations,
+      ),
+      this.fetchCompleteIssueRelationConnection(
+        issueId,
+        issueLabel,
+        "inverseRelations",
+        node.inverseRelations,
+      ),
+    ]);
+    return {
+      ...node,
+      relations,
+      inverseRelations,
+    };
+  }
+
+  private async fetchCompleteIssueRelationConnection(
+    issueId: string,
+    issueLabel: string,
+    connectionName: "relations" | "inverseRelations",
+    initialConnection: LinearConnection<LinearRelationNode> | null | undefined,
+  ): Promise<LinearConnection<LinearRelationNode>> {
+    const subject = `Linear issue ${issueLabel} ${connectionName}`;
+    const nodes = initialConnection?.nodes;
+    if (!Array.isArray(nodes)) {
+      throw new SymphonyError(
+        "tracker_error",
+        `${subject} are missing from response`,
+      );
+    }
+    const completeNodes = [...nodes];
+    let pageInfo = normalizePageInfo(initialConnection?.pageInfo, subject);
+    let after = pageInfo.hasNextPage ? pageInfo.endCursor : null;
+
+    while (after) {
+      const query =
+        connectionName === "relations"
+          ? ISSUE_RELATIONS_PAGE_QUERY
+          : ISSUE_INVERSE_RELATIONS_PAGE_QUERY;
+      const response = await this.graphql<{
+        issue?: LinearIssueNode | null;
+      }>(query, { id: issueId, after });
+      if (!response.issue) {
+        throw new SymphonyError(
+          "tracker_error",
+          `Linear issue not found while paginating ${connectionName}: ${issueId}`,
+        );
+      }
+      const connection = response.issue[connectionName];
+      const pageNodes = connection?.nodes;
+      if (!Array.isArray(pageNodes)) {
+        throw new SymphonyError(
+          "tracker_error",
+          `${subject} are missing from response`,
+        );
+      }
+      completeNodes.push(...pageNodes);
+      pageInfo = normalizePageInfo(connection?.pageInfo, subject);
+      after = pageInfo.hasNextPage ? pageInfo.endCursor : null;
+    }
+
+    return {
+      nodes: completeNodes,
       pageInfo,
     };
   }
@@ -728,7 +935,56 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
       id: issueId,
     });
     if (!response.issue) throw new SymphonyError("tracker_error", `Linear issue not found: ${issueId}`);
-    return response.issue;
+    const resolvedId = asString(response.issue.id) ?? issueId;
+    const issueLabel = asString(response.issue.identifier) ?? resolvedId;
+    const childNodes = response.issue.children?.nodes;
+    if (!Array.isArray(childNodes)) {
+      throw new SymphonyError(
+        "tracker_error",
+        `Linear issue ${issueLabel} children are missing from response`,
+      );
+    }
+    const completeNodes = [...childNodes];
+    let pageInfo = normalizePageInfo(
+      response.issue.children?.pageInfo,
+      `Linear issue ${issueLabel} children`,
+    );
+    let after = pageInfo.hasNextPage ? pageInfo.endCursor : null;
+
+    while (after) {
+      const page = await this.graphql<{
+        issue?: LinearIssueCreateContext | null;
+      }>(ISSUE_CHILDREN_PAGE_QUERY, {
+        id: resolvedId,
+        after,
+      });
+      if (!page.issue) {
+        throw new SymphonyError(
+          "tracker_error",
+          `Linear issue not found while paginating children: ${resolvedId}`,
+        );
+      }
+      const pageNodes = page.issue.children?.nodes;
+      if (!Array.isArray(pageNodes)) {
+        throw new SymphonyError(
+          "tracker_error",
+          `Linear issue ${issueLabel} children are missing from response`,
+        );
+      }
+      completeNodes.push(...pageNodes);
+      pageInfo = normalizePageInfo(
+        page.issue.children?.pageInfo,
+        `Linear issue ${issueLabel} children`,
+      );
+      after = pageInfo.hasNextPage ? pageInfo.endCursor : null;
+    }
+    return {
+      ...response.issue,
+      children: {
+        nodes: completeNodes,
+        pageInfo,
+      },
+    };
   }
 
   private async fetchIssueRelationContext(issueId: string): Promise<LinearIssueRelationContext> {
@@ -736,7 +992,14 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
       id: issueId,
     });
     if (!response.issue) throw new SymphonyError("tracker_error", `Linear issue not found: ${issueId}`);
-    return response.issue;
+    const resolvedId = asString(response.issue.id) ?? issueId;
+    const relations = await this.fetchCompleteIssueRelationConnection(
+      resolvedId,
+      resolvedId,
+      "relations",
+      response.issue.relations,
+    );
+    return { ...response.issue, relations };
   }
 
   private normalizeWorkflowTeam(team: LinearWorkflowTeamNode): LinearWorkflowTeamDescriptor {
@@ -946,6 +1209,7 @@ export function normalizeIssue(node: LinearIssueNode, assigneeFilter: AssigneeFi
     delegateId,
     assignedToWorker: assignedToWorker(assigneeId, delegateId, assigneeFilter),
     labels: normalizeLabels(node.labels?.nodes),
+    blocks: normalizeBlockingTargets(node.relations?.nodes),
     blockedBy: normalizeBlockers(node.inverseRelations?.nodes),
     hasChildren: (node.children?.nodes ?? []).length > 0,
     children: normalizeChildren(node.children?.nodes),
@@ -967,6 +1231,17 @@ function normalizeBlockers(nodes: LinearRelationNode[] | undefined): IssueBlocke
       id: asNullableString(node.issue?.id),
       identifier: asNullableString(node.issue?.identifier),
       state: asNullableString(node.issue?.state?.name),
+    }));
+}
+
+function normalizeBlockingTargets(nodes: LinearRelationNode[] | undefined): IssueBlockerRef[] {
+  if (!Array.isArray(nodes)) return [];
+  return nodes
+    .filter((node) => asString(node.type)?.toLowerCase() === "blocks")
+    .map((node) => ({
+      id: asNullableString(node.relatedIssue?.id),
+      identifier: asNullableString(node.relatedIssue?.identifier),
+      state: asNullableString(node.relatedIssue?.state?.name),
     }));
 }
 

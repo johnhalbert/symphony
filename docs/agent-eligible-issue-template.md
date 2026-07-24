@@ -21,8 +21,8 @@ within the issue. Update `contractVersion` when obligations materially change.
 
 ```json
 {
-  "schemaVersion": 1,
-  "contractVersion": "2026-06-04.1",
+  "schemaVersion": 2,
+  "contractVersion": "2026-07-23.1",
   "delivery": {
     "mode": "merge"
   },
@@ -32,7 +32,11 @@ within the issue. Update `contractVersion` when obligations materially change.
       "requirement": "Concrete, reviewable obligation the worker must satisfy.",
       "proofHint": "Optional non-authoritative evidence guidance."
     }
-  ]
+  ],
+  "relationships": {
+    "blocks": [],
+    "blockedBy": []
+  }
 }
 ```
 
@@ -40,9 +44,45 @@ Use `"delivery": {"mode":"merge"}` for normal implementation work. A
 deliberately test-only TDD issue whose reviewed expected-red tests should finish
 without merging must instead use
 `"delivery": {"mode":"accepted_artifact","artifact":"expected_red_tests"}`.
-Its implementation sibling successors (children of the same decomposition
-parent), never children of the artifact issue, use merge delivery and depend on
-the test issue so Symphony can seed each successor from the reviewed checkpoint.
+
+`relationships.blocks` and `relationships.blockedBy` are always required;
+empty arrays are valid. They are the issue contract’s copy of the generalized
+Linear ordering graph and must exactly match Linear. They never mean
+“implementation successor.”
+
+TDD succession is a separate optional bilateral contract. An expected-red
+producer names exactly one implementation successor:
+
+```json
+"relationships": {
+  "blocks": ["ENG-2002"],
+  "blockedBy": [],
+  "succession": {
+    "id": "tdd-eng-2001-implementation",
+    "purpose": "expected_red_implementation",
+    "successor": { "issue": "ENG-2002" }
+  }
+}
+```
+
+The merge-delivery implementation issue must agree:
+
+```json
+"relationships": {
+  "blocks": [],
+  "blockedBy": ["ENG-2001"],
+  "succession": {
+    "id": "tdd-eng-2001-implementation",
+    "purpose": "expected_red_implementation",
+    "succeeds": { "issue": "ENG-2001" }
+  }
+}
+```
+
+The matching Linear `blocks` edge is still required independently. Other
+issues may also be blocked by the expected-red issue for ordinary ordering;
+they do not consume its artifact unless they carry the reciprocal succession
+agreement.
 
 ## Touched Surfaces
 

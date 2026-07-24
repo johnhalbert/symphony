@@ -158,6 +158,7 @@ function snapshot(): IssueCurrentStateSnapshot {
     delegateId: null,
     assignedToWorker: true,
     labels: [],
+    blocks: [],
     blockedBy: [],
     hasChildren: false,
     trackerCreatedAt: now,

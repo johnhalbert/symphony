@@ -15,7 +15,12 @@ import {
   type IssueLifecycleStore,
 } from "../persistence/IssueLifecycleStore.js";
 import { ProjectionRevisionNotifier, type ProjectionChangeListener, type ProjectionChangeUnsubscribe } from "../persistence/ProjectionRevision.js";
-import type { TrackerWriteEvidence, TrackerWriteResult, TrackerWriter } from "../tracker/TrackerWriter.js";
+import type {
+  TrackerIssueDescriptionUpdateInput,
+  TrackerWriteEvidence,
+  TrackerWriteResult,
+  TrackerWriter,
+} from "../tracker/TrackerWriter.js";
 import type { Issue } from "../types.js";
 import { errorMessage, SymphonyError } from "../errors.js";
 
@@ -985,6 +990,21 @@ export class WritebackProcessor {
     idempotencyKey: string,
   ): Promise<WritebackOperation | null> {
     return this.store.get(idempotencyKey);
+  }
+
+  async updateIssueDescription(
+    input: TrackerIssueDescriptionUpdateInput,
+  ): Promise<TrackerWriteResult> {
+    if (!this.writer.updateIssueDescription) {
+      throw new SymphonyError(
+        "invalid_request",
+        "Tracker writer does not support issue description updates",
+      );
+    }
+    if (this.dryRun) {
+      return { status: "dry_run", message: "Writeback dry_run" };
+    }
+    return this.writer.updateIssueDescription(input);
   }
 
   async enqueueAndProcess(operation: NewWritebackOperation, options: EnqueueWritebackOptions = {}): Promise<WritebackOperation> {

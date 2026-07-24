@@ -104,11 +104,41 @@ export type IssueContractDelivery =
   | { mode: "merge" }
   | { mode: "accepted_artifact"; artifact: "expected_red_tests" };
 
+export const CURRENT_ISSUE_CONTRACT_SCHEMA_VERSION = 2;
+
+export type IssueContractSuccessionPurpose = "expected_red_implementation";
+
+export interface IssueContractSuccessionEndpoint {
+  issue: string;
+}
+
+export type IssueContractSuccession =
+  | {
+      id: string;
+      purpose: IssueContractSuccessionPurpose;
+      successor: IssueContractSuccessionEndpoint;
+      succeeds?: never;
+    }
+  | {
+      id: string;
+      purpose: IssueContractSuccessionPurpose;
+      succeeds: IssueContractSuccessionEndpoint;
+      successor?: never;
+    };
+
+export interface IssueContractRelationships {
+  blocks: string[];
+  blockedBy: string[];
+  succession?: IssueContractSuccession;
+}
+
 export interface ParsedIssueContract {
   schemaVersion: number;
   contractVersion: string;
   requirements: IssueContractRequirement[];
   delivery: IssueContractDelivery;
+  /** Absent only for legacy schema-v1 contracts. */
+  relationships?: IssueContractRelationships;
   [key: string]: unknown;
 }
 
@@ -132,9 +162,17 @@ export type ParsedIssueContractResult =
 
 export function lintAgentEligibleIssueContract(issue: Issue, config: ServiceConfig): IssueContractLintResult {
   const applicable = requiresAgentEligibleIssueContract(issue, config);
-  const analysis = applicable
+  const baseAnalysis = applicable
     ? analyzeIssueContractDescription(issue.description, config.agent.protectedPaths)
     : emptyIssueContractAnalysis();
+  const relationshipErrors =
+    applicable && baseAnalysis.issueContractErrors.length === 0
+      ? validateIssueContractRelationshipsAgainstIssue(issue)
+      : [];
+  const analysis = {
+    ...baseAnalysis,
+    issueContractErrors: [...baseAnalysis.issueContractErrors, ...relationshipErrors],
+  };
   return {
     issue: {
       id: issue.id,
@@ -161,9 +199,16 @@ export function analyzeIssueContractDescription(
   const contractChecklist = sections.get(normalizeHeading(CONTRACT_CHECKLIST_HEADING));
   const validationRequirements = sections.get(normalizeHeading(VALIDATION_REQUIREMENTS_HEADING));
   const promotionReadiness = sections.get(normalizeHeading(PROMOTION_READINESS_HEADING)) ?? "";
+  const duplicateContractErrors =
+    markdownHeadingOccurrenceCount(content, ISSUE_CONTRACT_HEADING) > 1
+      ? ["Issue description must contain exactly one `Issue Contract` section"]
+      : [];
   return {
     missingSections: missingRequiredIssueContractSections(content),
-    issueContractErrors: validateIssueContractSection(issueContract),
+    issueContractErrors: [
+      ...duplicateContractErrors,
+      ...validateIssueContractSection(issueContract),
+    ],
     underSpecifiedContractErrors: [
       ...validateIssueContractSpecificity(issueContract),
       ...validateContractChecklistSpecificity(contractChecklist),
@@ -192,6 +237,58 @@ export function summarizeIssueContractForPrompt(
   };
 }
 
+export function replaceIssueContractJson(
+  description: string,
+  issueContractJson: string,
+): string {
+  if (markdownHeadingOccurrenceCount(description, ISSUE_CONTRACT_HEADING) !== 1) {
+    throw new Error(
+      "Issue description must contain exactly one `Issue Contract` section",
+    );
+  }
+  const lines = description.split(/\r?\n/);
+  let inIssueContract = false;
+  let fenceStart = -1;
+  let fenceEnd = -1;
+  let fenceMarker = "";
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] ?? "";
+    const heading = line.match(/^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/);
+    if (heading) {
+      inIssueContract =
+        normalizeHeading(heading[1] ?? "") ===
+        normalizeHeading(ISSUE_CONTRACT_HEADING);
+      continue;
+    }
+    if (!inIssueContract) continue;
+    if (fenceStart === -1) {
+      const fence = line.match(/^\s{0,3}(`{3,}|~{3,})\s*json\s*$/i);
+      if (!fence) continue;
+      fenceStart = index;
+      fenceMarker = fence[1] ?? "```";
+      continue;
+    }
+    const closing = line.match(/^\s{0,3}(`{3,}|~{3,})\s*$/);
+    const closingMarker = closing?.[1];
+    if (
+      closingMarker !== undefined &&
+      closingMarker[0] === fenceMarker[0] &&
+      closingMarker.length >= fenceMarker.length
+    ) {
+      fenceEnd = index;
+      break;
+    }
+  }
+  if (fenceStart === -1 || fenceEnd === -1) {
+    throw new Error("Issue Contract must contain a fenced `json` block");
+  }
+  return [
+    ...lines.slice(0, fenceStart + 1),
+    issueContractJson.trim(),
+    ...lines.slice(fenceEnd),
+  ].join("\n");
+}
+
 export function parseIssueContractFromDescription(
   description: string | null | undefined,
 ): ParsedIssueContractSnapshot | null {
@@ -206,7 +303,16 @@ export function parseIssueContractFromDescription(
 }
 
 export function parseIssueContract(description: string | null | undefined): ParsedIssueContractResult {
-  const sections = markdownSections(description ?? "");
+  const content = description ?? "";
+  if (markdownHeadingOccurrenceCount(content, ISSUE_CONTRACT_HEADING) > 1) {
+    return {
+      valid: false,
+      errors: [
+        "Issue description must contain exactly one `Issue Contract` section",
+      ],
+    };
+  }
+  const sections = markdownSections(content);
   const section = sections.get(normalizeHeading(ISSUE_CONTRACT_HEADING));
   if (section === undefined) {
     return { valid: false, errors: ["Issue Contract section is missing"] };
@@ -237,13 +343,14 @@ function parseIssueContractJsonResult(value: string): ParsedIssueContractResult 
     return { valid: false, errors: ["Issue Contract fenced `json` must parse as valid JSON"] };
   }
   if (!isRecord(parsed)) return { valid: false, errors: ["Issue Contract JSON must be an object"] };
-  const errors = validateIssueContractObject(parsed);
+  const errors = validateIssueContractObject(parsed, false);
   if (errors.length > 0) return { valid: false, errors };
 
   const delivery = parseIssueContractDelivery(parsed.delivery);
   if (delivery === null) {
     return { valid: false, errors: ["Issue Contract delivery is invalid"] };
   }
+  const relationships = parseIssueContractRelationships(parsed.relationships);
   const contract: ParsedIssueContract = {
     ...parsed,
     schemaVersion: parsed.schemaVersion as number,
@@ -255,6 +362,7 @@ function parseIssueContractJsonResult(value: string): ParsedIssueContractResult 
       ...(typeof requirement.proofHint === "string" ? { proofHint: requirement.proofHint.trim() } : {}),
     })),
     delivery,
+    ...(relationships === null ? {} : { relationships }),
   };
   const canonicalJson = stableJson(contract);
   return {
@@ -299,14 +407,25 @@ function validateIssueContractSection(section: string | undefined): string[] {
     return ["Issue Contract JSON must be an object"];
   }
 
-  return validateIssueContractObject(parsed);
+  return validateIssueContractObject(parsed, true);
 }
 
-function validateIssueContractObject(parsed: Record<string, unknown>): string[] {
+function validateIssueContractObject(
+  parsed: Record<string, unknown>,
+  requireCurrentSchema: boolean,
+): string[] {
   const errors: string[] = [];
   const schemaVersion = parsed.schemaVersion;
   if (typeof schemaVersion !== "number" || !Number.isInteger(schemaVersion) || schemaVersion <= 0) {
     errors.push("Issue Contract must include a positive integer `schemaVersion`");
+  } else if (schemaVersion !== 1 && schemaVersion !== CURRENT_ISSUE_CONTRACT_SCHEMA_VERSION) {
+    errors.push(
+      `Issue Contract schemaVersion ${schemaVersion} is unsupported; supported versions are 1 and ${CURRENT_ISSUE_CONTRACT_SCHEMA_VERSION}`,
+    );
+  } else if (requireCurrentSchema && schemaVersion !== CURRENT_ISSUE_CONTRACT_SCHEMA_VERSION) {
+    errors.push(
+      `Agent-eligible Issue Contract must use schemaVersion ${CURRENT_ISSUE_CONTRACT_SCHEMA_VERSION}`,
+    );
   }
 
   const contractVersion = typeof parsed.contractVersion === "string" ? parsed.contractVersion.trim() : "";
@@ -315,6 +434,13 @@ function validateIssueContractObject(parsed: Record<string, unknown>): string[] 
   }
 
   errors.push(...validateIssueContractDelivery(parsed.delivery));
+  errors.push(
+    ...validateIssueContractRelationships(
+      parsed.relationships,
+      schemaVersion === CURRENT_ISSUE_CONTRACT_SCHEMA_VERSION,
+      parsed.delivery,
+    ),
+  );
 
   const requirements = parsed.requirements;
   if (!Array.isArray(requirements) || requirements.length === 0) {
@@ -362,6 +488,280 @@ function validateIssueContractObject(parsed: Record<string, unknown>): string[] 
   }
 
   return errors;
+}
+
+function validateIssueContractRelationships(
+  value: unknown,
+  required: boolean,
+  deliveryValue: unknown,
+): string[] {
+  if (value === undefined) {
+    return required
+      ? ["Issue Contract must include `relationships.blocks` and `relationships.blockedBy` arrays"]
+      : [];
+  }
+  if (!isRecord(value)) {
+    return ["Issue Contract `relationships` must be an object"];
+  }
+
+  const errors: string[] = [];
+  const allowedKeys = new Set(["blocks", "blockedBy", "succession"]);
+  const unknownKeys = Object.keys(value).filter((key) => !allowedKeys.has(key));
+  if (unknownKeys.length > 0) {
+    errors.push(
+      `Issue Contract \`relationships\` contains unsupported fields: ${unknownKeys.sort().join(", ")}`,
+    );
+  }
+
+  errors.push(...validateIssueReferenceArray(value.blocks, "relationships.blocks"));
+  errors.push(...validateIssueReferenceArray(value.blockedBy, "relationships.blockedBy"));
+
+  const successionErrors = validateIssueContractSuccession(value.succession);
+  errors.push(...successionErrors);
+  if (successionErrors.length > 0 || value.succession === undefined || !isRecord(value.succession)) {
+    if (deliveryIsExpectedRedArtifact(deliveryValue) && value.succession === undefined) {
+      errors.push(
+        "Expected-red accepted-artifact delivery requires `relationships.succession.successor`",
+      );
+    }
+    return errors;
+  }
+
+  const successor = successionEndpointIssue(value.succession.successor);
+  const succeeds = successionEndpointIssue(value.succession.succeeds);
+  if (successor !== null) {
+    if (!deliveryIsExpectedRedArtifact(deliveryValue)) {
+      errors.push(
+        "Issue Contract with `relationships.succession.successor` must use expected-red accepted-artifact delivery",
+      );
+    }
+    if (!issueReferenceArrayIncludes(value.blocks, successor)) {
+      errors.push(
+        "`relationships.blocks` must include the issue declared by `relationships.succession.successor`",
+      );
+    }
+  }
+  if (succeeds !== null) {
+    if (deliveryIsExpectedRedArtifact(deliveryValue)) {
+      errors.push(
+        "Issue Contract with `relationships.succession.succeeds` must use merge delivery",
+      );
+    }
+    if (!issueReferenceArrayIncludes(value.blockedBy, succeeds)) {
+      errors.push(
+        "`relationships.blockedBy` must include the issue declared by `relationships.succession.succeeds`",
+      );
+    }
+  }
+  return errors;
+}
+
+function validateIssueReferenceArray(value: unknown, field: string): string[] {
+  if (!Array.isArray(value)) {
+    return [`Issue Contract \`${field}\` must be an array (an empty array is valid)`];
+  }
+  const normalized = value.map((entry) =>
+    typeof entry === "string" ? entry.trim().toLowerCase() : "",
+  );
+  if (normalized.some((entry) => entry.length === 0)) {
+    return [`Issue Contract \`${field}\` entries must be non-empty issue references`];
+  }
+  if (new Set(normalized).size !== normalized.length) {
+    return [`Issue Contract \`${field}\` must not contain duplicate issue references`];
+  }
+  return [];
+}
+
+function validateIssueContractSuccession(value: unknown): string[] {
+  if (value === undefined) return [];
+  if (!isRecord(value)) {
+    return ["Issue Contract `relationships.succession` must be an object"];
+  }
+  const allowedKeys = new Set(["id", "purpose", "successor", "succeeds"]);
+  const unknownKeys = Object.keys(value).filter((key) => !allowedKeys.has(key));
+  const errors: string[] = [];
+  if (unknownKeys.length > 0) {
+    errors.push(
+      `Issue Contract \`relationships.succession\` contains unsupported fields: ${unknownKeys.sort().join(", ")}`,
+    );
+  }
+  const id = typeof value.id === "string" ? value.id.trim() : "";
+  if (!STABLE_REQUIREMENT_ID_PATTERN.test(id)) {
+    errors.push(
+      "Issue Contract `relationships.succession.id` must be a stable non-empty identifier",
+    );
+  }
+  if (value.purpose !== "expected_red_implementation") {
+    errors.push(
+      "Issue Contract `relationships.succession.purpose` must be `expected_red_implementation`",
+    );
+  }
+  const hasSuccessor = value.successor !== undefined;
+  const hasSucceeds = value.succeeds !== undefined;
+  if (hasSuccessor === hasSucceeds) {
+    errors.push(
+      "Issue Contract `relationships.succession` must include exactly one of `successor` or `succeeds`",
+    );
+  }
+  if (hasSuccessor) {
+    errors.push(...validateSuccessionEndpoint(value.successor, "successor"));
+  }
+  if (hasSucceeds) {
+    errors.push(...validateSuccessionEndpoint(value.succeeds, "succeeds"));
+  }
+  return errors;
+}
+
+function validateSuccessionEndpoint(value: unknown, field: "successor" | "succeeds"): string[] {
+  if (!isRecord(value)) {
+    return [`Issue Contract \`relationships.succession.${field}\` must be an object`];
+  }
+  const unknownKeys = Object.keys(value).filter((key) => key !== "issue");
+  const errors =
+    unknownKeys.length === 0
+      ? []
+      : [
+          `Issue Contract \`relationships.succession.${field}\` contains unsupported fields: ${unknownKeys
+            .sort()
+            .join(", ")}`,
+        ];
+  if (typeof value.issue !== "string" || value.issue.trim().length === 0) {
+    errors.push(
+      `Issue Contract \`relationships.succession.${field}.issue\` must be a non-empty issue reference`,
+    );
+  }
+  return errors;
+}
+
+function deliveryIsExpectedRedArtifact(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    value.mode === "accepted_artifact" &&
+    value.artifact === "expected_red_tests"
+  );
+}
+
+function successionEndpointIssue(value: unknown): string | null {
+  return isRecord(value) && typeof value.issue === "string" && value.issue.trim().length > 0
+    ? value.issue.trim()
+    : null;
+}
+
+function issueReferenceArrayIncludes(value: unknown, reference: string): boolean {
+  return (
+    Array.isArray(value) &&
+    value.some(
+      (entry) =>
+        typeof entry === "string" &&
+        entry.trim().toLowerCase() === reference.trim().toLowerCase(),
+    )
+  );
+}
+
+function parseIssueContractRelationships(value: unknown): IssueContractRelationships | null {
+  if (!isRecord(value) || !Array.isArray(value.blocks) || !Array.isArray(value.blockedBy)) {
+    return null;
+  }
+  const succession = isRecord(value.succession)
+    ? parseIssueContractSuccession(value.succession)
+    : null;
+  return {
+    blocks: value.blocks
+      .map((entry) => String(entry).trim())
+      .sort(compareIssueContractReference),
+    blockedBy: value.blockedBy
+      .map((entry) => String(entry).trim())
+      .sort(compareIssueContractReference),
+    ...(succession === null ? {} : { succession }),
+  };
+}
+
+function parseIssueContractSuccession(
+  value: Record<string, unknown>,
+): IssueContractSuccession | null {
+  const id = typeof value.id === "string" ? value.id.trim() : "";
+  if (id.length === 0 || value.purpose !== "expected_red_implementation") return null;
+  const successor = successionEndpointIssue(value.successor);
+  if (successor !== null) {
+    return {
+      id,
+      purpose: "expected_red_implementation",
+      successor: { issue: successor },
+    };
+  }
+  const succeeds = successionEndpointIssue(value.succeeds);
+  return succeeds === null
+    ? null
+    : {
+        id,
+        purpose: "expected_red_implementation",
+        succeeds: { issue: succeeds },
+      };
+}
+
+export function validateIssueContractRelationshipsAgainstIssue(issue: Issue): string[] {
+  const parsed = parseIssueContractFromDescription(issue.description);
+  if (parsed === null || parsed.schemaVersion !== CURRENT_ISSUE_CONTRACT_SCHEMA_VERSION) {
+    return [];
+  }
+  const relationships = parsed.relationships;
+  if (relationships === undefined) return [];
+  return [
+    ...relationships.blocks
+      .filter((reference) => issueReferenceMatches(reference, issue))
+      .map(() => "Issue Contract `relationships.blocks` cannot contain the issue itself"),
+    ...relationships.blockedBy
+      .filter((reference) => issueReferenceMatches(reference, issue))
+      .map(() => "Issue Contract `relationships.blockedBy` cannot contain the issue itself"),
+    ...relationshipDirectionErrors("blocks", relationships.blocks, issue.blocks ?? []),
+    ...relationshipDirectionErrors("blockedBy", relationships.blockedBy, issue.blockedBy),
+  ];
+}
+
+function compareIssueContractReference(left: string, right: string): number {
+  return left.localeCompare(right, undefined, { sensitivity: "base" });
+}
+
+function relationshipDirectionErrors(
+  field: "blocks" | "blockedBy",
+  declared: readonly string[],
+  observed: readonly { id: string | null; identifier: string | null }[],
+): string[] {
+  const unmatchedDeclared = declared.filter(
+    (reference) => !observed.some((edge) => issueReferenceMatches(reference, edge)),
+  );
+  const undeclaredObserved = observed.filter(
+    (edge) => !declared.some((reference) => issueReferenceMatches(reference, edge)),
+  );
+  const errors: string[] = [];
+  if (unmatchedDeclared.length > 0) {
+    errors.push(
+      `Issue Contract \`relationships.${field}\` declares edges absent from Linear: ${unmatchedDeclared
+        .sort()
+        .join(", ")}`,
+    );
+  }
+  if (undeclaredObserved.length > 0) {
+    errors.push(
+      `Linear ${field} edges are missing from Issue Contract \`relationships.${field}\`: ${undeclaredObserved
+        .map((edge) => edge.identifier ?? edge.id ?? "unknown")
+        .sort()
+        .join(", ")}`,
+    );
+  }
+  return errors;
+}
+
+export function issueReferenceMatches(
+  reference: string,
+  issue: { id: string | null; identifier: string | null },
+): boolean {
+  const normalized = reference.trim().toLowerCase();
+  return (
+    (issue.id !== null && issue.id.trim().toLowerCase() === normalized) ||
+    (issue.identifier !== null &&
+      issue.identifier.trim().toLowerCase() === normalized)
+  );
 }
 
 function validateIssueContractDelivery(value: unknown): string[] {
@@ -474,6 +874,36 @@ function emptyIssueContractAnalysis(): IssueContractAnalysis {
 
 function markdownHeadings(description: string): Set<string> {
   return new Set(markdownSections(description).keys());
+}
+
+function markdownHeadingOccurrenceCount(
+  description: string,
+  targetHeading: string,
+): number {
+  const target = normalizeHeading(targetHeading);
+  let count = 0;
+  let activeFence: MarkdownFenceDelimiter | null = null;
+  for (const line of description.split(/\r?\n/)) {
+    const fence = parseMarkdownFenceDelimiter(line);
+    if (activeFence) {
+      if (
+        fence &&
+        fence.marker === activeFence.marker &&
+        fence.length >= activeFence.length &&
+        fence.trailing.trim().length === 0
+      ) {
+        activeFence = null;
+      }
+      continue;
+    }
+    if (fence) {
+      activeFence = fence;
+      continue;
+    }
+    const match = line.match(/^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/);
+    if (match && normalizeHeading(match[1] ?? "") === target) count += 1;
+  }
+  return count;
 }
 
 interface MarkdownFenceDelimiter {

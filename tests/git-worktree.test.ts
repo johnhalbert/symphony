@@ -105,6 +105,87 @@ describe("git worktree workspace source", () => {
     await git(["merge-base", "--is-ancestor", preparedBaseHeadSha, preparedHeadSha], repo);
   });
 
+  it("records an artifact already present exactly on the live base as absorbed", async () => {
+    const sourceBaseHeadSha = (await git(["rev-parse", "HEAD"], repo)).trim();
+    await git(["checkout", "-b", "artifact/already-landed"], repo);
+    await mkdir(path.join(repo, "tests"), { recursive: true });
+    await writeFile(
+      path.join(repo, "tests", "already-landed.test.ts"),
+      "expected red\n",
+      "utf8",
+    );
+    await commitAll(repo, "add already-landed expected-red test");
+    const sourceHeadSha = (await git(["rev-parse", "HEAD"], repo)).trim();
+    const blobSha = (
+      await git(["rev-parse", "HEAD:tests/already-landed.test.ts"], repo)
+    ).trim();
+
+    await git(["checkout", "main"], repo);
+    await git(
+      [
+        "-c",
+        "user.name=Symphony Test",
+        "-c",
+        "user.email=symphony@example.com",
+        "merge",
+        "--no-ff",
+        "artifact/already-landed",
+        "-m",
+        "land artifact through successor",
+      ],
+      repo,
+    );
+    await writeFile(path.join(repo, "LIVE_BASE.md"), "later successor work\n", "utf8");
+    await commitAll(repo, "advance main after artifact landed");
+    const preparedBaseHeadSha = (await git(["rev-parse", "HEAD"], repo)).trim();
+    const seed = artifactSeed(repo, {
+      artifactId: "artifact-already-landed",
+      sourceBranch: "artifact/already-landed",
+      sourceBaseHeadSha,
+      sourceHeadSha,
+      fileManifest: [
+        {
+          path: "tests/already-landed.test.ts",
+          status: "added",
+          blobSha,
+        },
+      ],
+    });
+    const manager = newManager(root, repo);
+    const target = issue({
+      identifier: "TEST-SEED-ALREADY-LANDED",
+      branchName: "symphony/TEST-SEED-ALREADY-LANDED",
+    });
+
+    const workspace = await manager.createForIssue(target, { seed });
+    const record = await manager.getWorkspaceRecord("TEST-SEED-ALREADY-LANDED");
+
+    expect(workspace.seed).toMatchObject({
+      artifactId: "artifact-already-landed",
+      preparedBaseHeadSha,
+      preparedHeadSha: preparedBaseHeadSha,
+      conflictedFiles: [],
+      absorbedPaths: ["tests/already-landed.test.ts"],
+    });
+    expect(record?.seed).toEqual(workspace.seed);
+    expect(
+      await readFile(
+        path.join(workspace.path, "tests", "already-landed.test.ts"),
+        "utf8",
+      ),
+    ).toBe("expected red\n");
+    expect(
+      await git(["diff", "--name-only", preparedBaseHeadSha, "HEAD"], workspace.path),
+    ).toBe("");
+    await expect(
+      verifyGitWorktreeSeedBinding(
+        workspace.path,
+        { ...workspace.seed!, absorbedPaths: [] },
+        10_000,
+      ),
+    ).rejects.toThrow(/absorbed paths do not match/);
+  });
+
   it("records regular, symlink, and deletion Git modes in a new artifact checkpoint", async () => {
     const sourceBaseHeadSha = (await git(["rev-parse", "HEAD"], repo)).trim();
     await git(["checkout", "-b", "artifact/mode-manifest"], repo);
@@ -976,7 +1057,19 @@ async function serviceStyleSquashRebase(
 
   await git(["reset", "--soft", mergeBase], workspacePath);
   await commitAll(workspacePath, `service squash for ${suffix}`);
-  await git(["rebase", "--onto", liveBase, mergeBase], workspacePath);
+  await git(
+    [
+      "-c",
+      "user.name=Symphony Test",
+      "-c",
+      "user.email=symphony@example.com",
+      "rebase",
+      "--onto",
+      liveBase,
+      mergeBase,
+    ],
+    workspacePath,
+  );
   return (await git(["rev-parse", "HEAD"], workspacePath)).trim();
 }
 
